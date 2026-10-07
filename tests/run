@@ -1,0 +1,643 @@
+#!/bin/sh
+# Exercise bin/channel (shell) and go/channel (static binary) against the same protocol.
+# A pass includes each program reading a mailbox the other one wrote.
+# Run from anywhere: tests/run
+set -eu
+export LC_ALL=C
+
+ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+SH=$ROOT/bin/channel
+GO=$ROOT/go/channel
+PY=$ROOT/bin/channel.py
+
+TMP=$(mktemp -d /tmp/channel-tests.XXXXXX)
+# /tmp is a different filesystem from this tree, so a rename between them is EXDEV.
+SHM=$(mktemp -d "$ROOT/.test-exdev.XXXXXX")
+PIDS=$TMP/pids
+: > "$PIDS"
+pass=0
+fail=0
+
+cleanup() {
+  if [ -f "$PIDS" ]; then
+    while read -r p; do
+      kill "$p" 2>/dev/null || true
+      wait "$p" 2>/dev/null || true
+    done < "$PIDS"
+  fi
+  rm -rf "$TMP" "$SHM"
+}
+trap cleanup EXIT INT TERM
+
+ok() { pass=$((pass + 1)); printf 'ok  %s\n' "$1"; }
+bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1" >&2; }
+
+same() {
+  if diff -q "$2" "$3" >/dev/null 2>&1; then
+    ok "$1"
+  else
+    bad "$1"
+    diff -u "$2" "$3" >&2 || true
+  fi
+}
+
+capture() {
+  _out=$1
+  _err=$2
+  _rc=$3
+  shift 3
+  set +e
+  "$@" >"$_out" 2>"$_err"
+  _status=$?
+  set -e
+  printf '%s\n' "$_status" > "$_rc"
+}
+
+expect_rc() {
+  got=$(cat "$3")
+  if [ "$got" = "$2" ]; then
+    ok "$1"
+  else
+    bad "$1 (rc $got want $2)"
+  fi
+}
+
+expect_text() {
+  printf '%s\n' "$3" > "$TMP/want-text"
+  same "$1" "$2" "$TMP/want-text"
+}
+
+empty_file() {
+  if [ ! -s "$2" ]; then
+    ok "$1"
+  else
+    bad "$1"
+    echo "---- $2 ----" >&2
+    cat "$2" >&2
+  fi
+}
+
+wait_for() {
+  file=$1
+  text=$2
+  n=0
+  while [ "$n" -lt 80 ]; do
+    if grep -F -q -- "$text" "$file" 2>/dev/null; then
+      return 0
+    fi
+    n=$((n + 1))
+    sleep 0.1
+  done
+  echo "timed out waiting for [$text]" >&2
+  echo "---- $file ----" >&2
+  cat "$file" >&2 || true
+  return 1
+}
+
+spawn() {
+  _out=$1
+  _err=$2
+  shift 2
+  "$@" >"$_out" 2>"$_err" &
+  echo $! >> "$PIDS"
+  echo $!
+}
+
+file_count() {
+  pat=$1
+  dir=$2
+  n=0
+  for f in "$dir"/$pat; do
+    [ -f "$f" ] || continue
+    n=$((n + 1))
+  done
+  printf '%s\n' "$n"
+}
+
+export GOCACHE=/tmp/go-build-cache
+export GOPATH=/tmp/gopath
+export GOTOOLCHAIN=local
+export CGO_ENABLED=0
+export GOPROXY=off
+go build -C "$ROOT/go" -trimpath -ldflags '-s -w' -o channel .
+
+for name in channel-setup channel-arm channel-send; do
+  if [ "$(readlink "$ROOT/bin/$name")" = channel ] && [ "$(readlink "$ROOT/go/$name")" = channel ]; then
+    ok "symlink $name"
+  else
+    bad "symlink $name"
+  fi
+done
+
+if head -1 "$SH" | grep -qx '#!/bin/sh'; then ok "shell shebang"; else bad "shell shebang"; fi
+if file "$GO" | grep -q 'statically linked'; then ok "go static"; else bad "go static"; fi
+if ldd "$GO" 2>&1 | grep -q 'not a dynamic executable'; then ok "go not dynamic"; else bad "go not dynamic"; fi
+size=$(stat -c %s "$GO")
+if [ "$size" -gt 1000000 ] && [ "$size" -lt 4000000 ]; then
+  ok "go size $size"
+else
+  bad "go size $size"
+fi
+deps=$(go list -C "$ROOT/go" -deps -f '{{if and (not .Standard) (ne .ImportPath "agentchannel")}}{{.ImportPath}}{{end}}')
+if [ -z "$deps" ]; then ok "go stdlib only"; else bad "go deps: $deps"; fi
+mods=$(go list -C "$ROOT/go" -m all)
+if [ "$mods" = agentchannel ]; then ok "go module has no requirements"; else bad "go modules: $mods"; fi
+
+# --- help and mode selection ---
+
+capture "$TMP/sh-help" "$TMP/sh-help.err" "$TMP/sh-help.rc" "$SH"
+capture "$TMP/go-help" "$TMP/go-help.err" "$TMP/go-help.rc" "$GO"
+same "help text" "$TMP/sh-help" "$TMP/go-help"
+empty_file "help stderr" "$TMP/sh-help.err"
+empty_file "go help stderr" "$TMP/go-help.err"
+expect_rc "help exit" 0 "$TMP/sh-help.rc"
+expect_rc "go help exit" 0 "$TMP/go-help.rc"
+
+capture "$TMP/sh-h" "$TMP/sh-h.err" "$TMP/sh-h.rc" "$ROOT/bin/channel-setup" -h
+same "setup -h is help" "$TMP/sh-h" "$TMP/sh-help"
+expect_rc "setup -h exit" 0 "$TMP/sh-h.rc"
+capture "$TMP/go-h" "$TMP/go-h.err" "$TMP/go-h.rc" "$ROOT/go/channel-arm" --help
+same "arm --help is help" "$TMP/go-h" "$TMP/go-help"
+
+capture "$TMP/sh-nomode" "$TMP/sh-nomode.err" "$TMP/sh-nomode.rc" "$SH" "$ROOT/example/comms.diag"
+capture "$TMP/go-nomode" "$TMP/go-nomode.err" "$TMP/go-nomode.rc" "$GO" "$ROOT/example/comms.diag"
+same "no mode stderr" "$TMP/sh-nomode.err" "$TMP/go-nomode.err"
+expect_text "no mode text" "$TMP/sh-nomode.err" "no mode; use --setup, --arm, or --send"
+expect_rc "no mode exit" 1 "$TMP/sh-nomode.rc"
+expect_rc "go no mode exit" 1 "$TMP/go-nomode.rc"
+
+capture "$TMP/sh-pick" "$TMP/sh-pick.err" "$TMP/sh-pick.rc" "$SH" --setup --arm
+capture "$TMP/go-pick" "$TMP/go-pick.err" "$TMP/go-pick.rc" "$GO" --arm --send
+same "two mode flags" "$TMP/sh-pick.err" "$TMP/go-pick.err"
+expect_text "pick one" "$TMP/sh-pick.err" "pick one of --setup, --arm, or --send"
+expect_rc "pick one exit" 1 "$TMP/sh-pick.rc"
+
+capture "$TMP/sh-conf" "$TMP/sh-conf.err" "$TMP/sh-conf.rc" "$ROOT/bin/channel-arm" --setup
+capture "$TMP/go-conf" "$TMP/go-conf.err" "$TMP/go-conf.rc" "$ROOT/go/channel-arm" --setup
+same "conflicting name and flag" "$TMP/sh-conf.err" "$TMP/go-conf.err"
+expect_text "conflict text" "$TMP/sh-conf.err" "this command is arm; setup is a different mode"
+
+capture "$TMP/sh-use" "$TMP/sh-use.err" "$TMP/sh-use.rc" "$ROOT/bin/channel-setup"
+capture "$TMP/go-use" "$TMP/go-use.err" "$TMP/go-use.rc" "$ROOT/go/channel-setup"
+same "setup usage" "$TMP/sh-use.err" "$TMP/go-use.err"
+expect_text "setup usage text" "$TMP/sh-use.err" "usage: channel-setup FILE NODE [-n|--dry-run] [--whatineedtoknow]"
+expect_rc "setup usage exit" 1 "$TMP/sh-use.rc"
+
+capture "$TMP/sh-use2" "$TMP/sh-use2.err" "$TMP/sh-use2.rc" "$SH" --send
+capture "$TMP/go-use2" "$TMP/go-use2.err" "$TMP/go-use2.rc" "$GO" --send
+same "send usage via flag" "$TMP/sh-use2.err" "$TMP/go-use2.err"
+expect_text "send usage text" "$TMP/sh-use2.err" "usage: channel --send FILE NODE RECIPIENT VERB BODYFILE [REF ...]"
+
+capture "$TMP/sh-badopt" "$TMP/sh-badopt.err" "$TMP/sh-badopt.rc" "$SH" --nope
+capture "$TMP/go-badopt" "$TMP/go-badopt.err" "$TMP/go-badopt.rc" "$GO" --nope
+expect_rc "shell unknown option" 1 "$TMP/sh-badopt.rc"
+expect_rc "go unknown option" 1 "$TMP/go-badopt.rc"
+expect_text "go unknown option text" "$TMP/go-badopt.err" "option --nope not recognized"
+if grep -F -q -- 'nope' "$TMP/sh-badopt.err"; then ok "shell unknown option names it"; else bad "shell unknown option names it"; fi
+
+capture "$TMP/sh-eq" "$TMP/sh-eq.err" "$TMP/sh-eq.rc" "$SH" --dry-run=1
+capture "$TMP/go-eq" "$TMP/go-eq.err" "$TMP/go-eq.rc" "$GO" --dry-run=1
+expect_rc "shell option value" 1 "$TMP/sh-eq.rc"
+expect_text "go option value" "$TMP/go-eq.err" "option --dry-run must not have a value"
+
+# --- example plan oracle (python) ---
+
+EX=$ROOT/example/comms.diag
+capture "$TMP/py-n" "$TMP/py-n.err" "$TMP/py-n.rc" python3 "$PY" setup -n "$EX" planner
+capture "$TMP/sh-n" "$TMP/sh-n.err" "$TMP/sh-n.rc" "$ROOT/bin/channel-setup" -n "$EX" planner
+capture "$TMP/go-n" "$TMP/go-n.err" "$TMP/go-n.rc" "$ROOT/go/channel-setup" "$EX" planner -n
+same "example dry-run shell" "$TMP/py-n" "$TMP/sh-n"
+same "example dry-run go" "$TMP/py-n" "$TMP/go-n"
+empty_file "example dry-run stderr" "$TMP/sh-n.err"
+if [ ! -d /channel/nodes ]; then ok "dry-run does not create /channel"; else bad "dry-run created /channel"; fi
+
+capture "$TMP/py-w" "$TMP/py-w.err" "$TMP/py-w.rc" python3 "$PY" arm "$EX" coder --whatineedtoknow
+capture "$TMP/sh-w" "$TMP/sh-w.err" "$TMP/sh-w.rc" "$SH" --arm "$EX" coder --whatineedtoknow
+capture "$TMP/go-w" "$TMP/go-w.err" "$TMP/go-w.rc" "$ROOT/go/channel-send" --whatineedtoknow "$EX" coder
+same "example what shell" "$TMP/py-w" "$TMP/sh-w"
+same "example what go" "$TMP/py-w" "$TMP/go-w"
+expect_rc "what exits" 0 "$TMP/sh-w.rc"
+
+# same mode flag on an already-named command is accepted
+capture "$TMP/sh-same" "$TMP/sh-same.err" "$TMP/sh-same.rc" "$ROOT/bin/channel-arm" --arm "$EX" coder --whatineedtoknow
+same "named command plus its own flag" "$TMP/py-w" "$TMP/sh-same"
+
+# options after positionals, including when POSIXLY_CORRECT is set in the environment
+capture "$TMP/sh-pos" "$TMP/sh-pos.err" "$TMP/sh-pos.rc" env POSIXLY_CORRECT=1 "$ROOT/bin/channel-setup" "$EX" planner --dry-run
+same "option after positionals" "$TMP/py-n" "$TMP/sh-pos"
+capture "$TMP/go-pos" "$TMP/go-pos.err" "$TMP/go-pos.rc" "$ROOT/go/channel" --setup "$EX" --dry-run planner
+same "go flag among positionals" "$TMP/py-n" "$TMP/go-pos"
+
+mkdir -p "$TMP/dir with space"
+cp "$EX" "$TMP/dir with space/comms.diag"
+capture "$TMP/sh-sp" "$TMP/sh-sp.err" "$TMP/sh-sp.rc" "$ROOT/bin/channel-setup" -n "$TMP/dir with space/comms.diag" planner
+capture "$TMP/go-sp" "$TMP/go-sp.err" "$TMP/go-sp.rc" "$ROOT/go/channel-setup" -n "$TMP/dir with space/comms.diag" planner
+same "plan path with a space" "$TMP/sh-sp" "$TMP/go-sp"
+if grep -F -q -- "$TMP/dir with space/comms.diag" "$TMP/sh-sp"; then ok "space path is printed"; else bad "space path is printed"; fi
+
+# -- ends the option scan, so -n becomes a node name
+capture "$TMP/sh-dd" "$TMP/sh-dd.err" "$TMP/sh-dd.rc" "$ROOT/bin/channel-setup" -- "$EX" -n
+capture "$TMP/go-dd" "$TMP/go-dd.err" "$TMP/go-dd.rc" "$ROOT/go/channel-setup" -- "$EX" -n
+same "double dash stops options" "$TMP/sh-dd.err" "$TMP/go-dd.err"
+expect_text "dash-n is not a node" "$TMP/sh-dd.err" "node must be a bare name, not a path (-n)"
+
+capture "$TMP/sh-armn" "$TMP/sh-armn.err" "$TMP/sh-armn.rc" "$ROOT/bin/channel-arm" -n "$EX" coder
+capture "$TMP/go-armn" "$TMP/go-armn.err" "$TMP/go-armn.rc" "$ROOT/go/channel-arm" "$EX" coder --dry-run
+same "dry-run rejected on arm" "$TMP/sh-armn.err" "$TMP/go-armn.err"
+expect_text "dry-run only setup" "$TMP/sh-armn.err" "--dry-run is only for channel-setup"
+
+# --- generated plan ---
+
+PIN=$TMP/nodes/planner/inbox
+CIN=$TMP/nodes/coder/inbox
+AIN=$TMP/nodes/auditor/inbox
+SIN=$TMP/nodes/scribe/inbox
+PLAN=$TMP/comms.diag
+cat > "$PLAN" <<EOF
+# -> waits. -< queues.
+blockdiag {
+  planner -> coder;
+  coder -< planner;
+  auditor -> scribe;
+}
+
+/*
+node planner $PIN
+node coder $CIN
+node auditor $AIN
+node scribe $SIN
+
+verb planner coder PING
+verb coder planner NOTE
+verb auditor scribe PING
+
+message PING {
+Ask for one step.
+body: {
+ACTION: PING
+PLAN: <path>
+}
+}
+
+message NOTE {
+A queued note.
+body: {
+TEXT: keep this line
+ITEM: <thing>
+}
+}
+*/
+EOF
+
+mkdir -p "$TMP/bodies"
+printf '%s\n' 'ACTION: PING' 'PLAN: /tmp/work' > "$TMP/bodies/ping.md"
+printf '%s\n' 'ACTION: PING' 'PLAN: /tmp/work' 'MORE: yes' > "$TMP/bodies/ping-extra.md"
+printf '%s\n' 'ACTION: PING' > "$TMP/bodies/ping-bad.md"
+printf '%s\n' 'ACTION: PING' 'PLAN: <path>' > "$TMP/bodies/ping-hole.md"
+printf '%s\n' 'TEXT: keep this line' 'ITEM: a box' > "$TMP/bodies/note.md"
+printf '%s\n' 'ITEM: a box' > "$TMP/bodies/note-bad.md"
+printf '%s\n' 'ref-bytes' > "$TMP/bodies/ref.txt"
+
+capture "$TMP/sh-dry" "$TMP/sh-dry.err" "$TMP/sh-dry.rc" "$SH" --setup -n "$PLAN" planner
+capture "$TMP/go-dry" "$TMP/go-dry.err" "$TMP/go-dry.rc" "$GO" --setup "$PLAN" planner -n
+capture "$TMP/py-dry" "$TMP/py-dry.err" "$TMP/py-dry.rc" python3 "$PY" setup "$PLAN" -n planner
+same "generated dry-run shell/go" "$TMP/sh-dry" "$TMP/go-dry"
+same "generated dry-run shell/py" "$TMP/sh-dry" "$TMP/py-dry"
+if [ ! -d "$PIN" ] && [ ! -d "$TMP/refs" ]; then ok "dry-run creates nothing"; else bad "dry-run creates nothing"; fi
+
+capture "$TMP/sh-both" "$TMP/sh-both.err" "$TMP/sh-both.rc" "$ROOT/bin/channel-setup" "$PLAN" planner -n --whatineedtoknow
+capture "$TMP/go-both" "$TMP/go-both.err" "$TMP/go-both.rc" "$ROOT/go/channel-setup" --whatineedtoknow "$PLAN" planner --dry-run
+capture "$TMP/py-both" "$TMP/py-both.err" "$TMP/py-both.rc" python3 "$PY" setup --whatineedtoknow "$PLAN" planner -n
+same "dry-run plus what shell/go" "$TMP/sh-both" "$TMP/go-both"
+same "dry-run plus what shell/py" "$TMP/sh-both" "$TMP/py-both"
+if [ ! -d "$PIN" ]; then ok "what creates nothing"; else bad "what creates nothing"; fi
+
+capture "$TMP/sh-pl" "$TMP/sh-pl.err" "$TMP/sh-pl.rc" "$SH" --arm "$PLAN" planner --whatineedtoknow
+capture "$TMP/go-pl" "$TMP/go-pl.err" "$TMP/go-pl.rc" "$GO" --setup "$PLAN" planner --whatineedtoknow
+if grep -F -q auditor "$TMP/sh-pl" || grep -F -q scribe "$TMP/sh-pl"; then
+  bad "planner what omits unrelated nodes"
+else
+  ok "planner what omits unrelated nodes"
+fi
+if grep -F -q 'node coder ' "$TMP/sh-pl" && grep -F -q 'message NOTE {' "$TMP/sh-pl" && grep -F -q 'message PING {' "$TMP/sh-pl"; then
+  ok "planner what includes its edges"
+else
+  bad "planner what includes its edges"
+fi
+same "planner what shell/go" "$TMP/sh-pl" "$TMP/go-pl"
+
+capture "$TMP/sh-au" "$TMP/sh-au.err" "$TMP/sh-au.rc" "$ROOT/bin/channel-send" "$PLAN" auditor --whatineedtoknow extra
+capture "$TMP/go-au" "$TMP/go-au.err" "$TMP/go-au.rc" "$ROOT/go/channel-send" "$PLAN" auditor DEST VERB "$TMP/bodies/ping.md" --whatineedtoknow
+same "what rejects extra send args" "$TMP/sh-au.err" "$TMP/go-au.err"
+expect_text "what extra usage" "$TMP/sh-au.err" "usage: channel-send FILE NODE --whatineedtoknow"
+expect_rc "what extra exit" 1 "$TMP/sh-au.rc"
+if [ ! -d "$AIN" ]; then ok "rejected what did not set up"; else bad "rejected what did not set up"; fi
+
+# plan errors, python is the third reader
+err_setup() {
+  name=$1
+  file=$2
+  node=$3
+  capture "$TMP/e-sh" "$TMP/e-sh.err" "$TMP/e-sh.rc" "$ROOT/bin/channel-setup" "$file" "$node"
+  capture "$TMP/e-go" "$TMP/e-go.err" "$TMP/e-go.rc" "$ROOT/go/channel-setup" "$file" "$node"
+  capture "$TMP/e-py" "$TMP/e-py.err" "$TMP/e-py.rc" python3 "$PY" setup "$file" "$node"
+  same "$name shell/go" "$TMP/e-sh.err" "$TMP/e-go.err"
+  same "$name shell/py" "$TMP/e-sh.err" "$TMP/e-py.err"
+  expect_rc "$name exit" 1 "$TMP/e-sh.rc"
+  empty_file "$name stdout" "$TMP/e-sh"
+}
+
+: > "$TMP/empty.diag"
+err_setup "empty plan" "$TMP/empty.diag" planner
+err_setup "missing plan" "$TMP/no-such.diag" planner
+
+printf '%s\n' 'blockdiag { planner -> coder; }' '/*' 'node planner rel/inbox' 'node coder /tmp/c' 'verb planner coder PING' 'message PING { body: { ACTION: PING } }' '*/' > "$TMP/rel.diag"
+err_setup "relative inbox" "$TMP/rel.diag" planner
+
+printf '%s\n' 'blockdiag { planner -> coder; }' '/*' "node planner $PIN" "node planner $CIN" 'verb planner coder PING' 'message PING { body: { ACTION: PING } }' '*/' > "$TMP/dupnode.diag"
+err_setup "duplicate node" "$TMP/dupnode.diag" planner
+
+printf '%s\n' 'blockdiag { planner -> coder; planner -> coder; }' '/*' "node planner $PIN" "node coder $CIN" 'verb planner coder PING' 'message PING { body: { ACTION: PING } }' '*/' > "$TMP/dupedge.diag"
+err_setup "duplicate edge" "$TMP/dupedge.diag" planner
+
+printf '%s\n' 'blockdiag { planner -> coder; }' '/*' "node planner $PIN" "node coder $CIN" 'message PING { body: { ACTION: PING } }' '*/' > "$TMP/noverb.diag"
+err_setup "edge without verb" "$TMP/noverb.diag" planner
+
+printf '%s\n' 'blockdiag { planner -> coder; }' '/*' "node planner $PIN" "node coder $CIN" 'verb planner coder GONE' 'message PING { body: { ACTION: PING } }' '*/' > "$TMP/noword.diag"
+err_setup "verb without message" "$TMP/noword.diag" planner
+
+printf '%s\n' 'blockdiag { planner -> coder; }' '/*' "node planner $PIN" "node extra $AIN" 'verb planner coder PING' 'message PING { body: { ACTION: PING } }' '*/' > "$TMP/extra.diag"
+err_setup "node not in diagram" "$TMP/extra.diag" planner
+
+printf '%s\n' 'blockdiag { planner <- coder; }' '/*' "node planner $PIN" "node coder $CIN" 'verb coder planner PING' 'message PING { body: { ACTION: PING } }' '*/' > "$TMP/back.diag"
+err_setup "rejected arrow" "$TMP/back.diag" planner
+
+printf '%s\n' 'blockdiag { planner ->> coder; }' '/*' "node planner $PIN" "node coder $CIN" '*/' > "$TMP/badarrow.diag"
+err_setup "unrecognized arrow" "$TMP/badarrow.diag" planner
+
+printf '%s\n' '/* unclosed' 'blockdiag { planner -> coder; }' > "$TMP/unclosed.diag"
+err_setup "unclosed comment" "$TMP/unclosed.diag" planner
+
+printf '%s\n' 'blockdiag { planner -> coder; }' '/*' "node planner $PIN" "node coder $CIN" 'verb planner coder PING' 'message PING { note }' '*/' > "$TMP/nobody.diag"
+err_setup "message without body" "$TMP/nobody.diag" planner
+
+printf '%s\n' 'blockdiag { planner -> coder [label = "work"]; }' '/*' "node planner $PIN" "node coder $CIN" 'verb planner coder PING' 'message PING { body: { ACTION: PING } }' '*/' > "$TMP/label.diag"
+capture "$TMP/sh-lab" "$TMP/sh-lab.err" "$TMP/sh-lab.rc" "$SH" --setup -n "$TMP/label.diag" planner
+capture "$TMP/go-lab" "$TMP/go-lab.err" "$TMP/go-lab.rc" "$GO" --setup -n "$TMP/label.diag" planner
+capture "$TMP/py-lab" "$TMP/py-lab.err" "$TMP/py-lab.rc" python3 "$PY" setup -n "$TMP/label.diag" planner
+same "label shell/go" "$TMP/sh-lab" "$TMP/go-lab"
+same "label shell/py" "$TMP/sh-lab" "$TMP/py-lab"
+if grep -F -q 'planner -> coder wait work' "$TMP/sh-lab"; then ok "label printed"; else bad "label printed"; fi
+
+capture "$TMP/sh-bare" "$TMP/sh-bare.err" "$TMP/sh-bare.rc" "$ROOT/bin/channel-setup" "$PLAN" 'planner/x'
+capture "$TMP/go-bare" "$TMP/go-bare.err" "$TMP/go-bare.rc" "$ROOT/go/channel-setup" "$PLAN" 'planner/x'
+capture "$TMP/py-bare" "$TMP/py-bare.err" "$TMP/py-bare.rc" python3 "$PY" setup "$PLAN" 'planner/x'
+same "path node shell/go" "$TMP/sh-bare.err" "$TMP/go-bare.err"
+same "path node shell/py" "$TMP/sh-bare.err" "$TMP/py-bare.err"
+
+capture "$TMP/sh-miss" "$TMP/sh-miss.err" "$TMP/sh-miss.rc" "$ROOT/bin/channel-arm" "$PLAN" ghost
+capture "$TMP/go-miss" "$TMP/go-miss.err" "$TMP/go-miss.rc" "$ROOT/go/channel-arm" "$PLAN" ghost
+same "unknown node" "$TMP/sh-miss.err" "$TMP/go-miss.err"
+expect_text "unknown node text" "$TMP/sh-miss.err" "ghost is not a node in $PLAN"
+
+# --- setup modes, one node only ---
+
+capture "$TMP/sh-set" "$TMP/sh-set.err" "$TMP/sh-set.rc" "$ROOT/bin/channel-setup" "$PLAN" planner
+expect_text "shell setup line" "$TMP/sh-set" "node planner inbox $PIN"
+expect_rc "shell setup exit" 0 "$TMP/sh-set.rc"
+empty_file "shell setup stderr" "$TMP/sh-set.err"
+if [ -d "$PIN" ] && [ ! -d "$CIN" ] && [ ! -d "$AIN" ]; then
+  ok "setup creates only this inbox"
+else
+  bad "setup creates only this inbox"
+fi
+if [ "$(stat -c %a "$TMP/nodes/planner")" = 2750 ] && [ "$(stat -c %a "$PIN")" = 3775 ] && [ "$(stat -c %a "$TMP/refs")" = 2775 ]; then
+  ok "shell directory modes"
+else
+  bad "shell directory modes $(stat -c %a "$TMP/nodes/planner") $(stat -c %a "$PIN") $(stat -c %a "$TMP/refs")"
+fi
+
+capture "$TMP/go-set" "$TMP/go-set.err" "$TMP/go-set.rc" "$ROOT/go/channel-setup" "$PLAN" coder
+expect_text "go setup line" "$TMP/go-set" "node coder inbox $CIN"
+if [ "$(stat -c %a "$TMP/nodes/coder")" = 2750 ] && [ "$(stat -c %a "$CIN")" = 3775 ]; then
+  ok "go directory modes"
+else
+  bad "go directory modes"
+fi
+if [ ! -d "$AIN" ]; then ok "go setup left auditor absent"; else bad "go setup left auditor absent"; fi
+
+# --- send errors, before any publish ---
+
+capture "$TMP/sh-nb" "$TMP/sh-nb.err" "$TMP/sh-nb.rc" "$ROOT/bin/channel-send" "$PLAN" planner coder PING "$TMP/bodies/missing.md"
+capture "$TMP/go-nb" "$TMP/go-nb.err" "$TMP/go-nb.rc" "$ROOT/go/channel-send" "$PLAN" planner scribe PING "$TMP/bodies/missing.md"
+capture "$TMP/py-nb" "$TMP/py-nb.err" "$TMP/py-nb.rc" python3 "$PY" send "$PLAN" planner coder PING "$TMP/bodies/missing.md"
+same "missing body shell/py" "$TMP/sh-nb.err" "$TMP/py-nb.err"
+expect_text "missing body text" "$TMP/sh-nb.err" "no body file $TMP/bodies/missing.md"
+if grep -F -q 'no directory' "$TMP/sh-nb.err" || grep -F -q 'no directory' "$TMP/go-nb.err"; then
+  bad "missing body is reported before a missing inbox"
+else
+  ok "missing body is reported before a missing inbox"
+fi
+
+capture "$TMP/sh-bb" "$TMP/sh-bb.err" "$TMP/sh-bb.rc" "$ROOT/bin/channel-send" "$PLAN" planner coder PING "$TMP/bodies/ping-bad.md"
+capture "$TMP/go-bb" "$TMP/go-bb.err" "$TMP/go-bb.rc" "$ROOT/go/channel-send" "$PLAN" planner coder PING "$TMP/bodies/ping-bad.md"
+capture "$TMP/py-bb" "$TMP/py-bb.err" "$TMP/py-bb.rc" python3 "$PY" send "$PLAN" planner coder PING "$TMP/bodies/ping-bad.md"
+same "bad body shell/go" "$TMP/sh-bb.err" "$TMP/go-bb.err"
+same "bad body shell/py" "$TMP/sh-bb.err" "$TMP/py-bb.err"
+expect_text "bad body text" "$TMP/sh-bb.err" "PING body is missing a value for: PLAN: <path>"
+
+capture "$TMP/sh-hole" "$TMP/sh-hole.err" "$TMP/sh-hole.rc" "$SH" --send "$PLAN" planner coder PING "$TMP/bodies/ping-hole.md"
+capture "$TMP/go-hole" "$TMP/go-hole.err" "$TMP/go-hole.rc" "$GO" --send "$PLAN" planner coder PING "$TMP/bodies/ping-hole.md"
+same "unfilled placeholder" "$TMP/sh-hole.err" "$TMP/go-hole.err"
+expect_text "unfilled text" "$TMP/sh-hole.err" "PING body is missing a value for: PLAN: <path>"
+
+# coder inbox exists; planner sends NOTE the wrong way
+capture "$TMP/sh-verb" "$TMP/sh-verb.err" "$TMP/sh-verb.rc" "$ROOT/bin/channel-send" "$PLAN" planner coder NOTE "$TMP/bodies/note.md"
+capture "$TMP/go-verb" "$TMP/go-verb.err" "$TMP/go-verb.rc" "$ROOT/go/channel-send" "$PLAN" planner coder NOTE "$TMP/bodies/note.md"
+same "verb not on arrow" "$TMP/sh-verb.err" "$TMP/go-verb.err"
+expect_text "verb not on arrow text" "$TMP/sh-verb.err" "verb NOTE is not allowed on planner -> coder"
+
+capture "$TMP/sh-edge" "$TMP/sh-edge.err" "$TMP/sh-edge.rc" "$ROOT/bin/channel-send" "$PLAN" planner scribe PING "$TMP/bodies/ping.md"
+capture "$TMP/go-edge" "$TMP/go-edge.err" "$TMP/go-edge.rc" "$ROOT/go/channel-send" "$PLAN" planner scribe PING "$TMP/bodies/ping.md"
+same "no edge" "$TMP/sh-edge.err" "$TMP/go-edge.err"
+expect_text "no edge text" "$TMP/sh-edge.err" "planner is not allowed to send to scribe"
+
+# scribe was never set up; a legal sender still needs that inbox
+"$ROOT/bin/channel-setup" "$PLAN" auditor >/dev/null
+capture "$TMP/sh-ni" "$TMP/sh-ni.err" "$TMP/sh-ni.rc" "$ROOT/bin/channel-send" "$PLAN" auditor scribe PING "$TMP/bodies/ping.md"
+capture "$TMP/go-ni" "$TMP/go-ni.err" "$TMP/go-ni.rc" "$ROOT/go/channel-send" "$PLAN" auditor scribe PING "$TMP/bodies/ping.md"
+same "missing recipient inbox" "$TMP/sh-ni.err" "$TMP/go-ni.err"
+expect_text "missing recipient text" "$TMP/sh-ni.err" "no directory $SIN; run channel-setup $PLAN scribe"
+if [ "$(file_count '*.md' "$CIN")" = 0 ]; then ok "failed sends published nothing"; else bad "failed sends published nothing"; fi
+
+# --- publish, header bytes, modes, refs ---
+
+capture "$TMP/sh-s1" "$TMP/sh-s1.err" "$TMP/sh-s1.rc" "$ROOT/bin/channel-send" "$PLAN" planner coder PING "$TMP/bodies/ping.md"
+empty_file "first send stderr" "$TMP/sh-s1.err"
+expect_rc "first send exit" 0 "$TMP/sh-s1.rc"
+sh_msg=$(sed -n 's/^SENT //p' "$TMP/sh-s1")
+if printf '%s\n' "$(basename "$sh_msg")" | grep -Eq '^[0-9]{8}-[0-9]{6}\.[0-9]{3}__planner__0001\.md$'; then
+  ok "shell filename shape"
+else
+  bad "shell filename shape $(basename "$sh_msg")"
+fi
+if [ "$(stat -c %a "$sh_msg")" = 660 ]; then ok "shell message mode"; else bad "shell message mode"; fi
+if [ "$(cat "$TMP/nodes/planner/out-seq.txt")" = "next 1" ]; then ok "shell seq file"; else bad "shell seq file"; fi
+printf '%s\n' 'FROM: planner' 'TO: coder' 'SEQ: 1' 'VERB: PING' 'REFS:' '- none' '---' 'ACTION: PING' 'PLAN: /tmp/work' > "$TMP/want-msg"
+same "shell message bytes" "$sh_msg" "$TMP/want-msg"
+
+# go continues the same counter. The send blocks until the shell file is removed.
+: > "$TMP/go-s2"
+: > "$TMP/go-s2.err"
+pid=$(spawn "$TMP/go-s2" "$TMP/go-s2.err" env CHANNEL_POLL=1 "$ROOT/go/channel-send" "$PLAN" planner coder PING "$TMP/bodies/ping-extra.md")
+if wait_for "$TMP/go-s2" "PENDING $sh_msg"; then ok "go waits on shell file"; else bad "go waits on shell file"; fi
+if grep -F -q 'listing the inbox every 0.2s' "$TMP/go-s2.err"; then ok "go pending poll note"; else bad "go pending poll note"; fi
+rm -- "$sh_msg"
+if wait_for "$TMP/go-s2" "SENT "; then ok "go sends after rm"; else bad "go sends after rm"; kill "$pid" 2>/dev/null || true; fi
+wait "$pid" 2>/dev/null || true
+go_msg=$(sed -n 's/^SENT //p' "$TMP/go-s2")
+if printf '%s\n' "$(basename "$go_msg")" | grep -Eq '^[0-9]{8}-[0-9]{6}\.[0-9]{3}__planner__0002\.md$'; then
+  ok "go continued shell seq"
+else
+  bad "go continued shell seq $(basename "$go_msg")"
+fi
+printf '%s\n' 'FROM: planner' 'TO: coder' 'SEQ: 2' 'VERB: PING' 'REFS:' '- none' '---' 'ACTION: PING' 'PLAN: /tmp/work' 'MORE: yes' > "$TMP/want-msg2"
+same "go message bytes" "$go_msg" "$TMP/want-msg2"
+if [ "$(cat "$TMP/nodes/planner/out-seq.txt")" = "next 2" ]; then ok "shared seq is 2"; else bad "shared seq is 2"; fi
+rm -- "$go_msg"
+
+# queue edge does not wait: two notes stay in the planner inbox
+capture "$TMP/sh-q1" "$TMP/sh-q1.err" "$TMP/sh-q1.rc" "$ROOT/go/channel-send" "$PLAN" coder planner NOTE "$TMP/bodies/note.md" "$TMP/bodies/ref.txt"
+capture "$TMP/sh-q2" "$TMP/sh-q2.err" "$TMP/sh-q2.rc" "$ROOT/bin/channel-send" "$PLAN" coder planner NOTE "$TMP/bodies/note.md"
+empty_file "queue send stderr" "$TMP/sh-q1.err"
+empty_file "second queue stderr" "$TMP/sh-q2.err"
+if grep -F -q PENDING "$TMP/sh-q1" || grep -F -q PENDING "$TMP/sh-q2"; then
+  bad "queue send does not wait"
+else
+  ok "queue send does not wait"
+fi
+q1=$(sed -n 's/^SENT //p' "$TMP/sh-q1")
+q2=$(sed -n 's/^SENT //p' "$TMP/sh-q2")
+if [ "$(file_count '*.md' "$PIN")" = 2 ]; then ok "both queued files remain"; else bad "both queued files remain"; fi
+if [ "$(stat -c %a "$TMP/refs/"*"ref.txt")" = 660 ]; then ok "ref mode"; else bad "ref mode"; fi
+if grep -F -q -- "- refs/$(basename "$TMP/refs/"*"ref.txt")" "$q1"; then ok "ref listed in message"; else bad "ref listed in message"; fi
+if cmp -s "$TMP/bodies/ref.txt" "$TMP/refs/"*"ref.txt"; then ok "ref bytes copied"; else bad "ref bytes copied"; fi
+sed -E 's/[0-9]{8}-[0-9]{6}\.[0-9]{3}/STAMP/g' "$q1" > "$TMP/q1.norm"
+printf '%s\n' 'FROM: coder' 'TO: planner' 'SEQ: 1' 'VERB: NOTE' 'REFS:' '- refs/STAMP__coder__0001__ref.txt' '---' 'TEXT: keep this line' 'ITEM: a box' > "$TMP/want-note"
+same "go note with ref" "$TMP/q1.norm" "$TMP/want-note"
+
+# verbatim line required
+capture "$TMP/sh-nl" "$TMP/sh-nl.err" "$TMP/sh-nl.rc" "$ROOT/bin/channel-send" "$PLAN" coder planner NOTE "$TMP/bodies/note-bad.md"
+capture "$TMP/go-nl" "$TMP/go-nl.err" "$TMP/go-nl.rc" "$ROOT/go/channel-send" "$PLAN" coder planner NOTE "$TMP/bodies/note-bad.md"
+same "missing verbatim" "$TMP/sh-nl.err" "$TMP/go-nl.err"
+expect_text "missing verbatim text" "$TMP/sh-nl.err" "NOTE body is missing the line: TEXT: keep this line"
+
+# --- arm oldest-only, each program reading the other's files ---
+
+arm_oldest() {
+  label=$1
+  armbin=$2
+  out=$TMP/arm-$label.out
+  err=$TMP/arm-$label.err
+  : > "$out"
+  : > "$err"
+  pid=$(spawn "$out" "$err" env CHANNEL_POLL=1 "$armbin" "$PLAN" planner)
+  if wait_for "$out" "READY"; then ok "$label arm ready"; else bad "$label arm ready"; return; fi
+  if grep -F -q 'channel-arm is listing the inbox every 0.2s. inotifywait is not in use.' "$err"; then
+    ok "$label poll note"
+  else
+    bad "$label poll note"
+  fi
+  if wait_for "$out" "FILE "; then ok "$label saw oldest"; else bad "$label saw oldest"; return; fi
+  first=$(sed -n 's/^FILE //p' "$out" | head -n 1)
+  older=$(printf '%s\n%s\n' "$(basename "$q1")" "$(basename "$q2")" | sort | head -n 1)
+  if [ "$(basename "$first")" = "$older" ]; then ok "$label oldest name"; else bad "$label oldest name"; fi
+  sleep 0.6
+  nfiles=$(grep -c '^FILE ' "$out" || true)
+  if [ "$nfiles" = 1 ]; then ok "$label holds oldest"; else bad "$label holds oldest ($nfiles)"; fi
+  rm -- "$first"
+  n=0
+  nfiles=1
+  while [ "$n" -lt 80 ]; do
+    nfiles=$(grep -c '^FILE ' "$out" || true)
+    if [ "$nfiles" = 2 ]; then
+      break
+    fi
+    n=$((n + 1))
+    sleep 0.1
+  done
+  if [ "$nfiles" = 2 ]; then ok "$label advances after rm"; else bad "$label advances after rm ($nfiles)"; fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+# files q1 and q2 are still in the planner inbox
+arm_oldest shell "$ROOT/bin/channel-arm"
+# restart reprints the file that remains
+left=$(find "$PIN" -name '*.md' | head -n 1)
+pid=$(spawn "$TMP/arm-re.out" "$TMP/arm-re.err" env CHANNEL_POLL=1 "$ROOT/go/channel-arm" "$PLAN" planner)
+if wait_for "$TMP/arm-re.out" "FILE $left"; then ok "restart reprints remaining file"; else bad "restart reprints remaining file"; fi
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+rm -f -- "$PIN"/*.md
+
+# shell arm, go send, then the reverse direction's wait is already covered.
+# inotify path: READY plus a FILE, without requiring the poll note.
+pid=$(spawn "$TMP/arm-in.out" "$TMP/arm-in.err" "$ROOT/go/channel-arm" "$PLAN" coder)
+if wait_for "$TMP/arm-in.out" "READY"; then ok "inotify arm ready"; else bad "inotify arm ready"; fi
+"$ROOT/bin/channel-send" "$PLAN" planner coder PING "$TMP/bodies/ping.md" > "$TMP/in-send.out"
+sent=$(sed -n 's/^SENT //p' "$TMP/in-send.out")
+if wait_for "$TMP/arm-in.out" "FILE $sent"; then ok "go arm sees shell send"; else bad "go arm sees shell send"; fi
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+
+pid=$(spawn "$TMP/arm-in2.out" "$TMP/arm-in2.err" env CHANNEL_POLL=1 "$ROOT/bin/channel-arm" "$PLAN" planner)
+if wait_for "$TMP/arm-in2.out" "READY"; then ok "shell arm ready for go note"; else bad "shell arm ready for go note"; fi
+"$ROOT/go/channel-send" "$PLAN" coder planner NOTE "$TMP/bodies/note.md" > "$TMP/in-send2.out"
+sent2=$(sed -n 's/^SENT //p' "$TMP/in-send2.out")
+if wait_for "$TMP/arm-in2.out" "FILE $sent2"; then ok "shell arm sees go send"; else bad "shell arm sees go send"; fi
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+
+# shell waits on a file go already published (the PING still in the coder inbox)
+pid=$(spawn "$TMP/pend.out" "$TMP/pend.err" env CHANNEL_POLL=1 "$ROOT/bin/channel-send" "$PLAN" planner coder PING "$TMP/bodies/ping.md")
+if wait_for "$TMP/pend.out" "PENDING $sent"; then ok "shell waits on go-visible file"; else bad "shell waits on go-visible file"; fi
+rm -- "$sent"
+if wait_for "$TMP/pend.out" "SENT "; then ok "shell sends after the go file is removed"; else bad "shell sends after the go file is removed"; kill "$pid" 2>/dev/null || true; fi
+wait "$pid" 2>/dev/null || true
+
+# --- cross-device rename ---
+
+EP=$TMP/exdev.diag
+ep_in=$TMP/exdev-nodes/planner/inbox
+ec_in=$SHM/coder/inbox
+cat > "$EP" <<EOF
+blockdiag {
+  planner -> coder;
+}
+/*
+node planner $ep_in
+node coder $ec_in
+verb planner coder PING
+message PING { body: { ACTION: PING } }
+*/
+EOF
+"$ROOT/bin/channel-setup" "$EP" planner >/dev/null
+"$ROOT/go/channel-setup" "$EP" coder >/dev/null
+capture "$TMP/sh-ex" "$TMP/sh-ex.err" "$TMP/sh-ex.rc" "$ROOT/bin/channel-send" "$EP" planner coder PING "$TMP/bodies/ping-bad.md"
+# ping-bad is the wrong shape (missing PLAN). Use a legal one-line body for this message.
+printf '%s\n' 'ACTION: PING' > "$TMP/bodies/ping-one.md"
+capture "$TMP/sh-ex" "$TMP/sh-ex.err" "$TMP/sh-ex.rc" "$ROOT/bin/channel-send" "$EP" planner coder PING "$TMP/bodies/ping-one.md"
+capture "$TMP/go-ex" "$TMP/go-ex.err" "$TMP/go-ex.rc" "$ROOT/go/channel-send" "$EP" planner coder PING "$TMP/bodies/ping-one.md"
+if grep -F -q 'would not be atomic' "$TMP/sh-ex.err" && grep -F -q 'would not be atomic' "$TMP/go-ex.err"; then
+  ok "cross-device rename is refused"
+else
+  bad "cross-device rename is refused"
+  cat "$TMP/sh-ex.err" "$TMP/go-ex.err" >&2
+fi
+expect_rc "shell exdev exit" 1 "$TMP/sh-ex.rc"
+expect_rc "go exdev exit" 1 "$TMP/go-ex.rc"
+if [ "$(file_count '*.md' "$ec_in")" = 0 ]; then ok "exdev published nothing"; else bad "exdev published nothing"; fi
+
+printf '%s\n' "$pass passed, $fail failed"
+[ "$fail" -eq 0 ]

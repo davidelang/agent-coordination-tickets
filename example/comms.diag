@@ -1,0 +1,114 @@
+# -> waits. One unremoved file from that sender, then the next send waits until it is removed.
+# -< does not wait. Files queue at the crow's foot, and that foot can be at either end.
+# <-> is -> in both directions.
+
+blockdiag {
+  planner <-> coder;
+}
+
+/*
+# node NAME /absolute/inbox
+#   Messages to NAME are placed in that directory by an atomic rename.
+#   When NAME finishes a message, it removes the file.
+#   If NAME is restarted, it handles the oldest file still in the inbox.
+#   Running that work again has to be safe. A half-finished plan is not detected.
+#
+# verb SOURCE DEST WORD...
+#   SOURCE may send those words to DEST. A word needs a message block.
+#   The blocks can sit before or after the verb lines.
+#
+# message NAME { ... body: { ... } }
+#   The text inside the braces is what an agent reads.
+#   A line with <...> has one filled-in value. Every other line is sent verbatim.
+#   A line that starts with # or // is a note. The script skips it.
+#   Put # or // at the start of a node, verb, or message line to leave it out.
+
+node planner /channel/nodes/planner/inbox
+node coder /channel/nodes/coder/inbox
+
+verb planner coder IMPLEMENT RESUME PROVIDE-EVIDENCE STOP
+verb coder planner COMPLETE FAILURE BLOCKED STOPPED DAVID-DIRECT
+
+message IMPLEMENT {
+This message is one approved plan to be implemented. It is sent after the user has approved a specific plan, or a project that this plan is part of.
+body: {
+ACTION: IMPLEMENT
+PLAN: <path/to/plan>
+FROM-STEP: <step, or the beginning>
+}
+}
+
+message RESUME {
+This message continues a plan that was already approved, from the named step.
+body: {
+ACTION: RESUME
+PLAN: <path/to/plan>
+FROM-STEP: <step>
+}
+}
+
+message PROVIDE-EVIDENCE {
+This message asks for the named check to be run again. The tree stays as it is.
+body: {
+ACTION: PROVIDE-EVIDENCE
+PLAN: <path/to/plan>
+CHECK: <what to run>
+}
+}
+
+message STOP {
+This message says to stop. The tree stays as it is.
+body: {
+ACTION: STOP
+PLAN: <path/to/plan>
+}
+}
+
+message COMPLETE {
+This message says the plan is done and the checks passed.
+body: {
+STATUS: COMPLETE
+PLAN: <path/to/plan>
+RESPONDING-TO: <path/to/message>
+}
+}
+
+message FAILURE {
+This message says a step failed.
+body: {
+STATUS: FAILURE
+PLAN: <path/to/plan>
+RESPONDING-TO: <path/to/message>
+REASON: <what failed>
+}
+}
+
+message BLOCKED {
+This message says that the coder's sanity checks prevent it from starting the plan. A re-plan or other fix is needed.
+body: {
+STATUS: BLOCKED
+PLAN: <path/to/plan>
+RESPONDING-TO: <path/to/message>
+REASON: <text reason for the block>
+}
+}
+
+message STOPPED {
+This message says the work stopped before the plan was finished.
+body: {
+STATUS: STOPPED
+PLAN: <path/to/plan>
+RESPONDING-TO: <path/to/message>
+REASON: <where things stand>
+}
+}
+
+message DAVID-DIRECT {
+This message says the human gave the coder the work in that window, rather than the planner sending it.
+body: {
+STATUS: <COMPLETE, FAILURE, BLOCKED, or STOPPED>
+PLAN: <path/to/plan, or none>
+REASON: <what the human asked, and how it ended>
+}
+}
+*/

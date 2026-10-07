@@ -1,0 +1,832 @@
+#!/bin/sh
+# One program. The name selects the mode.
+# channel prints help. channel-setup, channel-arm, and channel-send are links to this file.
+# --setup, --arm, and --send select the mode when the name is channel.
+set -eu
+export LC_ALL=C
+# GNU getopt keeps scanning after positionals only when this is unset.
+unset POSIXLY_CORRECT || true
+
+die() { printf '%s\n' "$1" >&2; exit 1; }
+say() { printf '%s\n' "$1"; }
+note() { printf '%s\n' "$1" >&2; }
+
+help() {
+  cat <<'EOF'
+channel — one inbox directory per agent
+
+With no mode, this prints help and exits.
+
+  channel --setup FILE NODE [-n|--dry-run] [--whatineedtoknow]
+  channel --arm   FILE NODE [--whatineedtoknow]
+  channel --send  FILE NODE DEST VERB BODY [REF ...] [--whatineedtoknow]
+
+channel-setup, channel-arm, and channel-send are names for this same program.
+The name selects the mode, so those forms do not need --setup, --arm, or --send.
+
+-n, --dry-run       check the plan and create nothing (setup only)
+--whatineedtoknow   print the nodes and messages this node uses, then exit
+-h, --help          print this help
+
+Options may sit before or after the file and the node. -- ends the options.
+EOF
+}
+
+rc=0
+getopt -T >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 4 ] || die "need GNU getopt (util-linux)"
+command -v awk >/dev/null 2>&1 || die "need awk"
+
+base=$(basename "$0")
+case "$base" in
+  channel-setup) name_mode=setup ;;
+  channel-arm) name_mode=arm ;;
+  channel-send) name_mode=send ;;
+  *) name_mode= ;;
+esac
+
+parsed=$(getopt -n "$base" -o hn -l help,dry-run,whatineedtoknow,setup,arm,send -- "$@") || exit 1
+eval set -- "$parsed"
+
+dry=0
+what=0
+flag_mode=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) help; exit 0 ;;
+    -n|--dry-run) dry=1; shift ;;
+    --whatineedtoknow) what=1; shift ;;
+    --setup|--arm|--send)
+      m=${1#--}
+      if [ -n "$flag_mode" ] && [ "$flag_mode" != "$m" ]; then
+        die "pick one of --setup, --arm, or --send"
+      fi
+      flag_mode=$m
+      shift
+      ;;
+    --) shift; break ;;
+    *) die "option $1 not recognized" ;;
+  esac
+done
+
+if [ -n "$name_mode" ] && [ -n "$flag_mode" ] && [ "$name_mode" != "$flag_mode" ]; then
+  die "this command is $name_mode; $flag_mode is a different mode"
+fi
+mode=$name_mode
+if [ -n "$flag_mode" ]; then
+  mode=$flag_mode
+fi
+if [ -z "$mode" ]; then
+  if [ "$dry" -eq 1 ] || [ "$what" -eq 1 ] || [ $# -gt 0 ]; then
+    die "no mode; use --setup, --arm, or --send"
+  fi
+  help
+  exit 0
+fi
+
+if [ -n "$name_mode" ]; then
+  invoked="channel-$mode"
+else
+  invoked="channel --$mode"
+fi
+
+PARSE=$(mktemp)
+SHOWN=$(mktemp)
+trap 'rm -f "$PARSE" "$SHOWN"' EXIT INT TERM
+
+parse_plan() {
+  awk -v plan="$1" '
+function die(msg) { print msg > "/dev/stderr"; exit 1 }
+function count_nl(s,    i, n) {
+  n = 0
+  for (i = 1; i <= length(s); i++) if (substr(s, i, 1) == "\n") n++
+  return n
+}
+function matching_brace(text, open_at,    depth, i, c) {
+  depth = 0
+  for (i = open_at; i <= length(text); i++) {
+    c = substr(text, i, 1)
+    if (c == "{") depth++
+    else if (c == "}") {
+      depth--
+      if (depth == 0) return i
+    }
+  }
+  return 0
+}
+function strip_comments(text,    i, n, out, end) {
+  n = length(text); i = 1; out = ""
+  while (i <= n) {
+    if (substr(text, i, 2) == "/*") {
+      end = index(substr(text, i + 2), "*/")
+      if (end == 0) break
+      i += 2 + end + 1
+      continue
+    }
+    if (substr(text, i, 2) == "//" || substr(text, i, 1) == "#") {
+      end = index(substr(text, i), "\n")
+      if (end == 0) break
+      i += end
+      out = out "\n"
+      continue
+    }
+    out = out substr(text, i, 1)
+    i++
+  }
+  return out
+}
+function trim_ws(s) {
+  gsub(/^[ \t\n]+/, "", s)
+  gsub(/[ \t\n]+$/, "", s)
+  return s
+}
+function find_op(s, pos,    ops, k, op) {
+  split("<-> >-< <- -> -- -< >-", ops, " ")
+  for (k = 1; k <= 7; k++) {
+    op = ops[k]
+    if (substr(s, pos, length(op)) == op) return op
+  }
+  return ""
+}
+function label_from(attr,    p, rest, q, end, i, c, out) {
+  p = index(attr, "label")
+  if (p == 0) return ""
+  rest = substr(attr, p + 5)
+  sub(/^[ \t]*/, "", rest)
+  if (substr(rest, 1, 1) != "=") return ""
+  rest = substr(rest, 2)
+  sub(/^[ \t]*/, "", rest)
+  if (rest == "") return ""
+  q = substr(rest, 1, 1)
+  if (q == "\"" || q == "'\''") {
+    end = index(substr(rest, 2), q)
+    if (end == 0) return ""
+    return substr(rest, 2, end - 1)
+  }
+  out = ""
+  for (i = 1; i <= length(rest); i++) {
+    c = substr(rest, i, 1)
+    if (c ~ /[A-Za-z0-9_.-]/) out = out c
+    else break
+  }
+  return out
+}
+function names_in(part, kept,    n, i, w) {
+  for (i in kept) delete kept[i]
+  n = 0
+  while (match(part, /[A-Za-z_][A-Za-z0-9_.-]*/)) {
+    w = substr(part, RSTART, RLENGTH)
+    if (w != "blockdiag" && w != "group") { n++; kept[n] = w }
+    part = substr(part, RSTART + RLENGTH)
+  }
+  return n
+}
+function parse_diag(text,    body, nstmt, i, stmt, label, open, rend, pos, op, opsn, ops, parts, pn, start, nn, kept, k, nodes, ni) {
+  body = strip_comments(text)
+  nstmt = split(body, stmts, ";")
+  edge_n = 0
+  for (i = 1; i <= nstmt; i++) {
+    stmt = stmts[i]
+    label = ""
+    open = index(stmt, "[")
+    if (open > 0) {
+      rend = 0
+      # last ]
+      for (pos = length(stmt); pos > open; pos--) if (substr(stmt, pos, 1) == "]") { rend = pos; break }
+      if (rend > open) {
+        label = label_from(substr(stmt, open + 1, rend - open - 1))
+        stmt = substr(stmt, 1, open - 1) substr(stmt, rend + 1)
+      }
+    }
+    opsn = 0; pn = 0; start = 1; pos = 1
+    while (pos <= length(stmt)) {
+      op = find_op(stmt, pos)
+      if (op == "") { pos++; continue }
+      pn++; parts[pn] = substr(stmt, start, pos - start)
+      opsn++; ops[opsn] = op
+      pos += length(op)
+      start = pos
+    }
+    pn++; parts[pn] = substr(stmt, start)
+    if (opsn == 0) {
+      if (stmt ~ /[<>]/) die("unrecognized arrow in: " trim_ws(stmt) ". Use ->, <->, or -<.")
+      continue
+    }
+    rest = stmt
+    for (k = 1; k <= opsn; k++) {
+      op = ops[k]
+      p = index(rest, op)
+      if (p > 0) rest = substr(rest, 1, p - 1) " " substr(rest, p + length(op))
+    }
+    if (rest ~ /[<>]/) die("unrecognized arrow in: " trim_ws(stmt) ". Use ->, <->, or -<.")
+    ni = 0
+    for (k = 1; k <= pn; k++) {
+      nn = names_in(parts[k], kept)
+      if (nn == 0) continue
+      ni++
+      if (k == 1) nodes[ni] = kept[nn]
+      else nodes[ni] = kept[1]
+    }
+    if (ni != opsn + 1) die("could not read an edge statement: " trim_ws(stmt))
+    for (k = 1; k <= opsn; k++) {
+      edge_n++
+      e_src[edge_n] = nodes[k]
+      e_op[edge_n] = ops[k]
+      e_dst[edge_n] = nodes[k + 1]
+      e_label[edge_n] = label
+    }
+  }
+}
+function expand() {
+  out_n = 0
+  for (i = 1; i <= edge_n; i++) {
+    op = e_op[i]
+    if (op == "<->") {
+      out_n++; o_src[out_n] = e_src[i]; o_dst[out_n] = e_dst[i]; o_mode[out_n] = "wait"; o_label[out_n] = e_label[i]
+      out_n++; o_src[out_n] = e_dst[i]; o_dst[out_n] = e_src[i]; o_mode[out_n] = "wait"; o_label[out_n] = e_label[i]
+    } else if (op == "->") {
+      out_n++; o_src[out_n] = e_src[i]; o_dst[out_n] = e_dst[i]; o_mode[out_n] = "wait"; o_label[out_n] = e_label[i]
+    } else if (op == "-<") {
+      out_n++; o_src[out_n] = e_src[i]; o_dst[out_n] = e_dst[i]; o_mode[out_n] = "queue"; o_label[out_n] = e_label[i]
+    } else if (op == "<-" || op == "--" || op == ">-" || op == ">-<") {
+      die(op " is drawn by blockdiag and is not a channel. Use ->, <->, or -<. See docs/diagram-marks.md.")
+    } else die("unknown operator " op)
+  }
+}
+function after_diagram(text,    i, n, depth, started, end, q) {
+  i = 1; n = length(text); depth = 0; started = 0
+  while (i <= n) {
+    if (substr(text, i, 2) == "/*") {
+      end = index(substr(text, i + 2), "*/")
+      if (end == 0) die("unclosed block comment in plan file")
+      i += 2 + end + 1
+      continue
+    }
+    if (substr(text, i, 1) == "#" || substr(text, i, 2) == "//") {
+      end = index(substr(text, i), "\n")
+      if (end == 0) i = n + 1
+      else i += end
+      continue
+    }
+    q = substr(text, i, 1)
+    if (q == "\"" || q == "'\''") {
+      i++
+      while (i <= n && substr(text, i, 1) != q) {
+        if (substr(text, i, 1) == "\\") { i += 2; continue }
+        i++
+      }
+      i++
+      continue
+    }
+    if (q == "{") { depth++; started = 1 }
+    else if (q == "}") {
+      depth--
+      if (started && depth == 0) return substr(text, i + 1)
+    }
+    i++
+  }
+  die("plan file has no closed blockdiag diagram")
+}
+function valid_node(name) {
+  return name ~ /^[A-Za-z][A-Za-z0-9_.-]*$/ && index(name, "__") == 0 && name != "blockdiag" && name != "group"
+}
+function is_msg_at(text, p,    j, c) {
+  j = p - 1
+  while (j >= 1) {
+    c = substr(text, j, 1)
+    if (c == "\n") return 1
+    if (c != " " && c != "\t") return 0
+    j--
+  }
+  return 1
+}
+function read_name(text, p,    i, c, name) {
+  i = p
+  while (i <= length(text) && (substr(text, i, 1) == " " || substr(text, i, 1) == "\t")) i++
+  name = ""
+  while (i <= length(text)) {
+    c = substr(text, i, 1)
+    if (c ~ /[A-Za-z0-9_.-]/) { name = name c; i++ }
+    else break
+  }
+  while (i <= length(text) && (substr(text, i, 1) == " " || substr(text, i, 1) == "\t")) i++
+  if (substr(text, i, 1) != "{") return ""
+  found_open = i
+  return name
+}
+function blank_span(text, start, end,    i, c, out) {
+  out = substr(text, 1, start - 1)
+  for (i = start; i <= end; i++) {
+    c = substr(text, i, 1)
+    out = out (c == "\n" ? "\n" : " ")
+  }
+  return out substr(text, end + 1)
+}
+function split_message(name, interior,    p, open_at, close_at, body, desc, line, n, j) {
+  if (!match(interior, /body[ \t]*:[ \t]*\{/)) die("message " name " has no body")
+  open_at = RSTART + RLENGTH - 1
+  close_at = matching_brace(interior, open_at)
+  if (close_at == 0) die("message " name " body is missing its closing brace")
+  body = substr(interior, open_at + 1, close_at - open_at - 1)
+  desc = substr(interior, 1, RSTART - 1) substr(interior, close_at + 1)
+  gsub(/^[ \t\n]+|[ \t\n]+$/, "", desc)
+  msg_n++
+  msg_name[msg_n] = name
+  msg_desc[msg_n] = desc
+  msg_body[msg_n] = ""
+  n = split(body, lines, "\n")
+  for (j = 1; j <= n; j++) {
+    line = lines[j]
+    gsub(/^[ \t]+|[ \t]+$/, "", line)
+    if (line != "") msg_body[msg_n] = msg_body[msg_n] line "\n"
+  }
+  if (msg_body[msg_n] == "") die("message " name " has an empty body")
+}
+function extract_messages(text,    i, p, name, open_at, close_at) {
+  msg_n = 0
+  i = 1
+  while (1) {
+    p = index(substr(text, i), "message")
+    if (p == 0) break
+    p = i + p - 1
+    if (is_msg_at(text, p)) {
+      name = read_name(text, p + 7)
+      if (name != "" && name ~ /^[A-Za-z]/) {
+        open_at = found_open
+        close_at = matching_brace(text, open_at)
+        if (close_at == 0) die("message " name " is missing its closing brace")
+        for (j = 1; j <= msg_n; j++) if (msg_name[j] == name) die("message " name " is defined twice")
+        split_message(name, substr(text, open_at + 1, close_at - open_at - 1))
+        text = blank_span(text, p, close_at)
+        i = close_at + 1
+        continue
+      }
+    }
+    i = p + 7
+  }
+  return text
+}
+function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+function parse_key(text, base,    nlines, i, line, nf, f, name, inbox, src, dst, words, k) {
+  text = extract_messages(text)
+  nlines = split(text, rows, "\n")
+  node_n = 0
+  verb_n = 0
+  for (i = 1; i <= nlines; i++) {
+    line = trim(rows[i])
+    if (line == "" || line == "/*" || line == "*/" || substr(line, 1, 1) == "#" || substr(line, 1, 2) == "//") continue
+    nf = split(line, f, /[ \t]+/)
+    if (f[1] == "node" && nf == 3) {
+      name = f[2]; inbox = f[3]
+      if (!valid_node(name)) die("line " base + i ": node name must be letters, digits, dot, underscore, or hyphen, and not contain __")
+      for (k = 1; k <= node_n; k++) if (n_name[k] == name) die("line " base + i ": node " name " is listed twice")
+      if (substr(inbox, 1, 1) != "/") die("line " base + i ": inbox path must be absolute")
+      node_n++; n_name[node_n] = name; n_path[node_n] = inbox
+    } else if (f[1] == "verb" && nf >= 4) {
+      src = f[2]; dst = f[3]; words = ""
+      for (k = 4; k <= nf; k++) words = words (k == 4 ? "" : " ") f[k]
+      for (k = 1; k <= verb_n; k++) if (v_src[k] == src && v_dst[k] == dst) die("line " base + i ": verb " src " " dst " is listed twice")
+      verb_n++; v_src[verb_n] = src; v_dst[verb_n] = dst; v_words[verb_n] = words
+    } else die("line " base + i ": expected '\''node NAME PATH'\'', '\''verb SRC DST WORD...'\'', or '\''message NAME { ... }'\''")
+  }
+}
+function has_node(name,    k) { for (k = 1; k <= node_n; k++) if (n_name[k] == name) return 1; return 0 }
+function has_msg(name,    k) { for (k = 1; k <= msg_n; k++) if (msg_name[k] == name) return 1; return 0 }
+function has_verb(src, dst,    k) { for (k = 1; k <= verb_n; k++) if (v_src[k] == src && v_dst[k] == dst) return 1; return 0 }
+function seen_edge(src, dst,    k) { for (k = 1; k <= seen_n; k++) if (s_src[k] == src && s_dst[k] == dst) return 1; return 0 }
+function in_edge(name,    k) {
+  for (k = 1; k <= seen_n; k++) if (s_src[k] == name || s_dst[k] == name) return 1
+  return 0
+}
+BEGIN {
+  text = ""
+  have = 0
+  status = getline line < plan
+  if (status < 0) die("no plan file " plan)
+  while (status > 0) {
+    if (have) text = text "\n"
+    text = text line
+    have = 1
+    status = getline line < plan
+  }
+  close(plan)
+  parse_diag(text)
+  expand()
+  tail = after_diagram(text)
+  base = count_nl(substr(text, 1, length(text) - length(tail)))
+  parse_key(tail, base)
+  prob = ""
+  seen_n = 0
+  for (i = 1; i <= out_n; i++) {
+    if (!has_node(o_src[i]) || !has_node(o_dst[i])) prob = prob o_src[i] " -> " o_dst[i] " uses a node the plan file does not define\n"
+    if (!has_verb(o_src[i], o_dst[i])) prob = prob o_src[i] " -> " o_dst[i] " has no verb line\n"
+    if (seen_edge(o_src[i], o_dst[i])) prob = prob "duplicate edge " o_src[i] " -> " o_dst[i] "\n"
+    seen_n++; s_src[seen_n] = o_src[i]; s_dst[seen_n] = o_dst[i]
+  }
+  for (i = 1; i <= node_n; i++) if (!in_edge(n_name[i])) prob = prob "node " n_name[i] " is in the key and not in the diagram\n"
+  for (i = 1; i <= verb_n; i++) {
+    if (!seen_edge(v_src[i], v_dst[i])) prob = prob "verb " v_src[i] " " v_dst[i] " is not an arrow in the diagram\n"
+    nw = split(v_words[i], ww, " ")
+    for (k = 1; k <= nw; k++) if (!has_msg(ww[k])) prob = prob ww[k] " on " v_src[i] " -> " v_dst[i] " has no message definition\n"
+  }
+  if (prob != "") { printf "%s", prob > "/dev/stderr"; exit 1 }
+  for (i = 1; i <= out_n; i++) print "E\t" o_src[i] "\t" o_dst[i] "\t" o_mode[i] "\t" o_label[i]
+  for (i = 1; i <= node_n; i++) print "N\t" n_name[i] "\t" n_path[i]
+  for (i = 1; i <= verb_n; i++) print "V\t" v_src[i] "\t" v_dst[i] "\t" v_words[i]
+  for (i = 1; i <= msg_n; i++) {
+    print "M\t" msg_name[i]
+    if (msg_desc[i] != "") {
+      nd = split(msg_desc[i], dl, "\n")
+      for (k = 1; k <= nd; k++) print "D\t" dl[k]
+    }
+    nb = split(msg_body[i], bl, "\n")
+    for (k = 1; k <= nb; k++) if (bl[k] != "") print "B\t" bl[k]
+  }
+}
+' "$1" > "$PARSE"
+}
+
+require_me() {
+  me=$1
+  case "$me" in
+    */*|*__*|"") die "node must be a bare name, not a path ($me)" ;;
+  esac
+  case "$me" in
+    [A-Za-z]*) ;;
+    *) die "node must be a bare name, not a path ($me)" ;;
+  esac
+  awk -F '\t' -v m="$me" '$1=="N" && $2==m { found=1 } END { exit !found }' "$PARSE" \
+    || die "$me is not a node in $PLAN"
+}
+
+abs_path() {
+  dir=$(dirname "$1")
+  file=$(basename "$1")
+  printf '%s/%s\n' "$(cd "$dir" && pwd)" "$file"
+}
+
+report_edges() {
+  say "OK $(abs_path "$PLAN")"
+  awk -F '\t' '$1=="E" { extra = ($5 != "" ? " " $5 : ""); print $2 " -> " $3 " " $4 extra }' "$PARSE"
+  say "dry-run"
+}
+
+emit_what() {
+  awk -F '\t' -v me="$1" '
+function sort_into(src, dst,    n, i, j, tmp, k) {
+  n = 0
+  for (k in src) { n++; dst[n] = k }
+  for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (dst[j] < dst[i]) { tmp = dst[i]; dst[i] = dst[j]; dst[j] = tmp }
+  return n
+}
+$1=="N" { path[$2] = $3; next }
+$1=="E" { ec++; es[ec] = $2; ed[ec] = $3; emode[ec] = $4; next }
+$1=="V" { verb[$2 " " $3] = $4; next }
+$1=="M" { cur = $2; next }
+$1=="D" { desc[cur] = (cur in desc && desc[cur] != "" ? desc[cur] "\n" : "") substr($0, 3); next }
+$1=="B" { body[cur] = body[cur] substr($0, 3) "\n"; next }
+END {
+  print "node " me " " path[me]
+  for (i = 1; i <= ec; i++) if (es[i] == me || ed[i] == me) {
+    if (es[i] != me) other[es[i]] = 1
+    if (ed[i] != me) other[ed[i]] = 1
+  }
+  n = sort_into(other, names)
+  for (i = 1; i <= n; i++) print "node " names[i] " " path[names[i]]
+  used_n = 0
+  for (i = 1; i <= ec; i++) if (es[i] == me || ed[i] == me) {
+    print es[i] " -> " ed[i] " " emode[i]
+    print "verb " es[i] " " ed[i] " " verb[es[i] " " ed[i]]
+    nw = split(verb[es[i] " " ed[i]], w, " ")
+    for (j = 1; j <= nw; j++) { used_n++; used[used_n] = w[j] }
+  }
+  for (j = 1; j <= used_n; j++) if (!(used[j] in seen)) {
+    seen[used[j]] = 1
+    word = used[j]
+    print "message " word " {"
+    if (desc[word] != "") print desc[word]
+    print "body: {"
+    nb = split(body[word], bl, "\n")
+    for (k = 1; k <= nb; k++) if (bl[k] != "") print bl[k]
+    print "}"
+    print "}"
+  }
+}
+' "$PARSE"
+}
+
+node_path() {
+  awk -F '\t' -v m="$1" '$1=="N" && $2==m { print $3 }' "$PARSE"
+}
+
+oldest_name() {
+  found=
+  for path in "$1"/*; do
+    [ -f "$path" ] || continue
+    base=$(basename "$path")
+    printf '%s\n' "$base" | grep -Eq '^[0-9]{8}-[0-9]{6}\.[0-9]{3}__.+__[0-9]+\.md$' || continue
+    if [ -z "$found" ]; then
+      found=$base
+    else
+      small=$(printf '%s\n%s\n' "$base" "$found" | sort | head -n 1)
+      [ "$small" = "$base" ] && found=$base
+    fi
+  done
+  printf '%s\n' "$found"
+}
+
+announce() {
+  inbox=$1
+  [ -d "$inbox" ] || die "inbox disappeared: $inbox"
+  shown=$(cat "$SHOWN" 2>/dev/null || true)
+  oldest=$(oldest_name "$inbox")
+  if [ "$oldest" = "$shown" ]; then
+    return 0
+  fi
+  if [ -n "$shown" ] && [ -f "$inbox/$shown" ]; then
+    return 0
+  fi
+  if [ -z "$oldest" ]; then
+    : > "$SHOWN"
+    return 0
+  fi
+  say "FILE $inbox/$oldest"
+  printf '%s\n' "$oldest" > "$SHOWN"
+}
+
+watch_oldest() {
+  while true; do
+    announce "$1"
+    sleep 0.2
+  done
+}
+
+try_inotify() {
+  if [ "${CHANNEL_POLL:-}" = 1 ] || ! command -v inotifywait >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+# One inotifywait event, or a one-second timeout, then return to this shell.
+# announce stays here so a failure exits the program rather than a pipeline child.
+inotify_loop() {
+  inbox=$1
+  fails=0
+  while [ -d "$inbox" ]; do
+    rc=0
+    inotifywait -q -t 1 -e moved_to -e moved_from -e delete --format '%f' "$inbox" >/dev/null 2>&1 || rc=$?
+    announce "$inbox"
+    if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+      fails=0
+      continue
+    fi
+    fails=$((fails + 1))
+    if [ "$fails" -ge 3 ]; then
+      return 1
+    fi
+  done
+  return 1
+}
+
+cmd_setup() {
+  [ $# -eq 2 ] || die "usage: $invoked FILE NODE [-n|--dry-run] [--whatineedtoknow]"
+  PLAN=$1
+  [ -f "$PLAN" ] || die "no plan file $PLAN"
+  parse_plan "$PLAN"
+  require_me "$2"
+  if [ "$dry" -eq 1 ]; then
+    report_edges
+  fi
+  if [ "$what" -eq 1 ]; then
+    emit_what "$2"
+  fi
+  if [ "$dry" -eq 1 ] || [ "$what" -eq 1 ]; then
+    return 0
+  fi
+  umask 002
+  refs=$(dirname "$PLAN")/refs
+  mkdir -p "$refs"
+  chmod 2775 "$refs" 2>/dev/null || note "chmod 2775 $refs failed"
+  inbox=$(node_path "$2")
+  mkdir -p "$inbox"
+  node=$(dirname "$inbox")
+  chmod 2750 "$node" 2>/dev/null || note "chmod 2750 $node failed"
+  chmod 3775 "$inbox" 2>/dev/null || note "chmod 3775 $inbox failed"
+  say "node $2 inbox $inbox"
+}
+
+cmd_arm() {
+  if [ "$dry" -eq 1 ]; then
+    die "--dry-run is only for channel-setup"
+  fi
+  if [ "$what" -eq 1 ]; then
+    [ $# -eq 2 ] || die "usage: $invoked FILE NODE --whatineedtoknow"
+  else
+    [ $# -eq 2 ] || die "usage: $invoked FILE NODE"
+  fi
+  PLAN=$1
+  [ -f "$PLAN" ] || die "no plan file $PLAN"
+  parse_plan "$PLAN"
+  require_me "$2"
+  if [ "$what" -eq 1 ]; then
+    emit_what "$2"
+    return 0
+  fi
+  inbox=$(node_path "$2")
+  [ -d "$inbox" ] || die "no directory $inbox; run channel-setup $PLAN $2"
+  if try_inotify; then
+    say "READY"
+    announce "$inbox"
+    inotify_loop "$inbox" || true
+    note "inotifywait ended; listing the inbox from here on."
+    watch_oldest "$inbox"
+  else
+    note "channel-arm is listing the inbox every 0.2s. inotifywait is not in use."
+    say "READY"
+    watch_oldest "$inbox"
+  fi
+}
+
+sender_of() {
+  rest=${1#*__}
+  printf '%s\n' "${rest%__*}"
+}
+
+wait_until_removed() {
+  inbox=$1
+  base=$2
+  target=$inbox/$base
+  say "PENDING $target"
+  if [ "${CHANNEL_POLL:-}" = 1 ] || ! command -v inotifywait >/dev/null 2>&1; then
+    note "channel-send is listing the inbox every 0.2s until the pending file is removed. inotifywait is not in use."
+    while [ -f "$target" ]; do
+      sleep 0.2
+    done
+    return 0
+  fi
+  while [ -f "$target" ]; do
+    inotifywait -q -t 1 -e moved_from -e delete --format '%f' "$inbox" >/dev/null 2>&1 || true
+  done
+}
+
+check_body() {
+  verb=$1
+  body=$2
+  awk -F '\t' -v verb="$verb" -v body="$body" '
+function die(msg) { print msg > "/dev/stderr"; exit 1 }
+$1=="M" { cur=$2; on=(cur==verb); next }
+$1=="B" && on { tmpl[++n] = substr($0, 3); next }
+END {
+  while ((getline line < body) > 0) {
+    gsub(/^[ \t]+|[ \t]+$/, "", line)
+    if (line != "") sent[++sn] = line
+  }
+  close(body)
+  for (i = 1; i <= n; i++) {
+    raw = tmpl[i]
+    open = index(raw, "<")
+    endat = 0
+    for (j = length(raw); j > 0; j--) if (substr(raw, j, 1) == ">") { endat = j; break }
+    if (open > 0 && open < endat) {
+      prefix = substr(raw, 1, open - 1)
+      filled = 0
+      for (j = 1; j <= sn; j++) {
+        line = sent[j]
+        if (prefix != "" && index(line, prefix) != 1) continue
+        value = line
+        if (prefix != "") {
+          value = substr(line, length(prefix) + 1)
+          gsub(/^[ \t]+|[ \t]+$/, "", value)
+        }
+        if (value != "" && !(substr(value, 1, 1) == "<" && substr(value, length(value), 1) == ">")) filled = 1
+      }
+      if (!filled) die(verb " body is missing a value for: " raw)
+    } else {
+      ok = 0
+      for (j = 1; j <= sn; j++) if (sent[j] == raw) ok = 1
+      if (!ok) die(verb " body is missing the line: " raw)
+    }
+  }
+}
+' "$PARSE"
+}
+
+cmd_send() {
+  if [ "$dry" -eq 1 ]; then
+    die "--dry-run is only for channel-setup"
+  fi
+  if [ "$what" -eq 1 ]; then
+    [ $# -eq 2 ] || die "usage: $invoked FILE NODE --whatineedtoknow"
+    PLAN=$1
+    [ -f "$PLAN" ] || die "no plan file $PLAN"
+    parse_plan "$PLAN"
+    require_me "$2"
+    emit_what "$2"
+    return 0
+  fi
+  [ $# -ge 5 ] || die "usage: $invoked FILE NODE RECIPIENT VERB BODYFILE [REF ...]"
+  PLAN=$1
+  me=$2
+  recipient=$3
+  verb=$4
+  body=$5
+  shift 5
+  [ -f "$PLAN" ] || die "no plan file $PLAN"
+  parse_plan "$PLAN"
+  require_me "$me"
+  node_path "$recipient" | grep -q . || die "unknown node (recipient=$recipient)"
+  mode_edge=$(awk -F '\t' -v s="$me" -v d="$recipient" '$1=="E" && $2==s && $3==d { print $4; found=1 } END { exit !found }' "$PARSE") \
+    || die "$me is not allowed to send to $recipient"
+  words=$(awk -F '\t' -v s="$me" -v d="$recipient" '$1=="V" && $2==s && $3==d { print $4 }' "$PARSE")
+  ok=0
+  for w in $words; do
+    [ "$w" = "$verb" ] && ok=1
+  done
+  [ "$ok" -eq 1 ] || die "verb $verb is not allowed on $me -> $recipient"
+  [ -f "$body" ] || die "no body file $body"
+  check_body "$verb" "$body"
+  for ref in "$@"; do
+    [ -f "$ref" ] || die "no referenced file $ref"
+  done
+  mine=$(node_path "$me")
+  inbox=$(node_path "$recipient")
+  [ -d "$mine" ] || die "no directory $mine; run channel-setup $PLAN $me"
+  [ -d "$inbox" ] || die "no directory $inbox; run channel-setup $PLAN $recipient"
+  if [ "$mode_edge" = wait ]; then
+    for path in "$inbox"/*; do
+      [ -f "$path" ] || continue
+      base=$(basename "$path")
+      printf '%s\n' "$base" | grep -Eq '^[0-9]{8}-[0-9]{6}\.[0-9]{3}__.+__[0-9]+\.md$' || continue
+      [ "$(sender_of "$base")" = "$me" ] || continue
+      wait_until_removed "$inbox" "$base"
+    done
+  fi
+  for ref in "$@"; do
+    [ -f "$ref" ] || die "no referenced file $ref"
+  done
+  node=$(dirname "$mine")
+  refs=$(dirname "$PLAN")/refs
+  [ -d "$refs" ] || die "no directory $refs; run channel-setup $PLAN $me"
+  lock=$node/out-seq.lock
+  seqf=$node/out-seq.txt
+  current=$(
+    flock -x 9
+    n=0
+    if [ -f "$seqf" ]; then
+      while read -r k v _; do
+        if [ "$k" = next ]; then n=$v; fi
+      done < "$seqf"
+    fi
+    n=$((n + 1))
+    printf 'next %s\n' "$n" > "$seqf.tmp"
+    mv -f "$seqf.tmp" "$seqf"
+    printf '%s\n' "$n"
+  ) 9>"$lock"
+  stamp=$(date +%Y%m%d-%H%M%S.%3N)
+  seq4=$(printf '%04d' "$current")
+  copied=
+  for ref in "$@"; do
+    dest=$refs/${stamp}__${me}__${seq4}__$(basename "$ref")
+    cp -- "$ref" "$dest"
+    chmod 0660 "$dest" 2>/dev/null || true
+    rel=refs/$(basename "$dest")
+    copied=${copied}${copied:+
+}${rel}
+  done
+  filename=${stamp}__${me}__${seq4}.md
+  tmp=$node/.tmp-$filename
+  {
+    printf 'FROM: %s\nTO: %s\nSEQ: %s\nVERB: %s\nREFS:\n' "$me" "$recipient" "$current" "$verb"
+    if [ -z "$copied" ]; then
+      printf '%s\n' "- none"
+    else
+      oldifs=$IFS
+      IFS='
+'
+      for item in $copied; do
+        printf -- '- %s\n' "$item"
+      done
+      IFS=$oldifs
+    fi
+    printf '%s\n' "---"
+    cat "$body"
+    last=$(tail -c 1 "$body" 2>/dev/null || true)
+    [ "$last" = "" ] || [ "$last" = "$(printf '\n')" ] || printf '\n'
+  } > "$tmp"
+  chmod 0660 "$tmp" 2>/dev/null || true
+  dev1=$(stat -c %d -- "$tmp")
+  dev2=$(stat -c %d -- "$inbox")
+  if [ "$dev1" != "$dev2" ]; then
+    die "$tmp and $inbox are on different filesystems, so the rename would not be atomic"
+  fi
+  mv -f -- "$tmp" "$inbox/$filename"
+  say "SENT $inbox/$filename"
+}
+
+case "$mode" in
+  setup) cmd_setup "$@" ;;
+  arm) cmd_arm "$@" ;;
+  send) cmd_send "$@" ;;
+  *) die "unknown mode $mode" ;;
+esac

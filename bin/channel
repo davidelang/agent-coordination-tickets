@@ -29,6 +29,16 @@ The name selects the mode, so those forms do not need --setup, --arm, or --send.
 -h, --help          print this help
 
 Options may sit before or after the file and the node. -- ends the options.
+
+Webhooks (optional, per node, workflow-specific: they live only in that diag):
+  node NAME /abs/inbox webhook=URL [webhook_key_file=/abs/file | webhook_key=TOKEN]
+After channel-send queues a message to NAME, it POSTs JSON
+  {"target","from","verb","inbox","file"}
+to URL with Content-Type: application/json and, if a key is given,
+Authorization: Bearer KEY (key file: first line; a leading "Bearer " is dropped).
+Success prints "WEBHOOK NAME CODE RESPONSE". Any failure prints a WARNING on
+stderr; the message stays queued and the exit status is still 0.
+Prefer webhook_key_file (mode 0600, outside the repo) over an inline key.
 EOF
 }
 
@@ -367,7 +377,7 @@ function extract_messages(text,    i, p, name, open_at, close_at) {
   return text
 }
 function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
-function parse_key(text, base,    nlines, i, line, nf, f, name, inbox, src, dst, words, k) {
+function parse_key(text, base,    nlines, i, line, nf, f, name, inbox, src, dst, words, k, kv, eq, key, val, wurl, wfile, wkey) {
   text = extract_messages(text)
   nlines = split(text, rows, "\n")
   node_n = 0
@@ -376,18 +386,36 @@ function parse_key(text, base,    nlines, i, line, nf, f, name, inbox, src, dst,
     line = trim(rows[i])
     if (line == "" || line == "/*" || line == "*/" || substr(line, 1, 1) == "#" || substr(line, 1, 2) == "//") continue
     nf = split(line, f, /[ \t]+/)
-    if (f[1] == "node" && nf == 3) {
+    if (f[1] == "node" && nf >= 3) {
       name = f[2]; inbox = f[3]
+      wurl = ""; wfile = ""; wkey = ""
+      for (k = 4; k <= nf; k++) {
+        kv = f[k]; eq = index(kv, "=")
+        if (eq < 2) die("line " base + i ": node option must be key=value (" kv ")")
+        key = substr(kv, 1, eq - 1); val = substr(kv, eq + 1)
+        if (val == "") die("line " base + i ": " key " is empty")
+        if (key == "webhook") {
+          if (val !~ /^https?:\/\//) die("line " base + i ": webhook must start with http:// or https://")
+          wurl = val
+        } else if (key == "webhook_key_file") {
+          if (substr(val, 1, 1) != "/") die("line " base + i ": webhook_key_file must be absolute")
+          wfile = val
+        } else if (key == "webhook_key") wkey = val
+        else die("line " base + i ": unknown node option " key " (allowed: webhook, webhook_key_file, webhook_key)")
+      }
+      if (wfile != "" && wkey != "") die("line " base + i ": use webhook_key_file or webhook_key, not both")
+      if (wurl == "" && (wfile != "" || wkey != "")) die("line " base + i ": webhook key given without webhook=URL")
       if (!valid_node(name)) die("line " base + i ": node name must be letters, digits, dot, underscore, or hyphen, and not contain __")
       for (k = 1; k <= node_n; k++) if (n_name[k] == name) die("line " base + i ": node " name " is listed twice")
       if (substr(inbox, 1, 1) != "/") die("line " base + i ": inbox path must be absolute")
       node_n++; n_name[node_n] = name; n_path[node_n] = inbox
+      n_wurl[node_n] = wurl; n_wfile[node_n] = wfile; n_wkey[node_n] = wkey
     } else if (f[1] == "verb" && nf >= 4) {
       src = f[2]; dst = f[3]; words = ""
       for (k = 4; k <= nf; k++) words = words (k == 4 ? "" : " ") f[k]
       for (k = 1; k <= verb_n; k++) if (v_src[k] == src && v_dst[k] == dst) die("line " base + i ": verb " src " " dst " is listed twice")
       verb_n++; v_src[verb_n] = src; v_dst[verb_n] = dst; v_words[verb_n] = words
-    } else die("line " base + i ": expected '\''node NAME PATH'\'', '\''verb SRC DST WORD...'\'', or '\''message NAME { ... }'\''")
+    } else die("line " base + i ": expected '\''node NAME PATH [webhook=URL [webhook_key_file=PATH|webhook_key=TOKEN]]'\'', '\''verb SRC DST WORD...'\'', or '\''message NAME { ... }'\''")
   }
 }
 function has_node(name,    k) { for (k = 1; k <= node_n; k++) if (n_name[k] == name) return 1; return 0 }
@@ -432,6 +460,7 @@ BEGIN {
   if (prob != "") { printf "%s", prob > "/dev/stderr"; exit 1 }
   for (i = 1; i <= out_n; i++) print "E\t" o_src[i] "\t" o_dst[i] "\t" o_mode[i] "\t" o_label[i]
   for (i = 1; i <= node_n; i++) print "N\t" n_name[i] "\t" n_path[i]
+  for (i = 1; i <= node_n; i++) if (n_wurl[i] != "") print "W\t" n_name[i] "\t" n_wurl[i] "\t" n_wfile[i] "\t" n_wkey[i]
   for (i = 1; i <= verb_n; i++) print "V\t" v_src[i] "\t" v_dst[i] "\t" v_words[i]
   for (i = 1; i <= msg_n; i++) {
     print "M\t" msg_name[i]
@@ -517,6 +546,50 @@ END {
 
 node_path() {
   awk -F '\t' -v m="$1" '$1=="N" && $2==m { print $3 }' "$PARSE"
+}
+
+json_str() {
+  printf '%s' "$1" | awk 'BEGIN { ORS = "" } { if (NR > 1) printf "\\n"; gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r"); print }'
+}
+
+# After a successful send: POST to the recipient's webhook if its node line has one.
+# Failures warn on stderr and never change the exit status; the message stays queued.
+fire_webhook() {
+  wline=$(awk -F '\t' -v m="$1" '$1=="W" && $2==m { print; exit }' "$PARSE")
+  [ -n "$wline" ] || return 0
+  wurl=$(printf '%s\n' "$wline" | cut -f3)
+  wfile=$(printf '%s\n' "$wline" | cut -f4)
+  wkey=$(printf '%s\n' "$wline" | cut -f5)
+  if [ -n "$wfile" ]; then
+    if [ ! -r "$wfile" ]; then
+      note "WARNING: webhook for $1 not fired: cannot read webhook_key_file $wfile (message is queued)"
+      return 0
+    fi
+    wkey=$(head -n 1 -- "$wfile" | tr -d '\r\n')
+    case "$wkey" in "Authorization: Bearer "*) wkey=${wkey#Authorization: Bearer } ;; "Bearer "*) wkey=${wkey#Bearer } ;; esac
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    note "WARNING: webhook for $1 not fired: curl not found (message is queued)"
+    return 0
+  fi
+  payload=$(printf '{"target":"%s","from":"%s","verb":"%s","inbox":"%s","file":"%s"}' \
+    "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" "$(json_str "$5")")
+  wout=$(mktemp) || { note "WARNING: webhook for $1 not fired: mktemp failed (message is queued)"; return 0; }
+  if [ -n "$wkey" ]; then
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$wkey" | curl -sS -o "$wout" -w '%{http_code}' \
+      --connect-timeout 5 --max-time 15 -X POST -K - -H 'Content-Type: application/json' \
+      --data-binary "$payload" -- "$wurl" 2>&1) || code="curl error: $code"
+  else
+    code=$(curl -sS -o "$wout" -w '%{http_code}' --connect-timeout 5 --max-time 15 -X POST \
+      -H 'Content-Type: application/json' --data-binary "$payload" -- "$wurl" 2>&1) || code="curl error: $code"
+  fi
+  code=$(printf '%s' "$code" | tr '\n' ' ')
+  resp=$(head -c 300 "$wout" 2>/dev/null | tr '\n' ' '); rm -f "$wout"
+  case "$code" in
+    2[0-9][0-9]) say "WEBHOOK $1 $code $resp" ;;
+    *) note "WARNING: webhook for $1 failed ($code) ${resp} (message is queued)" ;;
+  esac
+  return 0
 }
 
 oldest_name() {
@@ -822,6 +895,7 @@ cmd_send() {
   fi
   mv -f -- "$tmp" "$inbox/$filename"
   say "SENT $inbox/$filename"
+  fire_webhook "$recipient" "$me" "$verb" "$inbox" "$inbox/$filename" || true
 }
 
 case "$mode" in

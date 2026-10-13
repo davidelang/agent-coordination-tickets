@@ -7,9 +7,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -44,7 +47,11 @@ type plan struct {
 	verbOrder [][2]string
 	messages  map[string]message
 	edges     []edge
+	hooks     map[string]hook
 }
+
+// Optional per-node webhook: node NAME PATH webhook=URL [webhook_key_file=PATH|webhook_key=TOKEN]
+type hook struct{ url, keyFile, key string }
 
 func die(msg string) {
 	fmt.Fprintln(os.Stderr, msg)
@@ -72,6 +79,16 @@ The name selects the mode, so those forms do not need --setup, --arm, or --send.
 -h, --help          print this help
 
 Options may sit before or after the file and the node. -- ends the options.
+
+Webhooks (optional, per node, workflow-specific: they live only in that diag):
+  node NAME /abs/inbox webhook=URL [webhook_key_file=/abs/file | webhook_key=TOKEN]
+After channel-send queues a message to NAME, it POSTs JSON
+  {"target","from","verb","inbox","file"}
+to URL with Content-Type: application/json and, if a key is given,
+Authorization: Bearer KEY (key file: first line; a leading "Bearer " is dropped).
+Success prints "WEBHOOK NAME CODE RESPONSE". Any failure prints a WARNING on
+stderr; the message stays queued and the exit status is still 0.
+Prefer webhook_key_file (mode 0600, outside the repo) over an inline key.
 `)
 }
 
@@ -508,6 +525,7 @@ func parseKey(text string, lineBase int) plan {
 		nodes:    map[string]string{},
 		verbs:    map[string][]string{},
 		messages: map[string]message{},
+		hooks:    map[string]hook{},
 	}
 	blank := []byte(text)
 	cursor := 0
@@ -541,8 +559,41 @@ func parseKey(text string, lineBase int) plan {
 			continue
 		}
 		parts := strings.Fields(line)
-		if parts[0] == "node" && len(parts) == 3 {
+		if parts[0] == "node" && len(parts) >= 3 {
 			name, inbox := parts[1], parts[2]
+			var h hook
+			for _, kv := range parts[3:] {
+				eq := strings.Index(kv, "=")
+				if eq < 1 {
+					die(fmt.Sprintf("line %d: node option must be key=value (%s)", n, kv))
+				}
+				key, val := kv[:eq], kv[eq+1:]
+				if val == "" {
+					die(fmt.Sprintf("line %d: %s is empty", n, key))
+				}
+				switch key {
+				case "webhook":
+					if !strings.HasPrefix(val, "http://") && !strings.HasPrefix(val, "https://") {
+						die(fmt.Sprintf("line %d: webhook must start with http:// or https://", n))
+					}
+					h.url = val
+				case "webhook_key_file":
+					if !filepath.IsAbs(val) {
+						die(fmt.Sprintf("line %d: webhook_key_file must be absolute", n))
+					}
+					h.keyFile = val
+				case "webhook_key":
+					h.key = val
+				default:
+					die(fmt.Sprintf("line %d: unknown node option %s (allowed: webhook, webhook_key_file, webhook_key)", n, key))
+				}
+			}
+			if h.keyFile != "" && h.key != "" {
+				die(fmt.Sprintf("line %d: use webhook_key_file or webhook_key, not both", n))
+			}
+			if h.url == "" && (h.keyFile != "" || h.key != "") {
+				die(fmt.Sprintf("line %d: webhook key given without webhook=URL", n))
+			}
 			if !validNode(name) {
 				die(fmt.Sprintf("line %d: node name must be letters, digits, dot, underscore, or hyphen, and not contain __", n))
 			}
@@ -553,6 +604,9 @@ func parseKey(text string, lineBase int) plan {
 				die(fmt.Sprintf("line %d: inbox path must be absolute", n))
 			}
 			p.nodes[name] = inbox
+			if h.url != "" {
+				p.hooks[name] = h
+			}
 			p.nodeOrder = append(p.nodeOrder, name)
 		} else if parts[0] == "verb" && len(parts) >= 4 {
 			src, dst, words := parts[1], parts[2], parts[3:]
@@ -563,7 +617,7 @@ func parseKey(text string, lineBase int) plan {
 			p.verbs[key] = append([]string{}, words...)
 			p.verbOrder = append(p.verbOrder, [2]string{src, dst})
 		} else {
-			die(fmt.Sprintf("line %d: expected 'node NAME PATH', 'verb SRC DST WORD...', or 'message NAME { ... }'", n))
+			die(fmt.Sprintf("line %d: expected 'node NAME PATH [webhook=URL [webhook_key_file=PATH|webhook_key=TOKEN]]', 'verb SRC DST WORD...', or 'message NAME { ... }'", n))
 		}
 	}
 	return p
@@ -1009,6 +1063,58 @@ func cmdSend(path, me, recipient, verb, bodyPath string, refs []string) {
 	dest := filepath.Join(inbox, filename)
 	publishReplace(tmp, dest)
 	say("SENT " + dest)
+	fireWebhook(p, recipient, me, verb, inbox, dest)
+}
+
+// fireWebhook POSTs after a successful send. Failures only warn; the message stays queued.
+func fireWebhook(p plan, target, from, verb, inbox, file string) {
+	h, ok := p.hooks[target]
+	if !ok {
+		return
+	}
+	warn := func(why string) {
+		note("WARNING: webhook for " + target + " " + why + " (message is queued)")
+	}
+	key := h.key
+	if h.keyFile != "" {
+		data, err := os.ReadFile(h.keyFile)
+		if err != nil {
+			warn("not fired: cannot read webhook_key_file " + h.keyFile)
+			return
+		}
+		key = strings.TrimRight(strings.SplitN(string(data), "\n", 2)[0], "\r")
+		key = strings.TrimPrefix(key, "Authorization: ")
+		key = strings.TrimPrefix(key, "Bearer ")
+	}
+	body, _ := json.Marshal(struct {
+		Target string `json:"target"`
+		From   string `json:"from"`
+		Verb   string `json:"verb"`
+		Inbox  string `json:"inbox"`
+		File   string `json:"file"`
+	}{target, from, verb, inbox, file})
+	req, err := http.NewRequest("POST", h.url, bytes.NewReader(body))
+	if err != nil {
+		warn("failed (" + err.Error() + ")")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		warn("failed (" + err.Error() + ")")
+		return
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+	text := strings.ReplaceAll(string(rb), "\n", " ")
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		say(fmt.Sprintf("WEBHOOK %s %d %s", target, resp.StatusCode, text))
+	} else {
+		warn(fmt.Sprintf("failed (%d) %s", resp.StatusCode, text))
+	}
 }
 
 func nextSeq(seqPath string) int {

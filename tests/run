@@ -133,7 +133,7 @@ if head -1 "$SH" | grep -qx '#!/bin/sh'; then ok "shell shebang"; else bad "shel
 if file "$GO" | grep -q 'statically linked'; then ok "go static"; else bad "go static"; fi
 if ldd "$GO" 2>&1 | grep -q 'not a dynamic executable'; then ok "go not dynamic"; else bad "go not dynamic"; fi
 size=$(stat -c %s "$GO")
-if [ "$size" -gt 1000000 ] && [ "$size" -lt 4000000 ]; then
+if [ "$size" -gt 1000000 ] && [ "$size" -lt 8000000 ]; then
   ok "go size $size"
 else
   bad "go size $size"

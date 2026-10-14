@@ -639,5 +639,80 @@ expect_rc "shell exdev exit" 1 "$TMP/sh-ex.rc"
 expect_rc "go exdev exit" 1 "$TMP/go-ex.rc"
 if [ "$(file_count '*.md' "$ec_in")" = 0 ]; then ok "exdev published nothing"; else bad "exdev published nothing"; fi
 
+# --- webhooks (shell and go must match) ---
+WH=$TMP/wh
+mkdir -p "$WH/plan"
+python3 -c '
+import http.server,sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(s):
+        b=s.rfile.read(int(s.headers["Content-Length"]))
+        open(sys.argv[1],"a").write(s.path+" "+str(s.headers.get("Authorization"))+" "+str(s.headers.get("Content-Type"))+" "+b.decode()+"\n")
+        s.send_response(500 if "fail" in s.path else 200); s.end_headers(); s.wfile.write(b"{\"success\":true}")
+    def log_message(s,*a): pass
+h=http.server.HTTPServer(("127.0.0.1",0),H); open(sys.argv[2],"w").write(str(h.server_port)); h.serve_forever()' "$WH/got" "$WH/port" &
+echo $! >> "$PIDS"
+i=0; while [ ! -s "$WH/port" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+WP=$(cat "$WH/port")
+printf 'Authorization: Bearer relkey\n' > "$WH/plan/rel.key"
+printf 'abskey\n' > "$WH/abs.key"
+printf 'ACTION: GO\n' > "$WH/body"
+for impl in sh go; do
+  [ $impl = sh ] && P=$SH || P=$GO
+  D=$WH/plan/$impl.diag
+  N=$WH/n-$impl
+  cat > "$D" <<DIAG
+blockdiag {
+  a -< b;
+  a -< r;
+  a -< s;
+  a -< i;
+  a -< f;
+  a -< x;
+}
+/*
+node a $N/a/inbox
+node b $N/b/inbox
+node r $N/r/inbox webhook=http://127.0.0.1:$WP/$impl-r webhook_key_file=rel.key
+node s $N/s/inbox webhook=http://127.0.0.1:$WP/$impl-s webhook_key_file=$WH/abs.key
+node i $N/i/inbox webhook=http://127.0.0.1:$WP/$impl-i webhook_key=Bearer\ inl
+node f $N/f/inbox webhook=http://127.0.0.1:$WP/$impl-fail webhook_key=k
+node x $N/x/inbox webhook=http://127.0.0.1:$WP/$impl-x webhook_key_file=missing.key
+verb a b GO
+verb a r GO
+verb a s GO
+verb a i GO
+verb a f GO
+verb a x GO
+message GO {
+Go.
+body: {
+ACTION: GO
+}
+}
+*/
+DIAG
+  sed -i 's/webhook_key=Bearer\\ inl/webhook_key=Bearer+inl/' "$D"
+  for n in a b r s i f x; do (cd "$WH" && "$P" --setup "plan/$impl.diag" $n >/dev/null 2>&1); done
+  for n in b r s i f x; do
+    (cd "$WH" && "$P" --send "plan/$impl.diag" a $n GO body >"$WH/$impl-$n.out" 2>"$WH/$impl-$n.err"); echo $? > "$WH/$impl-$n.rc"
+  done
+  for n in b r s i f x; do
+    if [ "$(cat "$WH/$impl-$n.rc")" = 0 ] && [ "$(file_count '*.md' "$N/$n/inbox")" = 1 ]; then ok "$impl webhook $n send queued"; else bad "$impl webhook $n send queued"; fi
+  done
+  if ! grep -q WEBHOOK "$WH/$impl-b.out" && [ ! -s "$WH/$impl-b.err" ]; then ok "$impl no-webhook node silent"; else bad "$impl no-webhook node silent"; fi
+  if grep -q "^/$impl-r Bearer relkey application/json {\"target\":\"r\",\"from\":\"a\",\"verb\":\"GO\",\"inbox\":\"$N/r/inbox\",\"file\":\"$N/r/inbox/" "$WH/got"; then ok "$impl relative key file from diag dir, header stripped"; else bad "$impl relative key file"; fi
+  if grep -q "^/$impl-s Bearer abskey " "$WH/got"; then ok "$impl absolute key file"; else bad "$impl absolute key file"; fi
+  if grep -q "^/$impl-i Bearer Bearer+inl " "$WH/got"; then ok "$impl inline key"; else bad "$impl inline key"; fi
+  if grep -q '^WEBHOOK r 200' "$WH/$impl-r.out"; then ok "$impl WEBHOOK line"; else bad "$impl WEBHOOK line"; fi
+  if grep -q '^WARNING: webhook for f failed (500)' "$WH/$impl-f.err"; then ok "$impl 500 warns"; else bad "$impl 500 warns"; fi
+  if grep -q "^WARNING: webhook for x not fired: cannot read webhook_key_file $WH/plan/missing.key" "$WH/$impl-x.err"; then ok "$impl missing relative key file warns with resolved path"; else bad "$impl missing key warn: $(cat "$WH/$impl-x.err")"; fi
+  if ! grep -q "^/$impl-x " "$WH/got"; then ok "$impl missing key not posted"; else bad "$impl missing key not posted"; fi
+  sed 's/webhook_key=k/webhook_key=k webhook_key_file=z/' "$D" > "$WH/bad.diag"
+  if "$P" --send "$WH/bad.diag" a b GO "$WH/body" 2>&1 | grep -q 'use webhook_key_file or webhook_key, not both'; then ok "$impl both keys rejected"; else bad "$impl both keys rejected"; fi
+  sed 's|webhook=http://127.0.0.1:[0-9]*/'$impl'-x |bogus=1 |' "$D" > "$WH/bad.diag"
+  if "$P" --send "$WH/bad.diag" a b GO "$WH/body" 2>&1 | grep -q 'unknown node option bogus'; then ok "$impl unknown option rejected"; else bad "$impl unknown option rejected"; fi
+done
+
 printf '%s\n' "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

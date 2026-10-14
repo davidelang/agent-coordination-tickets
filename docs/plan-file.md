@@ -14,6 +14,14 @@ node NAME /absolute/inbox
 
 Messages to NAME are placed in that directory by an atomic rename. When NAME finishes a message, it removes the file. If NAME is restarted, it handles the oldest file still in the inbox. The path is absolute.
 
+A node line may also carry a webhook, fired after each message queued to NAME:
+
+```
+node NAME /absolute/inbox webhook=URL [webhook_key=TOKEN | webhook_key_file=PATH]
+```
+
+Give only the key; the tool sends `Authorization: Bearer <key>` (a leading `Bearer ` or `Authorization: Bearer ` is stripped). The inline key and the key file are both fully supported. A relative `webhook_key_file` is resolved from the plan file's directory, and the file's first line is the key. The POST body is `{"target","from","verb","inbox","file"}` as JSON. A webhook failure prints a `WARNING`; the message stays queued and the send still succeeds. Details: [bin/README.md](../bin/README.md#webhooks-optional).
+
 ## verb
 
 ```

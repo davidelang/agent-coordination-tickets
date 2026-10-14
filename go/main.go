@@ -50,7 +50,7 @@ type plan struct {
 	hooks     map[string]hook
 }
 
-// Optional per-node webhook: node NAME PATH webhook=URL [webhook_key_file=PATH|webhook_key=TOKEN]
+// Optional per-node webhook: node NAME PATH webhook=URL [webhook_key=TOKEN|webhook_key_file=PATH (relative: diag dir)]
 type hook struct{ url, keyFile, key string }
 
 func die(msg string) {
@@ -81,14 +81,15 @@ The name selects the mode, so those forms do not need --setup, --arm, or --send.
 Options may sit before or after the file and the node. -- ends the options.
 
 Webhooks (optional, per node, workflow-specific: they live only in that diag):
-  node NAME /abs/inbox webhook=URL [webhook_key_file=/abs/file | webhook_key=TOKEN]
+  node NAME /abs/inbox webhook=URL [webhook_key=TOKEN | webhook_key_file=PATH]
+A relative webhook_key_file is resolved from the diag file's directory.
+Give only the key: the tool sends Authorization: Bearer KEY. A leading
+"Authorization: Bearer " or "Bearer " is stripped (key file: first line).
 After channel-send queues a message to NAME, it POSTs JSON
   {"target","from","verb","inbox","file"}
-to URL with Content-Type: application/json and, if a key is given,
-Authorization: Bearer KEY (key file: first line; a leading "Bearer " is dropped).
+to URL with Content-Type: application/json.
 Success prints "WEBHOOK NAME CODE RESPONSE". Any failure prints a WARNING on
 stderr; the message stays queued and the exit status is still 0.
-Prefer webhook_key_file (mode 0600, outside the repo) over an inline key.
 `)
 }
 
@@ -578,9 +579,6 @@ func parseKey(text string, lineBase int) plan {
 					}
 					h.url = val
 				case "webhook_key_file":
-					if !filepath.IsAbs(val) {
-						die(fmt.Sprintf("line %d: webhook_key_file must be absolute", n))
-					}
 					h.keyFile = val
 				case "webhook_key":
 					h.key = val
@@ -1077,13 +1075,24 @@ func fireWebhook(p plan, target, from, verb, inbox, file string) {
 	}
 	key := h.key
 	if h.keyFile != "" {
-		data, err := os.ReadFile(h.keyFile)
+		kf := h.keyFile
+		if !filepath.IsAbs(kf) {
+			dir, err := filepath.Abs(filepath.Dir(p.path))
+			if err != nil {
+				dir = filepath.Dir(p.path)
+			}
+			kf = filepath.Join(dir, kf)
+		}
+		data, err := os.ReadFile(kf)
 		if err != nil {
-			warn("not fired: cannot read webhook_key_file " + h.keyFile)
+			warn("not fired: cannot read webhook_key_file " + kf)
 			return
 		}
 		key = strings.TrimRight(strings.SplitN(string(data), "\n", 2)[0], "\r")
-		key = strings.TrimPrefix(key, "Authorization: ")
+	}
+	if strings.HasPrefix(key, "Authorization: Bearer ") {
+		key = strings.TrimPrefix(key, "Authorization: Bearer ")
+	} else {
 		key = strings.TrimPrefix(key, "Bearer ")
 	}
 	body, _ := json.Marshal(struct {

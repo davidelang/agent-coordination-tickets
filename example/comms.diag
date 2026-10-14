@@ -13,6 +13,18 @@ blockdiag {
 #   If NAME is restarted, it handles the oldest file still in the inbox.
 #   Running that work again has to be safe. A half-finished plan is not detected.
 #
+# node NAME /absolute/inbox webhook=URL [webhook_key=TOKEN | webhook_key_file=PATH]
+#   Optional. After channel-send queues a message to NAME, it POSTs to URL.
+#   Give only the key. The tool sends "Authorization: Bearer <key>".
+#   A leading "Bearer " or "Authorization: Bearer " is stripped.
+#   webhook_key=TOKEN puts the key inline. webhook_key_file=PATH reads its first line.
+#   Both are fully supported. A relative PATH is resolved from this file's directory.
+#   Body (Content-Type: application/json):
+#     {"target":NAME,"from":SENDER,"verb":VERB,"inbox":INBOX,"file":PATH}
+#   Success prints "WEBHOOK NAME CODE RESPONSE". A failure prints a WARNING;
+#   the message stays queued and the send still succeeds.
+#   Values may not contain spaces. The webhook belongs to this workflow only.
+#
 # verb SOURCE DEST WORD...
 #   SOURCE may send those words to DEST. A word needs a message block.
 #   The blocks can sit before or after the verb lines.

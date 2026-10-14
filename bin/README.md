@@ -20,17 +20,18 @@ There is no claim step and no cursor. The file stays in the inbox until the rece
 
 ## Webhooks (optional)
 
-A `node` line may name a webhook to fire after each message queued to that node. This is for a receiver that cannot block on `channel-arm`, for example a bot whose routine is started by a webhook. The webhook belongs to one workflow, so it lives only in that workflow's diag file, never in project or system config.
+A `node` line may name a webhook to fire after each message queued to that node. This is for a receiver that cannot block on `channel-arm`, for example a bot whose routine is started by a webhook. The webhook belongs to one workflow, so it lives only in that workflow's diag file, never in project or system config. The shell script (`bin/channel`) and the Go binary (`go/channel`) behave the same.
 
 ```
-node review /abs/inbox webhook=https://api2.cursor.sh/automations/webhook/<id> webhook_key_file=/abs/path/review.key
-node review /abs/inbox webhook=https://example/hook webhook_key=<token>    # inline; avoid
-node review /abs/inbox webhook=http://127.0.0.1:8765/hook                # no auth header
+node review /abs/inbox webhook=https://api2.cursor.sh/automations/webhook/<id> webhook_key=<token>
+node review /abs/inbox webhook=https://api2.cursor.sh/automations/webhook/<id> webhook_key_file=review.key
+node review /abs/inbox webhook=http://127.0.0.1:8765/hook                # no Authorization header
 ```
 
-- Options are `key=value` after the inbox path. The allowed keys are `webhook`, `webhook_key_file`, and `webhook_key`. Any other key is an error. Values may not contain spaces.
-- `webhook` must start with `http://` or `https://`. `webhook_key_file` must be absolute. Give at most one of the two key options, and a key needs `webhook`.
-- The key file's first line is the token. A leading `Bearer ` or `Authorization: Bearer ` is stripped. Keep it mode 0600 and outside any repo. The key is passed to curl on stdin, never on the command line.
-- After the rename into the inbox, `channel-send` runs `curl -sS --connect-timeout 5 --max-time 15 -X POST` with `Content-Type: application/json`, `Authorization: Bearer <key>`, and the body `{"target":NODE,"from":SENDER,"verb":VERB,"inbox":INBOX,"file":PATH}`.
-- On a 2xx it prints `WEBHOOK NAME CODE RESPONSE`. On any other result (non-2xx, no curl, unreadable key file, timeout) it prints a `WARNING:` line on stderr. The message stays queued and the exit status is unchanged.
+- Options are `key=value` after the inbox path. The allowed keys are `webhook`, `webhook_key`, and `webhook_key_file`. Any other key is an error. Values may not contain spaces.
+- `webhook` must start with `http://` or `https://`. Give at most one of the two key options, and a key needs `webhook`.
+- `webhook_key=<token>` inline and `webhook_key_file=<path>` are both fully supported. A relative `webhook_key_file` is resolved from the diag file's directory, so a key file can sit next to the plan; an absolute path also works. The file's first line is the key.
+- Give only the key. The tool builds `Authorization: Bearer <key>`. A leading `Authorization: Bearer ` or `Bearer ` is stripped, so a pasted header line also works. The key never appears on a command line.
+- After the rename into the inbox, `channel-send` POSTs (connect timeout 5s, total 15s) with `Content-Type: application/json` and the body `{"target":NODE,"from":SENDER,"verb":VERB,"inbox":INBOX,"file":PATH}`.
+- On a 2xx it prints `WEBHOOK NAME CODE RESPONSE`. On any other result (non-2xx, unreachable, unreadable key file, timeout) it prints a `WARNING:` line on stderr. The message stays queued and the exit status is unchanged.
 - Nodes without a webhook behave exactly as before. `--whatineedtoknow` does not print webhook URLs or keys.

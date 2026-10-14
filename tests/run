@@ -425,6 +425,17 @@ fi
 
 capture "$TMP/go-set" "$TMP/go-set.err" "$TMP/go-set.rc" "$ROOT/go/channel-setup" "$PLAN" coder
 expect_text "go setup line" "$TMP/go-set" "node coder inbox $CIN"
+touch "$CIN/keep-me"
+capture "$TMP/go-re" "$TMP/go-re.err" "$TMP/go-re.rc" "$ROOT/go/channel-setup" "$PLAN" coder
+capture "$TMP/sh-re" "$TMP/sh-re.err" "$TMP/sh-re.rc" "$ROOT/bin/channel-setup" "$PLAN" coder
+capture "$TMP/py-re" "$TMP/py-re.err" "$TMP/py-re.rc" python3 "$PY" setup "$PLAN" coder
+expect_text "go setup rerun reports existing" "$TMP/go-re" "node coder inbox $CIN existing"
+expect_rc "go setup rerun exit" 0 "$TMP/go-re.rc"
+same "setup rerun shell/go" "$TMP/sh-re" "$TMP/go-re"
+same "setup rerun shell/py" "$TMP/sh-re" "$TMP/py-re"
+expect_rc "shell setup rerun exit" 0 "$TMP/sh-re.rc"
+if [ -f "$CIN/keep-me" ] && [ "$(stat -c %a "$CIN")" = 2775 ]; then ok "setup rerun kept inbox contents"; else bad "setup rerun kept inbox contents"; fi
+rm -f "$CIN/keep-me"
 if [ "$(stat -c %a "$TMP/nodes/coder")" = 2775 ] && [ "$(stat -c %a "$CIN")" = 2775 ]; then
   ok "go directory modes"
 else

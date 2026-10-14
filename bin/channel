@@ -523,6 +523,7 @@ send: $bindir/channel-send $plan $me DEST VERB BODYFILE [REF ...]
   REF files are optional; they are copied into refs/ and listed in the message.
   On a -> arrow the send waits until DEST removes your previous message; on -< it queues.
 done: rm the FILE from $inbox when you have finished handling it. Removing it is the acknowledgement.
+  You may move a FILE into $inbox/claimed/ while you work on it (the watch ignores subfolders, so it shows the next file); rm it from there only after your reply is sent.
 after a start or a compact, run $bindir/channel-arm $plan $me --whatineedtoknow again.
 
 ACTEOF
@@ -716,9 +717,16 @@ cmd_setup() {
   fi
   umask 002
   refs=$(dirname "$PLAN")/refs
-  mkdir -p "$refs"
-  chmod 2775 "$refs" 2>/dev/null || note "chmod 2775 $refs failed"
   inbox=$(node_path "$2")
+  # Rerunning on an existing node is safe: create whatever is missing, change nothing that exists.
+  if [ ! -d "$refs" ]; then
+    mkdir -p "$refs"
+    chmod 2775 "$refs" 2>/dev/null || note "chmod 2775 $refs failed"
+  fi
+  if [ -d "$inbox" ]; then
+    say "node $2 inbox $inbox existing"
+    return 0
+  fi
   mkdir -p "$inbox"
   node=$(dirname "$inbox")
   chmod 2775 "$node" 2>/dev/null || note "chmod 2775 $node failed"

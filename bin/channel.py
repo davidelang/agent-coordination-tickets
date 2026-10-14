@@ -385,6 +385,7 @@ ACT_LINES = [
     '  REF files are optional; they are copied into refs/ and listed in the message.',
     '  On a -> arrow the send waits until DEST removes your previous message; on -< it queues.',
     'done: rm the FILE from {INBOX} when you have finished handling it. Removing it is the acknowledgement.',
+    '  You may move a FILE into {INBOX}/claimed/ while you work on it (the watch ignores subfolders, so it shows the next file); rm it from there only after your reply is sent.',
     'after a start or a compact, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again.',
     '',
 ]
@@ -457,10 +458,15 @@ def cmd_setup(plan_path, me, dry_run, what):
         return
     old = os.umask(0o002)
     try:
+        # Rerunning on an existing node is safe: create whatever is missing, change nothing that exists.
         refs = plan_path.parent / "refs"
-        refs.mkdir(parents=True, exist_ok=True)
-        try_chmod(refs, 0o2775)
+        if not refs.is_dir():
+            refs.mkdir(parents=True, exist_ok=True)
+            try_chmod(refs, 0o2775)
         inbox = nodes[me]
+        if inbox.is_dir():
+            say(f"node {me} inbox {inbox} existing")
+            return
         inbox.mkdir(parents=True, exist_ok=True)
         node = node_dir(inbox)
         try_chmod(node, 0o2775)

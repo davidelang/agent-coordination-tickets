@@ -6,7 +6,7 @@ Each command takes the plan file and a bare node name. Options follow the `getop
 
 | Script | When |
 |---|---|
-| `channel-setup FILE NODE [-n\|--dry-run] [--whatineedtoknow]` | Once per node, by a human. Creates that node's inbox and a `refs/` directory next to the plan file, all mode 2775 (setgid, group-writable, no sticky bit). `-n` checks the plan, prints the directed edges, and creates nothing. |
+| `channel-setup FILE NODE [-n\|--dry-run] [--whatineedtoknow]` | Once per node, by a human. Creates that node's inbox and a `refs/` directory next to the plan file, all mode 2775 (setgid, group-writable, no sticky bit). Safe to rerun: on an existing node it prints `node NODE inbox PATH existing`, exits 0, and changes nothing, so a skill can call it whenever the inbox is missing. `-n` checks the plan, prints the directed edges, and creates nothing. |
 | `channel-arm FILE NODE [--whatineedtoknow]` | The receiver leaves this running. It prints `READY`, then `FILE <path>` for the oldest message in that inbox. When that file is removed, it prints the new oldest. It does not print a newer file while an older one is still there. |
 | `channel-send FILE NODE DEST VERB BODY [REF ...] [--whatineedtoknow]` | The sender. Checks `VERB` is allowed on that arrow and that `BODY` matches the message block. Copies refs into `refs/`, then renames the message into the destination inbox. On a `->` arrow it waits until this sender's previous file there is removed. The destination inbox has to exist already. |
 
@@ -35,3 +35,7 @@ node review /abs/inbox webhook=http://127.0.0.1:8765/hook                # no Au
 - After the rename into the inbox, `channel-send` POSTs (connect timeout 5s, total 15s) with `Content-Type: application/json` and the body `{"target":NODE,"from":SENDER,"verb":VERB,"inbox":INBOX,"file":PATH}`.
 - On a 2xx it prints `WEBHOOK NAME CODE RESPONSE`. On any other result (non-2xx, unreachable, unreadable key file, timeout) it prints a `WARNING:` line on stderr. The message stays queued and the exit status is unchanged.
 - Nodes without a webhook behave exactly as before. `--whatineedtoknow` does not print webhook URLs or keys.
+
+## In-progress files
+
+`channel-arm` only announces message files directly inside `inbox/`; subdirectories are ignored. A node may move a message it is working on into `inbox/claimed/` (create it with mode 2775) so the watch moves on. Remove the claimed file only after the reply to it has been sent.

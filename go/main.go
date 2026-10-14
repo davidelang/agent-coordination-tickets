@@ -701,6 +701,7 @@ func emitAct(me string, p plan) {
 		"  REF files are optional; they are copied into refs/ and listed in the message.",
 		"  On a -> arrow the send waits until DEST removes your previous message; on -< it queues.",
 		"done: rm the FILE from {INBOX} when you have finished handling it. Removing it is the acknowledgement.",
+		"  You may move a FILE into {INBOX}/claimed/ while you work on it (the watch ignores subfolders, so it shows the next file); rm it from there only after your reply is sent.",
 		"after a start or a compact, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again.",
 		"",
 	} {
@@ -779,12 +780,19 @@ func cmdSetup(path, me string, dry, what bool) {
 	}
 	old := syscall.Umask(0o002)
 	defer syscall.Umask(old)
+	// Rerunning on an existing node is safe: create whatever is missing, change nothing that exists.
 	refs := filepath.Join(filepath.Dir(p.path), "refs")
-	if err := os.MkdirAll(refs, 0o775); err != nil {
-		die(err.Error())
+	if info, err := os.Stat(refs); err != nil || !info.IsDir() {
+		if err := os.MkdirAll(refs, 0o775); err != nil {
+			die(err.Error())
+		}
+		tryChmod(refs, os.ModeSetgid|0o775)
 	}
-	tryChmod(refs, os.ModeSetgid|0o775)
 	inbox := p.nodes[me]
+	if info, err := os.Stat(inbox); err == nil && info.IsDir() {
+		say("node " + me + " inbox " + inbox + " existing")
+		return
+	}
 	if err := os.MkdirAll(inbox, 0o775); err != nil {
 		die(err.Error())
 	}

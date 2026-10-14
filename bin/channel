@@ -25,7 +25,8 @@ channel-setup, channel-arm, and channel-send are names for this same program.
 The name selects the mode, so those forms do not need --setup, --arm, or --send.
 
 -n, --dry-run       check the plan and create nothing (setup only)
---whatineedtoknow   print the nodes and messages this node uses, then exit
+--whatineedtoknow   print how to act (paths, watch/send commands, body rules), then
+                    the nodes and messages this node uses, then exit
 -h, --help          print this help
 
 Options may sit before or after the file and the node. -- ends the options.
@@ -500,7 +501,42 @@ report_edges() {
   say "dry-run"
 }
 
+emit_act() {
+  me=$1
+  plan=$(abs_path "$PLAN")
+  inbox=$(abs_path "$(node_path "$me")")
+  bindir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+  cat <<ACTEOF
+how to act:
+you are node $me
+plan: $plan
+inbox: $inbox
+watch: $bindir/channel-arm $plan $me
+  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.
+read: a message file has FROM, TO, SEQ, VERB and REFS (paths relative to the plan directory, or - none), then a --- line, then the body.
+  Handle the oldest FILE first, one file at a time.
+send: $bindir/channel-send $plan $me DEST VERB BODYFILE [REF ...]
+  DEST is a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below).
+  BODYFILE is the path of a file you write first, holding that verb's body lines below.
+  Copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.
+  Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.
+  REF files are optional; they are copied into refs/ and listed in the message.
+  On a -> arrow the send waits until DEST removes your previous message; on -< it queues.
+done: rm the FILE from $inbox when you have finished handling it. Removing it is the acknowledgement.
+after a start or a compact, run $bindir/channel-arm $plan $me --whatineedtoknow again.
+
+ACTEOF
+}
+
+abs_path() {
+  case $1 in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$(pwd)" "${1#./}" ;;
+  esac
+}
+
 emit_what() {
+  emit_act "$1"
   awk -F '\t' -v me="$1" '
 function sort_into(src, dst,    n, i, j, tmp, k) {
   n = 0
@@ -685,8 +721,8 @@ cmd_setup() {
   inbox=$(node_path "$2")
   mkdir -p "$inbox"
   node=$(dirname "$inbox")
-  chmod 2750 "$node" 2>/dev/null || note "chmod 2750 $node failed"
-  chmod 3775 "$inbox" 2>/dev/null || note "chmod 3775 $inbox failed"
+  chmod 2775 "$node" 2>/dev/null || note "chmod 2775 $node failed"
+  chmod 2775 "$inbox" 2>/dev/null || note "chmod 2775 $inbox failed"
   say "node $2 inbox $inbox"
 }
 

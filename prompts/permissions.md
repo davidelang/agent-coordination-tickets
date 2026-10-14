@@ -15,8 +15,8 @@ The script creates directories and sets modes. It does not change the owner. Aft
 
 | Path | Mode | Owner | Why |
 |---|---|---|---|
-| node directory | `2750` | the agent whose inbox is inside it | That user writes the outgoing counter and the temp file. The group can traverse into the inbox and cannot replace the counter. |
-| `inbox/` | `3775` | the receiving agent | Setgid so the message inherits the inbox group. Sticky so one sender cannot delete another's file. Group-writable so a sender in the group can create a file. The directory owner removes a file when the work is done. |
+| node directory | `2775` | the agent whose inbox is inside it | Setgid and group-writable, the same as the rest of an `ai-sandbox`-style sandbox. The node's sender writes the outgoing counter and the temp file here, whichever group member it runs as. |
+| `inbox/` | `2775` | the receiving agent | Setgid so the message inherits the inbox group. Group-writable so a sender in the group can create a file and the receiver can remove it when the work is done, whichever group member created the directory. No sticky bit: with one, a receiver running as a different user from the directory owner could not remove messages it did not send. The trade-off is that any group member can remove any message. |
 | message files | `0660` | the sender, group of the inbox | The script sets this mode. The receiver reads via the group. |
 | `refs/` | `2775` | either sender, shared group | Every sender copies a reference here before the rename. |
 

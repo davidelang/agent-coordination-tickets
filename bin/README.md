@@ -6,11 +6,11 @@ Each command takes the plan file and a bare node name. Options follow the `getop
 
 | Script | When |
 |---|---|
-| `channel-setup FILE NODE [-n\|--dry-run] [--whatineedtoknow]` | Once per node, by a human. Creates that node's inbox and a `refs/` directory next to the plan file. `-n` checks the plan, prints the directed edges, and creates nothing. |
+| `channel-setup FILE NODE [-n\|--dry-run] [--whatineedtoknow]` | Once per node, by a human. Creates that node's inbox and a `refs/` directory next to the plan file, all mode 2775 (setgid, group-writable, no sticky bit). `-n` checks the plan, prints the directed edges, and creates nothing. |
 | `channel-arm FILE NODE [--whatineedtoknow]` | The receiver leaves this running. It prints `READY`, then `FILE <path>` for the oldest message in that inbox. When that file is removed, it prints the new oldest. It does not print a newer file while an older one is still there. |
 | `channel-send FILE NODE DEST VERB BODY [REF ...] [--whatineedtoknow]` | The sender. Checks `VERB` is allowed on that arrow and that `BODY` matches the message block. Copies refs into `refs/`, then renames the message into the destination inbox. On a `->` arrow it waits until this sender's previous file there is removed. The destination inbox has to exist already. |
 
-`--whatineedtoknow` prints the nodes this one talks to and the `message` blocks on those arrows, then exits. It does not create directories, send, or watch. Run it on `channel-arm` after a start or a compact. The flag is on all three so the dump is not a fourth command.
+`--whatineedtoknow` starts with a "how to act" header filled in for that node: the absolute plan and inbox paths, the exact `channel-arm` watch and `channel-send` commands (the running binary's siblings), what goes in the body file, handling the oldest file first, and removing a file from the inbox when done. Then it prints the nodes this one talks to and the `message` blocks on those arrows, and exits. A bot needs nothing beyond that output. It does not create directories, send, or watch. Run it on `channel-arm` after a start or a compact. The flag is on all three so the dump is not a fourth command.
 
 The receiver removes a finished message with `rm` of that one path. There is no `channel-finish`.
 

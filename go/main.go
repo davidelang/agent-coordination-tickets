@@ -75,7 +75,8 @@ channel-setup, channel-arm, and channel-send are names for this same program.
 The name selects the mode, so those forms do not need --setup, --arm, or --send.
 
 -n, --dry-run       check the plan and create nothing (setup only)
---whatineedtoknow   print the nodes and messages this node uses, then exit
+--whatineedtoknow   print how to act (paths, watch/send commands, body rules), then
+                    the nodes and messages this node uses, then exit
 -h, --help          print this help
 
 Options may sit before or after the file and the node. -- ends the options.
@@ -669,7 +670,46 @@ func reportEdges(p plan) {
 	}
 }
 
+func emitAct(me string, p plan) {
+	plan, err := filepath.Abs(p.path)
+	if err != nil {
+		plan = p.path
+	}
+	inbox, err := filepath.Abs(p.nodes[me])
+	if err != nil {
+		inbox = p.nodes[me]
+	}
+	bin := ""
+	if exe, err := os.Executable(); err == nil {
+		bin = filepath.Dir(exe)
+	}
+	r := strings.NewReplacer("{NODE}", me, "{PLAN}", plan, "{INBOX}", inbox, "{BIN}", bin)
+	for _, line := range []string{
+		"how to act:",
+		"you are node {NODE}",
+		"plan: {PLAN}",
+		"inbox: {INBOX}",
+		"watch: {BIN}/channel-arm {PLAN} {NODE}",
+		"  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.",
+		"read: a message file has FROM, TO, SEQ, VERB and REFS (paths relative to the plan directory, or - none), then a --- line, then the body.",
+		"  Handle the oldest FILE first, one file at a time.",
+		"send: {BIN}/channel-send {PLAN} {NODE} DEST VERB BODYFILE [REF ...]",
+		"  DEST is a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below).",
+		"  BODYFILE is the path of a file you write first, holding that verb's body lines below.",
+		"  Copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.",
+		"  Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.",
+		"  REF files are optional; they are copied into refs/ and listed in the message.",
+		"  On a -> arrow the send waits until DEST removes your previous message; on -< it queues.",
+		"done: rm the FILE from {INBOX} when you have finished handling it. Removing it is the acknowledgement.",
+		"after a start or a compact, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again.",
+		"",
+	} {
+		say(r.Replace(line))
+	}
+}
+
 func emitWhat(me string, p plan) {
+	emitAct(me, p)
 	related := map[string]bool{me: true}
 	var touching []edge
 	for _, e := range p.edges {
@@ -749,8 +789,8 @@ func cmdSetup(path, me string, dry, what bool) {
 		die(err.Error())
 	}
 	node := filepath.Dir(inbox)
-	tryChmod(node, os.ModeSetgid|0o750)
-	tryChmod(inbox, os.ModeSetgid|os.ModeSticky|0o775)
+	tryChmod(node, os.ModeSetgid|0o775)
+	tryChmod(inbox, os.ModeSetgid|0o775)
 	say("node " + me + " inbox " + inbox)
 }
 

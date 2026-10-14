@@ -368,7 +368,38 @@ def report_edges(plan_path, edges):
         say(f"{src} -> {dst} {mode}{extra}")
 
 
-def emit_what(me, nodes, verbs, messages, edges):
+ACT_LINES = [
+    'how to act:',
+    'you are node {NODE}',
+    'plan: {PLAN}',
+    'inbox: {INBOX}',
+    'watch: {BIN}/channel-arm {PLAN} {NODE}',
+    '  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.',
+    'read: a message file has FROM, TO, SEQ, VERB and REFS (paths relative to the plan directory, or - none), then a --- line, then the body.',
+    '  Handle the oldest FILE first, one file at a time.',
+    'send: {BIN}/channel-send {PLAN} {NODE} DEST VERB BODYFILE [REF ...]',
+    '  DEST is a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below).',
+    "  BODYFILE is the path of a file you write first, holding that verb's body lines below.",
+    '  Copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.',
+    '  Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.',
+    '  REF files are optional; they are copied into refs/ and listed in the message.',
+    '  On a -> arrow the send waits until DEST removes your previous message; on -< it queues.',
+    'done: rm the FILE from {INBOX} when you have finished handling it. Removing it is the acknowledgement.',
+    'after a start or a compact, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again.',
+    '',
+]
+
+
+def emit_act(me, plan_path, nodes):
+    bin_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    plan = os.path.abspath(str(plan_path))
+    inbox = os.path.abspath(str(nodes[me]))
+    for line in ACT_LINES:
+        say(line.replace("{NODE}", me).replace("{PLAN}", plan).replace("{INBOX}", inbox).replace("{BIN}", bin_dir))
+
+
+def emit_what(me, nodes, verbs, messages, edges, plan_path):
+    emit_act(me, plan_path, nodes)
     """Nodes this one talks to, and the message blocks on those arrows."""
     related = {me}
     touching = []
@@ -406,7 +437,7 @@ def emit_what(me, nodes, verbs, messages, edges):
 def show_what(plan_path, me):
     plan_path, nodes, verbs, messages, edges = load_plan(plan_path)
     require_me(me, nodes, plan_path)
-    emit_what(me, nodes, verbs, messages, edges)
+    emit_what(me, nodes, verbs, messages, edges, plan_path)
 
 
 def require_dir(path, hint):
@@ -421,7 +452,7 @@ def cmd_setup(plan_path, me, dry_run, what):
         report_edges(plan_path, edges)
         say("dry-run")
     if what:
-        emit_what(me, nodes, verbs, messages, edges)
+        emit_what(me, nodes, verbs, messages, edges, plan_path)
     if dry_run or what:
         return
     old = os.umask(0o002)
@@ -432,8 +463,8 @@ def cmd_setup(plan_path, me, dry_run, what):
         inbox = nodes[me]
         inbox.mkdir(parents=True, exist_ok=True)
         node = node_dir(inbox)
-        try_chmod(node, 0o2750)
-        try_chmod(inbox, 0o3775)
+        try_chmod(node, 0o2775)
+        try_chmod(inbox, 0o2775)
         say(f"node {me} inbox {inbox}")
     finally:
         os.umask(old)

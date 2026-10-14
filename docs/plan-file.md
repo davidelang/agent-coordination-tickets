@@ -43,7 +43,7 @@ FROM-STEP: <step, or the beginning>
 }
 ```
 
-The text inside the outer braces is what the agent learns. `channel-arm FILE NODE --whatineedtoknow` prints the blocks on the arrows that touch that node, then exits. The same flag works on `channel-setup` and `channel-send`. `body:` is the shape of the file passed to `channel-send`. A field in `<...>` is filled in. Every other line is sent unchanged. `channel-send` rejects a body that drops a verbatim line or leaves a `<...>` field unfilled.
+The text inside the outer braces is what the agent learns. `channel-arm FILE NODE --whatineedtoknow` prints a "how to act" header (paths, the exact watch and send commands, body rules, remove-when-done), then the blocks on the arrows that touch that node, and exits. The same flag works on `channel-setup` and `channel-send`. `body:` is the shape of the file passed to `channel-send`. A field in `<...>` is filled in. Every other line is sent unchanged. `channel-send` rejects a body that drops a verbatim line or leaves a `<...>` field unfilled.
 
 ## Arrows
 

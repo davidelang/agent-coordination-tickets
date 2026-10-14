@@ -32,12 +32,18 @@ trap cleanup EXIT INT TERM
 ok() { pass=$((pass + 1)); printf 'ok  %s\n' "$1"; }
 bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1" >&2; }
 
+# The how-to-act header names the running binary's directory, which differs
+# between the shell, Python, and Go builds; compare it as a bare command name.
+norm_bin() { sed -E 's#[^ ]*/(channel-(arm|send)) #\1 #g' "$1"; }
+
 same() {
-  if diff -q "$2" "$3" >/dev/null 2>&1; then
+  norm_bin "$2" > "$2.norm"
+  norm_bin "$3" > "$3.norm"
+  if diff -q "$2.norm" "$3.norm" >/dev/null 2>&1; then
     ok "$1"
   else
     bad "$1"
-    diff -u "$2" "$3" >&2 || true
+    diff -u "$2.norm" "$3.norm" >&2 || true
   fi
 }
 
@@ -411,7 +417,7 @@ if [ -d "$PIN" ] && [ ! -d "$CIN" ] && [ ! -d "$AIN" ]; then
 else
   bad "setup creates only this inbox"
 fi
-if [ "$(stat -c %a "$TMP/nodes/planner")" = 2750 ] && [ "$(stat -c %a "$PIN")" = 3775 ] && [ "$(stat -c %a "$TMP/refs")" = 2775 ]; then
+if [ "$(stat -c %a "$TMP/nodes/planner")" = 2775 ] && [ "$(stat -c %a "$PIN")" = 2775 ] && [ "$(stat -c %a "$TMP/refs")" = 2775 ]; then
   ok "shell directory modes"
 else
   bad "shell directory modes $(stat -c %a "$TMP/nodes/planner") $(stat -c %a "$PIN") $(stat -c %a "$TMP/refs")"
@@ -419,7 +425,7 @@ fi
 
 capture "$TMP/go-set" "$TMP/go-set.err" "$TMP/go-set.rc" "$ROOT/go/channel-setup" "$PLAN" coder
 expect_text "go setup line" "$TMP/go-set" "node coder inbox $CIN"
-if [ "$(stat -c %a "$TMP/nodes/coder")" = 2750 ] && [ "$(stat -c %a "$CIN")" = 3775 ]; then
+if [ "$(stat -c %a "$TMP/nodes/coder")" = 2775 ] && [ "$(stat -c %a "$CIN")" = 2775 ]; then
   ok "go directory modes"
 else
   bad "go directory modes"

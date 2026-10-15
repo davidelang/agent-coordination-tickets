@@ -984,6 +984,11 @@ def fire_webhook(plan_file, target, sender, verb, inbox, file):
         os._exit(0)
 
 
+# A wrong key or URL, which no retry fixes. Everything else is retried,
+# including 400: a webhook host can report its rate limit as 400.
+PERMANENT_STATUS = (401, 403, 404, 405, 410)
+
+
 def post_once(url, key, payload):
     """One POST. Returns (status or 0, text, retry)."""
     req = urllib.request.Request(url, data=payload, method="POST", headers={"Content-Type": "application/json"})
@@ -993,7 +998,7 @@ def post_once(url, key, payload):
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status, resp.read(300).decode(errors="replace").replace("\n", " "), False
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read(300).decode(errors="replace").replace("\n", " "), exc.code >= 500 or exc.code == 429
+        return exc.code, exc.read(300).decode(errors="replace").replace("\n", " "), exc.code not in PERMANENT_STATUS
     except (urllib.error.URLError, OSError) as exc:
         return 0, str(exc), True
 

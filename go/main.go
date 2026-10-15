@@ -162,7 +162,8 @@ After channel-send queues a message to NAME, it POSTs JSON
   {"target","from","verb","inbox","file"}
 to URL with Content-Type: application/json.
 Optional webhook_retries=N (default 12) and webhook_backoff_max=T (default 30m;
-T is N, Ns, Nm or Nh): network errors, 5xx and 429 are retried with exponential
+T is N, Ns, Nm or Nh): every failure except 401, 403, 404, 405 and 410 (key or
+URL wrong) is retried with exponential
 backoff (1s, 2s, 4s, ... capped at T) in a detached background process, so the
 send returns after the first try; the final outcome goes to syslog.
 Success prints "WEBHOOK NAME CODE RESPONSE". Any failure prints a WARNING on
@@ -1558,7 +1559,17 @@ func postOnce(url, key string, body []byte, target string) (string, bool) {
 		say(fmt.Sprintf("WEBHOOK %s %d %s", target, resp.StatusCode, text))
 		return "", false
 	}
-	return fmt.Sprintf("%d\x00%s", resp.StatusCode, text), resp.StatusCode >= 500 || resp.StatusCode == 429
+	return fmt.Sprintf("%d\x00%s", resp.StatusCode, text), !permanentStatus(resp.StatusCode)
+}
+
+// permanentStatus: a wrong key or URL, which no retry fixes. Everything else is retried,
+// including 400: a webhook host can report its rate limit as 400.
+func permanentStatus(code int) bool {
+	switch code {
+	case 401, 403, 404, 405, 410:
+		return true
+	}
+	return false
 }
 
 func nextSeq(seqPath string) int {

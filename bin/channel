@@ -42,7 +42,8 @@ After channel-send queues a message to NAME, it POSTs JSON
   {"target","from","verb","inbox","file"}
 to URL with Content-Type: application/json.
 Optional webhook_retries=N (default 12) and webhook_backoff_max=T (default 30m;
-T is N, Ns, Nm or Nh): network errors, 5xx and 429 are retried with exponential
+T is N, Ns, Nm or Nh): every failure except 401, 403, 404, 405 and 410 (key or
+URL wrong) is retried with exponential
 backoff (1s, 2s, 4s, ... capped at T) in a detached background process, so the
 send returns after the first try; the final outcome goes to syslog.
 Success prints "WEBHOOK NAME CODE RESPONSE". Any failure prints a WARNING on
@@ -72,11 +73,12 @@ case "$base" in
   *) name_mode= ;;
 esac
 
-parsed=$(getopt -n "$base" -o hnm: -l help,dry-run,whatineedtoknow,setup,arm,send,ping,status,all,run:,every:,timeout: -- "$@") || exit 1
+parsed=$(getopt -n "$base" -o hnm: -l help,dry-run,whatineedtoknow,setup,arm,send,ping,status,all,run:,every:,timeout:,webhook-retry -- "$@") || exit 1
 eval set -- "$parsed"
 
 dry=0
 what=0
+wh_job=0
 flag_mode=
 MSGS=$(mktemp)
 nmsg=0
@@ -100,6 +102,7 @@ while [ $# -gt 0 ]; do
       case "$2" in ""|*[!A-Za-z0-9_.-]*) die "--run must be letters, digits, dot, underscore, or hyphen" ;; esac
       ping_run=$2; ping_all=1; shift 2 ;;
     --every) check_every=$2; shift 2 ;;
+    --webhook-retry) wh_job=1; shift ;;
     --timeout) ping_timeout=$2; shift 2 ;;
     --setup|--arm|--send|--ping|--status)
       m=${1#--}
@@ -124,6 +127,8 @@ mode=$name_mode
 if [ -n "$flag_mode" ]; then
   mode=$flag_mode
 fi
+# Internal: the detached webhook retry job started by fire_webhook.
+[ "$wh_job" -eq 0 ] || mode=webhook-retry
 if [ -z "$mode" ]; then
   if [ "$dry" -eq 1 ] || [ "$what" -eq 1 ] || [ $# -gt 0 ]; then
     die "no mode; use --setup, --arm, --send, --ping, or --status"
@@ -676,7 +681,8 @@ json_str() {
   printf '%s' "$1" | awk 'BEGIN { ORS = "" } { if (NR > 1) printf "\\n"; gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r"); print }'
 }
 
-# One POST. Sets code, resp, and retry (1 for network errors, 5xx, 429).
+# One POST. Sets code, resp, and retry (0 only for 401, 403, 404, 405, 410: a wrong key or
+# URL, which no retry fixes; 400 is retried, since a webhook host can report its rate limit as 400).
 post_once() {
   wout=$(mktemp) || { code="mktemp failed"; resp=; retry=0; return 0; }
   if [ -n "$2" ]; then
@@ -690,8 +696,8 @@ post_once() {
   code=$(printf '%s' "$code" | tr '\n' ' ')
   resp=$(head -c 300 "$wout" 2>/dev/null | tr '\n' ' '); rm -f "$wout"
   case "$code" in
-    5[0-9][0-9]|429|curl*|000*) retry=1 ;;
-    *) retry=0 ;;
+    401|403|404|405|410) retry=0 ;;
+    *) retry=1 ;;
   esac
 }
 
@@ -735,31 +741,37 @@ fire_webhook() {
   fi
   log_event webhook result retrying to "$1" from "$2" verb "$3" attempts 1 error "$code $resp" file "$5"
   note "WARNING: webhook for $1 failed ($code) ${resp}; retrying in the background (up to $wret more tries, backoff up to ${wmax}s; outcome in syslog) (message is queued)"
-  # Detached retry loop: own session, no stdio, so the sender returns now.
-  (
-    trap - EXIT INT TERM
-    attempt=1
-    delay=1
-    while [ "$attempt" -le "$wret" ]; do
-      attempt=$((attempt + 1))
-      wait=$delay
-      [ "$wait" -le "$wmax" ] || wait=$wmax
-      sleep "$wait"
-      delay=$((delay * 2))
-      post_once "$wurl" "$wkey" "$payload"
-      case "$code" in
-        2[0-9][0-9])
-          log_event webhook result ok to "$1" from "$2" verb "$3" attempts "$attempt" file "$5"
-          exit 0
-          ;;
-      esac
-      if [ "$retry" -eq 0 ] || [ "$attempt" -gt "$wret" ]; then
-        log_event webhook result fail to "$1" from "$2" verb "$3" attempts "$attempt" error "$code $resp" file "$5"
-        exit 0
-      fi
-    done
-  ) </dev/null >/dev/null 2>&1 &
+  # Detached retry job: this program again, in its own session (setsid), no stdio, so the
+  # sender returns now and the job outlives it. The job, including the key, travels in the
+  # environment, never on a command line.
+  CHANNEL_WH_URL=$wurl CHANNEL_WH_KEY=$wkey CHANNEL_WH_BODY=$payload CHANNEL_WH_TARGET=$1 \
+    CHANNEL_WH_FROM=$2 CHANNEL_WH_VERB=$3 CHANNEL_WH_FILE=$5 CHANNEL_WH_RETRIES=$wret CHANNEL_WH_MAX=$wmax \
+    setsid "$bindir/channel" --webhook-retry </dev/null >/dev/null 2>&1 &
   return 0
+}
+
+# --webhook-retry: the background retries for one webhook (job in CHANNEL_WH_* env).
+run_webhook_job() {
+  attempt=1
+  delay=1
+  while [ "$attempt" -le "$CHANNEL_WH_RETRIES" ]; do
+    attempt=$((attempt + 1))
+    wait=$delay
+    [ "$wait" -le "$CHANNEL_WH_MAX" ] || wait=$CHANNEL_WH_MAX
+    sleep "$wait"
+    delay=$((delay * 2))
+    post_once "$CHANNEL_WH_URL" "$CHANNEL_WH_KEY" "$CHANNEL_WH_BODY"
+    case "$code" in
+      2[0-9][0-9])
+        log_event webhook result ok to "$CHANNEL_WH_TARGET" from "$CHANNEL_WH_FROM" verb "$CHANNEL_WH_VERB" attempts "$attempt" file "$CHANNEL_WH_FILE"
+        return 0
+        ;;
+    esac
+    if [ "$retry" -eq 0 ] || [ "$attempt" -gt "$CHANNEL_WH_RETRIES" ]; then
+      log_event webhook result fail to "$CHANNEL_WH_TARGET" from "$CHANNEL_WH_FROM" verb "$CHANNEL_WH_VERB" attempts "$attempt" error "$code $resp" file "$CHANNEL_WH_FILE"
+      return 0
+    fi
+  done
 }
 
 # VERB, FROM and NONCE of a message file, tab-separated.
@@ -1423,5 +1435,6 @@ case "$mode" in
   setup) cmd_setup "$@" ;;
   arm) cmd_arm "$@" ;;
   send) cmd_send "$@" ;;
+  webhook-retry) run_webhook_job ;;
   *) die "unknown mode $mode" ;;
 esac

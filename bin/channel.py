@@ -478,6 +478,7 @@ ACT_LINES = [
     'plan: {PLAN}',
     'inbox: {INBOX}',
     'watch: {BIN}/channel-arm {PLAN} {NODE}',
+    "  If your agent's /channel skill names a wrapper for the watch (cursor: .cursor/lib/cursor-channel-watch {PLAN} {NODE}), run that wrapper instead and never start channel-arm yourself.",
     '  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.',
     '  If it prints ALREADY-WATCHING and exits, a watch for this node is already running: do not start another. If it exits with any other message, report that message and stop; do not work around it.',
     '  The watch answers PING for you (it sends PONG and removes the PING) and never shows it; for a check-all PING (body has SCOPE: all) it also starts the check on your own arrows.',

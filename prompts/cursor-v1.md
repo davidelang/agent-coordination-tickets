@@ -6,8 +6,8 @@ This paragraph is the Cursor desktop agent. The Cursor CLI has its own permissio
 
 The human gives you the plan file and your bare node name. Pass both exactly. Do not read them from the environment, and do not look for an identity file.
 
-Run `channel-arm PLAN NODE` as one background terminal command. Handle each stdout line the way the role section says. Do not wrap it in a pipeline. Do not poll. Do not run `inotifywait` or `mv`. The one `rm` you run is the FILE path, with no flags, after the work is done. The script lists the inbox when `inotifywait` is unavailable. That listing does not wake you.
+Run `channel-arm PLAN NODE` as one background terminal command. Handle each stdout line the way the role section says. Do not wrap it in a pipeline. Do not poll. Do not run `inotifywait` or `mv`. The one `rm` you run is the FILE path, with no flags, after the work is done.
 
-If the command exits immediately, tell the human and wait. A missing `inotifywait` is not that failure.
+If the command exits immediately, tell the human and wait. If `inotifywait` is missing, `channel-arm` exits with an error that says so; tell the human (the fix is to install inotify-tools, or for the human to set `CHANNEL_POLL=1`).
 
 The allowlist entries are in [permissions.md](permissions.md).

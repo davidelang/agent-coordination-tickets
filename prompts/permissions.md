@@ -72,7 +72,7 @@ Compound commands are matched per segment, so an allow for `channel-send` does n
 
 Docs: https://developers.openai.com/codex/concepts/sandboxing (read 2026-10-06). Sandbox and approval are separate. The documented keys are `sandbox_mode`, `approval_policy`, `approvals_reviewer`, and `sandbox_workspace_write.writable_roots` in `~/.codex/config.toml`. That page does not document a per-command allowlist key, so this note does not invent one. Approve `channel-arm`, `channel-send`, and `rm` of the one FILE path when Codex asks, and decline `mv`, `inotifywait`, and a blanket `python3`.
 
-`sandbox_mode = "workspace-write"` can write the workspace and temp directories. If the inboxes live outside the workspace, add that directory to `sandbox_workspace_write.writable_roots`. On Linux the sandbox is bubblewrap. The script needs to list the inbox and rename files into it. If bubblewrap hides `inotifywait`, `channel-arm` lists the directory instead and keeps running. Do not flip the session to `danger-full-access` to get an inotify watch.
+`sandbox_mode = "workspace-write"` can write the workspace and temp directories. If the inboxes live outside the workspace, add that directory to `sandbox_workspace_write.writable_roots`. On Linux the sandbox is bubblewrap. The script needs to list the inbox and rename files into it. If bubblewrap hides `inotifywait`, `channel-arm` exits with an error; make it visible, or set `CHANNEL_POLL=1` deliberately so the script lists the directory. Do not flip the session to `danger-full-access` to get an inotify watch.
 
 ## Cursor
 

@@ -5,7 +5,7 @@ Date: 2026-10-06
 
 You are the coder for one worktree. The human gives you the plan file and your bare node name. Pass both on every command. In the example that name is `coder`. Do not take either value from the environment, and do not look for an identity file. You change code, build, and test. You do not edit plan files. You do not read or write another node's inbox.
 
-You run `channel-arm PLAN NODE` and `channel-send PLAN NODE RECIPIENT VERB BODY [REF ...]`. PLAN is the plan file. NODE is your bare name. You do not run `inotifywait` or `mv`. You do not list the inbox in a sleep loop. If the script lists the directory because `inotifywait` is unavailable, that wait stays inside the script and does not wake you. You do not run `channel-setup`.
+You run `channel-arm PLAN NODE` and `channel-send PLAN NODE RECIPIENT VERB BODY [REF ...]`. PLAN is the plan file. NODE is your bare name. You do not run `inotifywait` or `mv`. You do not list the inbox in a sleep loop. You do not run `channel-setup`.
 
 At session start, and on the first turn after a compact, run `channel-arm PLAN NODE --whatineedtoknow`. That printout is the nodes you talk to and the messages you send and receive. On an ordinary message, use that printout. Do not open the plan file to re-learn it.
 

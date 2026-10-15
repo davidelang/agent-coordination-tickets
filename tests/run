@@ -585,7 +585,7 @@ arm_oldest() {
     sleep 0.1
   done
   if [ "$nfiles" = 2 ]; then ok "$label advances after rm"; else bad "$label advances after rm ($nfiles)"; fi
-  kill "$pid" 2>/dev/null || true
+  kill -9 "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
 }
 
@@ -614,7 +614,7 @@ if wait_for "$TMP/arm-in2.out" "READY"; then ok "shell arm ready for go note"; e
 "$ROOT/go/channel-send" "$PLAN" coder planner NOTE "$TMP/bodies/note.md" > "$TMP/in-send2.out"
 sent2=$(sed -n 's/^SENT //p' "$TMP/in-send2.out")
 if wait_for "$TMP/arm-in2.out" "FILE $sent2"; then ok "shell arm sees go send"; else bad "shell arm sees go send"; fi
-kill "$pid" 2>/dev/null || true
+kill -9 "$pid" 2>/dev/null || true
 wait "$pid" 2>/dev/null || true
 
 # shell waits on a file go already published (the PING still in the coder inbox)
@@ -850,6 +850,41 @@ for e in send ping ping-answered deliver consumed; do
   if grep -q " agent-channel event=$e " "$X/log.txt"; then ok "log has event=$e"; else bad "log has event=$e"; fi
 done
 unset CHANNEL_LOG_FILE
+
+# No fallbacks: one watch per node, inotifywait required unless CHANNEL_POLL=1, bad env values fail.
+NOINO=$TMP/noino-bin
+mkdir -p "$NOINO"
+for f in /usr/bin/* /bin/*; do
+  b=$(basename "$f")
+  [ "$b" = inotifywait ] || [ -e "$NOINO/$b" ] || [ -L "$NOINO/$b" ] || ln -s "$f" "$NOINO/$b"
+done
+for impl in go sh py; do
+  case $impl in
+    go) A="$ROOT/go/channel-arm"; P="$ROOT/go/channel-ping" ;;
+    sh) A="$ROOT/bin/channel-arm"; P="$ROOT/bin/channel-ping" ;;
+    py) A="python3 $PY arm"; P="python3 $PY ping" ;;
+  esac
+  rm -f "$X"/nodes/*/inbox/*.md "$X"/nodes/c/arm.pid
+  $A "$X/x.diag" c > "$X/$impl-dup1" 2>&1 &
+  p1=$!
+  wait_for "$X/$impl-dup1" READY || true
+  rc=0; timeout 5 $A "$X/x.diag" c > "$X/$impl-dup2" 2>&1 || rc=$?
+  if [ "$rc" = 3 ] && grep -q "^ALREADY-WATCHING c pid $p1 " "$X/$impl-dup2"; then ok "$impl second watch on a node is refused"; else bad "$impl second watch on a node is refused (rc=$rc)"; fi
+  kill -9 "$p1" 2>/dev/null || true
+  wait "$p1" 2>/dev/null || true
+  printf '%s %s\n' "$$" "$(hostname)" > "$X/nodes/c/arm.pid"
+  $A "$X/x.diag" c > "$X/$impl-dup3" 2>&1 &
+  p1=$!
+  if wait_for "$X/$impl-dup3" READY; then ok "$impl stale arm.pid (pid not an arm) does not block"; else bad "$impl stale arm.pid (pid not an arm) does not block"; fi
+  kill -9 "$p1" 2>/dev/null || true
+  wait "$p1" 2>/dev/null || true
+  rm -f "$X/nodes/c/arm.pid"
+  rc=0; PATH=$NOINO timeout 5 $A "$X/x.diag" c > "$X/$impl-noino" 2>&1 || rc=$?
+  if [ "$rc" != 0 ] && grep -q 'inotifywait not found' "$X/$impl-noino" && ! grep -q '^READY' "$X/$impl-noino"; then ok "$impl arm without inotifywait fails loudly"; else bad "$impl arm without inotifywait fails loudly (rc=$rc)"; fi
+  rm -f "$X/nodes/c/arm.pid"
+  rc=0; CHANNEL_PING_TIMEOUT=abc $P "$X/x.diag" c > "$X/$impl-badenv" 2>&1 || rc=$?
+  if [ "$rc" != 0 ] && grep -q 'must be a whole number' "$X/$impl-badenv"; then ok "$impl bad env number fails"; else bad "$impl bad env number fails (rc=$rc)"; fi
+done
 
 printf '%s\n' "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -10,7 +10,7 @@ Agents that poll a mailbox spend their context window on the waiting. A long-run
 
 Two programs implement the same protocol.
 
-`bin/channel` is a `/bin/sh` script. `channel-setup`, `channel-arm`, and `channel-send` are links to it. It needs GNU `getopt`, `awk`, `flock`, `stat`, and `date`. `inotifywait` is optional. Without it, or with `CHANNEL_POLL=1`, the watch lists the directory every 0.2 seconds and still prints a line only when the oldest file changes.
+`bin/channel` is a `/bin/sh` script. `channel-setup`, `channel-arm`, and `channel-send` are links to it. It needs GNU `getopt`, `setsid`, `awk`, `stat`, and `date`. It also needs `inotifywait` (inotify-tools); without it `channel-arm` and a waiting `channel-send` exit with an error rather than switching to something else. `CHANNEL_POLL=1` is the one deliberate alternative: the watch lists the directory every 0.2 seconds and still prints a line only when the oldest file changes. If `inotifywait` stops while running, the command exits with an error.
 
 `go/channel` is a static binary built from the Go standard library only. The same three names are links to that binary. Build it with the command in [go/README.md](go/README.md). The agent runs that binary, so a permission grant keys off the program name.
 

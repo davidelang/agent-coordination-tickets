@@ -14,6 +14,6 @@ On startup, and any time you are awake and the monitor is not running:
 
 Each stdout line is one wake. Handle it the way the role section says, then end the turn. The monitor stays up. Do not poll, sleep, or re-read the inbox between lines. `--whatineedtoknow` is a separate command that prints and exits. Do not put that flag on the monitor.
 
-A stderr line that the script is listing the inbox is the POSIX fallback. Leave the monitor running. You are woken by stdout lines only. If the script exits immediately, tell the human the stderr reason and do not restart until they say it is fixed. A missing `inotifywait` is not that failure. A monitor that hits its lifetime cap gets one replacement, then you tell the human.
+A stderr line that the script is listing the inbox means the human set `CHANNEL_POLL=1`. Leave the monitor running. You are woken by stdout lines only. If the script exits immediately, tell the human the stderr reason and do not restart until they say it is fixed. A missing `inotifywait` is such a failure (the stderr says so). A monitor that hits its lifetime cap gets one replacement, then you tell the human.
 
 Permission to add, and the Landlock write grant, are in [permissions.md](permissions.md). Do not ask for `mv`, `inotifywait`, or a blanket `python3`. The one `rm` you run is the FILE path, with no flags.

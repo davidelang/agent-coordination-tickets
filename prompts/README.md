@@ -2,7 +2,7 @@
 
 How to stand the channel up is [../README.md](../README.md). The filesystem sequence is the scripts in [../bin/](../bin/). A model that cannot run a shell cannot use the channel. Different model versions of the same product use the same wake paragraph.
 
-`channel-arm` and a waiting `channel-send` use `inotifywait` when it works. Otherwise they list the inbox every 0.2 seconds. That listing is inside the script, prints a line only when the oldest file changes, and uses no model tokens. The model still does not poll. `CHANNEL_POLL=1` forces the listing. This is part of v1.
+`channel-arm` and a waiting `channel-send` use `inotifywait`. If it is missing or stops, they exit with an error; they never switch on their own. `CHANNEL_POLL=1`, set deliberately, makes them list the inbox every 0.2 seconds instead. That listing is inside the script, prints a line only when the oldest file changes, and uses no model tokens. The model still does not poll. This is part of v1.
 
 The files below are sections of one prompt. Put the role section and the product paragraph in that one prompt. The agent does not open a second file to learn the messages. At session start, and on the first turn after a compact, it runs `channel-arm PLAN NODE --whatineedtoknow` and uses that output until the next compact. For Grok, that one sentence has to live in a project rule (`AGENTS.md` or `.grok/rules/*.md`), which is reloaded from disk.
 

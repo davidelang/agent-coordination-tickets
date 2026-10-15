@@ -60,6 +60,7 @@ rc=0
 getopt -T >/dev/null 2>&1 || rc=$?
 [ "$rc" -eq 4 ] || die "need GNU getopt (util-linux)"
 command -v awk >/dev/null 2>&1 || die "need awk"
+command -v setsid >/dev/null 2>&1 || die "need setsid (util-linux)"
 
 base=$(basename "$0")
 case "$base" in
@@ -113,6 +114,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+case "$check_every" in ""|*[!0-9]*) die "--every / CHANNEL_CHECKALL_EVERY must be a whole number >= 0, got \"$check_every\"" ;; esac
+case "$ping_timeout" in ""|*[!0-9]*|0) die "--timeout / CHANNEL_PING_TIMEOUT must be a whole number > 0, got \"$ping_timeout\"" ;; esac
+
 if [ -n "$name_mode" ] && [ -n "$flag_mode" ] && [ "$name_mode" != "$flag_mode" ]; then
   die "this command is $name_mode; $flag_mode is a different mode"
 fi
@@ -154,14 +158,17 @@ log_event() {
     line="$line $1=$v"
     shift 2
   done
-  if [ "${CHANNEL_SYSLOG:-1}" != 0 ] && command -v logger >/dev/null 2>&1; then
+  if [ "${CHANNEL_SYSLOG:-1}" != 0 ]; then
     case "$line" in
-      *result=fail*|*result=timeout*) logger -t agent-channel -p user.warning -- "$line" 2>/dev/null || true ;;
-      *) logger -t agent-channel -p user.info -- "$line" 2>/dev/null || true ;;
+      *result=fail*|*result=timeout*) lprio=user.warning ;;
+      *) lprio=user.info ;;
     esac
+    logger -t agent-channel -p "$lprio" -- "$line" ||
+      note "WARNING: syslog write failed (logger; CHANNEL_SYSLOG=0 turns syslog off): $line"
   fi
   if [ -n "${CHANNEL_LOG_FILE:-}" ]; then
-    printf '%s agent-channel %s\n' "$(date +%Y-%m-%dT%H:%M:%S%:z)" "$line" >> "$CHANNEL_LOG_FILE" 2>/dev/null || true
+    printf '%s agent-channel %s\n' "$(date +%Y-%m-%dT%H:%M:%S%:z)" "$line" >> "$CHANNEL_LOG_FILE" ||
+      note "WARNING: CHANNEL_LOG_FILE write failed: $CHANNEL_LOG_FILE"
   fi
 }
 
@@ -584,6 +591,7 @@ plan: $plan
 inbox: $inbox
 watch: $bindir/channel-arm $plan $me
   Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.
+  If it prints ALREADY-WATCHING and exits, a watch for this node is already running: do not start another. If it exits with any other message, report that message and stop; do not work around it.
   The watch answers PING for you (it sends PONG and removes the PING) and never shows it; for a check-all PING (body has SCOPE: all) it also starts the check on your own arrows.
   With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run $bindir/channel-ping --run <id> $plan $me (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).
 start: before new messages, look in $inbox/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.
@@ -792,19 +800,18 @@ handle_control() {
         log_event ping-answered node "$ARM_ME" from "$cfrom" nonce "$cnonce" scope "$cscope" run "$crun"
         if [ "$cscope" = all ] && [ -n "$crun" ]; then
           case "$crun" in
-            *[!A-Za-z0-9_.-]*) ;;
+            *[!A-Za-z0-9_.-]*)
+              note "check-all PING from $cfrom has a bad RUN \"$crun\"; not passed on"
+              log_event checkall result fail node "$ARM_ME" run "$crun" why "bad run id"
+              ;;
             *)
-              if command -v setsid >/dev/null 2>&1; then
-                setsid "$bindir/channel-ping" --run "$crun" "$PLAN" "$ARM_ME" </dev/null >/dev/null 2>&1 &
-              else
-                "$bindir/channel-ping" --run "$crun" "$PLAN" "$ARM_ME" </dev/null >/dev/null 2>&1 &
-              fi
+              setsid "$bindir/channel-ping" --run "$crun" "$PLAN" "$ARM_ME" </dev/null >/dev/null 2>&1 &
               ;;
           esac
         fi
         ;;
       PONG)
-        mv -f -- "$cpath" "$(pong_path "$ARM_ME" "$cnonce")" 2>/dev/null || true
+        mv -f -- "$cpath" "$(pong_path "$ARM_ME" "$cnonce")" || note "cannot file PONG for channel-ping"
         log_event pong-received node "$ARM_ME" from "$cfrom" nonce "$cnonce"
         ;;
     esac
@@ -856,10 +863,12 @@ watch_oldest() {
   done
 }
 
+# CHANNEL_POLL=1 is the only way to list the inbox instead of using inotifywait;
+# if inotifywait cannot run, the command fails rather than switching.
+INOTIFY_FIX="(install inotify-tools, or set CHANNEL_POLL=1 to list the inbox every 0.2s)"
 try_inotify() {
-  if [ "${CHANNEL_POLL:-}" = 1 ] || ! command -v inotifywait >/dev/null 2>&1; then
-    return 1
-  fi
+  [ "${CHANNEL_POLL:-}" = 1 ] && return 1
+  command -v inotifywait >/dev/null 2>&1 || die "inotifywait not found $INOTIFY_FIX"
   return 0
 }
 
@@ -878,10 +887,11 @@ inotify_loop() {
     fi
     fails=$((fails + 1))
     if [ "$fails" -ge 3 ]; then
-      return 1
+      die "inotifywait failed 3 times in a row (exit $rc); the watch stops. Start channel-arm again. $INOTIFY_FIX"
     fi
   done
-  return 1
+  announce "$inbox"
+  die "inbox disappeared: $inbox"
 }
 
 cmd_setup() {
@@ -918,6 +928,38 @@ cmd_setup() {
   say "node $2 inbox $inbox"
 }
 
+# Only one channel-arm watches a node. A live watch recorded in nodes/NODE/arm.pid
+# is reported (ALREADY-WATCHING, exit 3) and this one does not start.
+arm_alive() {
+  [ -r "/proc/$1/cmdline" ] || return 1
+  tr '\000' '\n' < "/proc/$1/cmdline" | awk '
+    { a[NR] = $0; n = split($0, parts, "/"); b[NR] = parts[n] }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (b[i] == "channel-arm") exit 0
+        if (b[i] == "channel.py" && a[i + 1] == "arm") exit 0
+        if (b[i] == "channel") for (j = i + 1; j <= NR; j++) if (a[j] == "--arm") exit 0
+      }
+      exit 1
+    }'
+}
+
+claim_watch() {
+  host=$(hostname) || die "cannot read hostname"
+  if [ -f "$1" ]; then
+    read -r opid ohost < "$1" || die "cannot read $1"
+    if [ -n "${ohost:-}" ] && [ "$ohost" != "$host" ]; then
+      say "ALREADY-WATCHING $2 pid $opid on host $ohost (cannot check it from here; remove $1 if that watch is gone)"
+      exit 3
+    fi
+    if [ -n "${opid:-}" ] && [ "$opid" != "$$" ] && arm_alive "$opid"; then
+      say "ALREADY-WATCHING $2 pid $opid (a watch for this node is running; do not start another)"
+      exit 3
+    fi
+  fi
+  { printf '%s %s\n' "$$" "$host" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; } || die "cannot write $1"
+}
+
 cmd_arm() {
   if [ "$dry" -eq 1 ]; then
     die "--dry-run is only for channel-setup"
@@ -938,12 +980,11 @@ cmd_arm() {
   inbox=$(node_path "$2")
   [ -d "$inbox" ] || die "no directory $inbox; run channel-setup $PLAN $2"
   ARM_ME=$2
+  claim_watch "$(dirname "$inbox")/arm.pid" "$2"
   if try_inotify; then
     say "READY"
     announce "$inbox"
-    inotify_loop "$inbox" || true
-    note "inotifywait ended; listing the inbox from here on."
-    watch_oldest "$inbox"
+    inotify_loop "$inbox"
   else
     note "channel-arm is listing the inbox every 0.2s. inotifywait is not in use."
     say "READY"
@@ -961,7 +1002,7 @@ wait_until_removed() {
   base=$2
   target=$inbox/$base
   say "PENDING $target"
-  if [ "${CHANNEL_POLL:-}" = 1 ] || ! command -v inotifywait >/dev/null 2>&1; then
+  if ! try_inotify; then
     note "channel-send is listing the inbox every 0.2s until the pending file is removed. inotifywait is not in use."
     while [ -f "$target" ]; do
       sleep 0.2
@@ -969,7 +1010,10 @@ wait_until_removed() {
     return 0
   fi
   while [ -f "$target" ]; do
-    inotifywait -q -t 1 -e moved_from -e delete --format '%f' "$inbox" >/dev/null 2>&1 || true
+    rc=0
+    inotifywait -q -t 1 -e moved_from -e delete --format '%f' "$inbox" >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ] || [ ! -f "$target" ] ||
+      die "inotifywait failed (exit $rc) while waiting for $target to be removed; nothing was sent. $INOTIFY_FIX"
   done
 }
 
@@ -1114,7 +1158,7 @@ cmd_send() {
   for ref in "$@"; do
     dest=$refs/${stamp}__${me}__${seq4}__$(basename "$ref")
     cp -- "$ref" "$dest"
-    chmod 0660 "$dest" 2>/dev/null || true
+    chmod 0660 "$dest" || note "chmod 0660 $dest failed"
     rel=refs/$(basename "$dest")
     copied=${copied}${copied:+
 }${rel}
@@ -1139,7 +1183,7 @@ cmd_send() {
     last=$(tail -c 1 "$body" 2>/dev/null || true)
     [ "$last" = "" ] || [ "$last" = "$(printf '\n')" ] || printf '\n'
   } > "$tmp"
-  chmod 0660 "$tmp" 2>/dev/null || true
+  chmod 0660 "$tmp" || note "chmod 0660 $tmp failed"
   dev1=$(stat -c %d -- "$tmp")
   dev2=$(stat -c %d -- "$inbox")
   if [ "$dev1" != "$dev2" ]; then
@@ -1172,8 +1216,12 @@ check_all_allowed() {
       return 1
     fi
   fi
-  printf '%s %s\n' "$3" "$(date +%s)" >> "$seen"
-  date +%Y-%m-%dT%H:%M:%S%:z > "$cstamp"
+  # Without the record the run and rate checks cannot stop a loop, so do not pass it on.
+  if ! { printf '%s %s\n' "$3" "$(date +%s)" >> "$seen" && date +%Y-%m-%dT%H:%M:%S%:z > "$cstamp"; }; then
+    note "check-all run $3 not started: cannot record it in $1"
+    log_event checkall result fail node "$2" run "$3" why "cannot record run"
+    return 1
+  fi
   return 0
 }
 

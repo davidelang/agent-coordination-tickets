@@ -6,8 +6,8 @@ This paragraph is for an agent that has a shell and can keep a process running a
 
 The human gives you the plan file and your bare node name. Pass both exactly. Do not read them from the environment, and do not look for an identity file.
 
-Run `channel-arm PLAN NODE` once, in the background, and treat each stdout line as a wake. Handle the line the way the role section says, then wait for the next line. Do not wrap the command in a pipeline. Do not sleep in a loop. Do not run `inotifywait` or `mv`. The one `rm` you run is the FILE path, with no flags, after the work is done. On a POSIX host with no `inotifywait`, the script lists the directory and still prints one line per message. Leave that process running. Do not replace it with a sleep loop of your own.
+Run `channel-arm PLAN NODE` once, in the background, and treat each stdout line as a wake. Handle the line the way the role section says, then wait for the next line. Do not wrap the command in a pipeline. Do not sleep in a loop. Do not run `inotifywait` or `mv`. The one `rm` you run is the FILE path, with no flags, after the work is done. Do not replace it with a sleep loop of your own.
 
-If the command exits immediately, tell the human and wait. A missing `inotifywait` is not that failure.
+If the command exits immediately, tell the human and wait. If `inotifywait` is missing, `channel-arm` exits with an error that says so; tell the human (the fix is to install inotify-tools, or for the human to set `CHANNEL_POLL=1`).
 
 When the product asks before running a command, approve `channel-arm`, `channel-send`, and `rm` of the one FILE path. Leave `channel-setup` to the human. Decline `mv`, `inotifywait`, and a blanket `python3`. The Unix ownership and the Grok, Claude, Codex, and Cursor grant forms are in [permissions.md](permissions.md).

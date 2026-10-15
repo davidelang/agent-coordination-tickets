@@ -2,7 +2,6 @@
 """Inbox channels. The model chooses a recipient and a verb. This program does the filesystem steps."""
 
 import errno
-import fcntl
 import getopt
 import json
 import syslog
@@ -11,6 +10,7 @@ import urllib.request
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -208,9 +208,20 @@ def extract_messages(text):
 
 
 HOOKS = {}
+def env_int(name, default, minimum=0):
+    """Integer from the environment; empty or unset means the default, anything else invalid is an error."""
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return default
+    if not raw.isdigit() or int(raw) < minimum:
+        print(f"{name} must be a whole number >= {minimum}, got {raw!r}", file=sys.stderr)
+        sys.exit(1)
+    return int(raw)
+
+
 OPTS = {"msgs": [], "all": False, "run": "",
-        "every": int(os.environ.get("CHANNEL_CHECKALL_EVERY", "30") or 30),
-        "timeout": int(os.environ.get("CHANNEL_PING_TIMEOUT", "300") or 300)}
+        "every": env_int("CHANNEL_CHECKALL_EVERY", 30),
+        "timeout": env_int("CHANNEL_PING_TIMEOUT", 300, 1)}
 ARM = {"me": None, "plan": None}
 
 
@@ -228,15 +239,15 @@ def log_event(event, **kv):
         try:
             syslog.openlog("agent-channel", 0, syslog.LOG_USER)
             syslog.syslog(prio, line)
-        except OSError:
-            pass
+        except OSError as exc:
+            print(f"WARNING: syslog write failed ({exc}; CHANNEL_SYSLOG=0 turns syslog off): {line}", file=sys.stderr)
     log_file = os.environ.get("CHANNEL_LOG_FILE")
     if log_file:
         try:
             with open(log_file, "a") as handle:
                 handle.write(datetime.now().astimezone().isoformat(timespec="seconds") + " agent-channel " + line + "\n")
-        except OSError:
-            pass
+        except OSError as exc:
+            print(f"WARNING: CHANNEL_LOG_FILE write failed: {exc}", file=sys.stderr)
 
 
 def parse_key(text, line_base=0):
@@ -387,13 +398,6 @@ def next_seq(seq_path):
     return current
 
 
-def lock_exclusive(path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle = open(path, "a+")
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    return handle
-
-
 def parse_message_name(name):
     match = NAME_RE.match(name)
     if not match:
@@ -475,6 +479,7 @@ ACT_LINES = [
     'inbox: {INBOX}',
     'watch: {BIN}/channel-arm {PLAN} {NODE}',
     '  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.',
+    '  If it prints ALREADY-WATCHING and exits, a watch for this node is already running: do not start another. If it exits with any other message, report that message and stop; do not work around it.',
     '  The watch answers PING for you (it sends PONG and removes the PING) and never shows it; for a check-all PING (body has SCOPE: all) it also starts the check on your own arrows.',
     '  With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run {BIN}/channel-ping --run <id> {PLAN} {NODE} (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).',
     'start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.',
@@ -589,27 +594,30 @@ def use_poll():
     return os.environ.get("CHANNEL_POLL") == "1"
 
 
+INOTIFY_FIX = "(install inotify-tools, or set CHANNEL_POLL=1 to list the inbox every 0.2s)"
+
+
 def try_inotify(args):
-    """Start inotifywait, or return None so the caller lists the directory."""
-    if use_poll() or shutil.which("inotifywait") is None:
+    """Start inotifywait. CHANNEL_POLL=1 is the only way to list the directory instead (returns None);
+    if inotifywait cannot run, the command fails rather than switching."""
+    if use_poll():
         return None
+    if shutil.which("inotifywait") is None:
+        die(f"inotifywait not found {INOTIFY_FIX}")
     try:
         proc = subprocess.Popen(
             args,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
         )
-    except OSError:
-        return None
-    if proc.stdout is None:
-        proc.terminate()
-        proc.wait()
-        return None
+    except OSError as exc:
+        die(f"cannot start inotifywait: {exc} {INOTIFY_FIX}")
     time.sleep(0.05)
     if proc.poll() is not None:
+        err = proc.stderr.read().strip()
         proc.wait()
-        return None
+        die(f"inotifywait exited at start: {err} {INOTIFY_FIX}")
     return proc
 
 
@@ -649,6 +657,47 @@ def watch_oldest(inbox, shown):
         time.sleep(POLL_SECONDS)
 
 
+def arm_alive(pid):
+    """True if pid is a running channel-arm (any implementation)."""
+    try:
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").decode(errors="replace").split("\0")
+    except OSError:
+        return False
+    for i, arg in enumerate(args):
+        base = os.path.basename(arg)
+        if base == "channel-arm":
+            return True
+        if base == "channel.py" and i + 1 < len(args) and args[i + 1] == "arm":
+            return True
+        if base == "channel" and "--arm" in args[i + 1:]:
+            return True
+    return False
+
+
+def claim_watch(pid_file, me):
+    """Only one channel-arm watches a node: a live watch in nodes/NODE/arm.pid is reported
+    (ALREADY-WATCHING, exit 3) and this one does not start."""
+    host = socket.gethostname()
+    try:
+        fields = pid_file.read_text().split()
+    except FileNotFoundError:
+        fields = []
+    except OSError as exc:
+        die(f"cannot read {pid_file}: {exc}")
+    if len(fields) == 2 and fields[1] != host:
+        say(f"ALREADY-WATCHING {me} pid {fields[0]} on host {fields[1]} (cannot check it from here; remove {pid_file} if that watch is gone)")
+        sys.exit(3)
+    if len(fields) == 2 and fields[0].isdigit() and int(fields[0]) != os.getpid() and arm_alive(int(fields[0])):
+        say(f"ALREADY-WATCHING {me} pid {fields[0]} (a watch for this node is running; do not start another)")
+        sys.exit(3)
+    tmp = pid_file.with_name(f"{pid_file.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(f"{os.getpid()} {host}\n")
+        os.replace(tmp, pid_file)
+    except OSError as exc:
+        die(f"cannot write {pid_file}: {exc}")
+
+
 def cmd_arm(plan_path, me):
     loaded = load_plan(plan_path)
     plan_path, nodes, _verbs, _messages, _edges = loaded
@@ -656,6 +705,7 @@ def cmd_arm(plan_path, me):
     ARM["me"], ARM["plan"] = me, loaded
     inbox = nodes[me]
     require_dir(inbox, f"run channel-setup {plan_path} {me}")
+    claim_watch(Path(inbox).parent / "arm.pid", me)
     proc = try_inotify(
         [
             "inotifywait",
@@ -687,8 +737,8 @@ def cmd_arm(plan_path, me):
             shown = announce(inbox, shown)
     finally:
         stop_proc(proc)
-    note("inotifywait ended; listing the inbox from here on.")
-    watch_oldest(inbox, shown)
+    announce(inbox, shown)
+    die("inotifywait ended unexpectedly; the watch stops. Start channel-arm again.")
 
 
 def wait_until_gone(path):
@@ -729,8 +779,7 @@ def wait_until_removed(inbox, name):
     finally:
         stop_proc(proc)
     if target.exists():
-        note("inotifywait ended; listing the inbox until the pending file is removed.")
-        wait_until_gone(target)
+        die(f"inotifywait ended unexpectedly while waiting for {target} to be removed; nothing was sent.")
 
 
 def publish_replace(tmp, dest):
@@ -950,15 +999,22 @@ def handle_control(inbox):
             scope, run = body_field(entry, "SCOPE"), body_field(entry, "RUN")
             entry.unlink(missing_ok=True)
             log_event("ping-answered", node=me, **{"from": sender}, nonce=nonce, scope=scope, run=run)
-            if scope == "all" and re.fullmatch(r"[A-Za-z0-9_.-]+", run):
-                subprocess.Popen([sys.executable, os.path.abspath(__file__), "ping", "--run", run, str(loaded[0]), me],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=True)
+            if scope == "all" and not re.fullmatch(r"[A-Za-z0-9_.-]+", run):
+                note(f"check-all PING from {sender} has a bad RUN {run!r}; not passed on")
+                log_event("checkall", result="fail", node=me, run=run, why="bad run id")
+            elif scope == "all":
+                try:
+                    subprocess.Popen([sys.executable, os.path.abspath(__file__), "ping", "--run", run, str(loaded[0]), me],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     start_new_session=True)
+                except OSError as exc:
+                    note(f"check-all run {run} not passed on: {exc}")
+                    log_event("checkall", result="fail", node=me, run=run, why=str(exc))
         elif verb == "PONG":
             try:
                 os.replace(entry, pong_path(loaded[1], me, nonce))
-            except OSError:
-                pass
+            except OSError as exc:
+                note(f"cannot file PONG for channel-ping: {exc}")
             log_event("pong-received", node=me, **{"from": sender}, nonce=nonce)
 
 
@@ -976,9 +1032,15 @@ def check_all_allowed(node, me, run, origin):
             say(f"SKIP {me} ran a check-all {int(age)}s ago (limit every {OPTS['every']} min)")
             log_event("checkall", result="skip", node=me, run=run, why="rate limit")
             return False
-    with open(seen, "a") as handle:
-        handle.write(f"{run} {int(time.time())}\n")
-    stamp.write_text(datetime.now().astimezone().isoformat(timespec="seconds") + "\n")
+    try:
+        with open(seen, "a") as handle:
+            handle.write(f"{run} {int(time.time())}\n")
+        stamp.write_text(datetime.now().astimezone().isoformat(timespec="seconds") + "\n")
+    except OSError as exc:
+        # Without the record the run and rate checks cannot stop a loop, so do not pass it on.
+        note(f"check-all run {run} not started: cannot record it: {exc}")
+        log_event("checkall", result="fail", node=me, run=run, why="cannot record run")
+        return False
     return True
 
 

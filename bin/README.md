@@ -90,6 +90,21 @@ node review /abs/inbox webhook=http://127.0.0.1:8765/hook                # no Au
 - On a 2xx it prints `WEBHOOK NAME CODE RESPONSE`. On any other first result (non-2xx, unreachable, unreadable key file, timeout) it prints a `WARNING:` line on stderr. The message stays queued and the exit status is unchanged.
 - Nodes without a webhook behave exactly as before. `--whatineedtoknow` does not print webhook URLs or keys.
 
+## One watch per node
+
+`channel-arm` records itself in `nodes/NODE/arm.pid` (`PID HOST`). If that file names a live `channel-arm` on this host, a second `channel-arm` for the same node prints `ALREADY-WATCHING NODE pid PID (...)` and exits with status 3 instead of starting; the running watch keeps going. A pid that is gone or is not a `channel-arm` does not block. A pid recorded by another host cannot be checked, so it is reported the same way; remove the file if that watch is gone.
+
+## No fallbacks
+
+Each step has one defined path; when it cannot run, the command fails with a message instead of quietly doing something else.
+
+- `inotifywait` is required. If it is missing, exits at start, or stops while running, `channel-arm` / `channel-send` exit with an error. `CHANNEL_POLL=1` is the only way to list the inbox every 0.2s instead, and it must be set on purpose.
+- Numbers in `CHANNEL_CHECKALL_EVERY` / `CHANNEL_PING_TIMEOUT` (and `--every` / `--timeout`) must be whole numbers; anything else is an error (unset or empty means the default).
+- A syslog or `CHANNEL_LOG_FILE` write that fails prints a `WARNING` on stderr (set `CHANNEL_SYSLOG=0` to turn syslog off deliberately).
+- A check-all that cannot be passed on (bad `RUN`, cannot start, cannot record the run) is printed and logged as `event=checkall result=fail`; a node that cannot record a run does not pass it on.
+- A PONG that cannot be filed, or a sent file whose mode cannot be set, prints a note.
+- The shell version needs `setsid` (util-linux, like GNU `getopt`).
+
 ## In-progress files and restarts
 
 `channel-arm` only announces message files directly inside `inbox/`; subdirectories are ignored. A node may move a message it is working on into `inbox/claimed/` (create it with mode 2775) so the watch moves on. Remove the claimed file only after the reply to it has been sent.

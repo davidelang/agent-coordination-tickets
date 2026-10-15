@@ -815,16 +815,17 @@ func reportEdges(p plan) {
 func emitAct(me string, p plan) {
 	plan, err := filepath.Abs(p.path)
 	if err != nil {
-		plan = p.path
+		die("cannot resolve plan path: " + err.Error())
 	}
 	inbox, err := filepath.Abs(p.nodes[me])
 	if err != nil {
-		inbox = p.nodes[me]
+		die("cannot resolve inbox path: " + err.Error())
 	}
-	bin := ""
-	if exe, err := os.Executable(); err == nil {
-		bin = filepath.Dir(exe)
+	exe, err := os.Executable()
+	if err != nil {
+		die("cannot find this program's path for the header: " + err.Error())
 	}
+	bin := filepath.Dir(exe)
 	r := strings.NewReplacer("{NODE}", me, "{PLAN}", plan, "{INBOX}", inbox, "{BIN}", bin)
 	for _, line := range []string{
 		"how to act:",
@@ -833,6 +834,7 @@ func emitAct(me string, p plan) {
 		"inbox: {INBOX}",
 		"watch: {BIN}/channel-arm {PLAN} {NODE}",
 		"  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.",
+		"  If it prints ALREADY-WATCHING and exits, a watch for this node is already running: do not start another. If it exits with any other message, report that message and stop; do not work around it.",
 		"  The watch answers PING for you (it sends PONG and removes the PING) and never shows it; for a check-all PING (body has SCOPE: all) it also starts the check on your own arrows.",
 		"  With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run {BIN}/channel-ping --run <id> {PLAN} {NODE} (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).",
 		"start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.",
@@ -986,6 +988,7 @@ func cmdArm(path, me string) {
 	armPlan, armMe, armActive = p, me, true
 	inbox := p.nodes[me]
 	requireDir(inbox, "run channel-setup "+path+" "+me)
+	claimWatch(filepath.Join(filepath.Dir(inbox), "arm.pid"), me)
 	proc := tryInotify([]string{
 		"inotifywait", "-m", "-q",
 		"-e", "moved_to", "-e", "moved_from", "-e", "delete",
@@ -1005,8 +1008,67 @@ func cmdArm(path, me string) {
 		shown = announce(inbox, shown)
 	}
 	stopProc(proc)
-	note("inotifywait ended; listing the inbox from here on.")
-	watchOldest(inbox, shown)
+	announce(inbox, shown)
+	die("inotifywait ended unexpectedly; the watch stops. Start channel-arm again.")
+}
+
+// claimWatch makes sure only one channel-arm watches a node. A live watch recorded in
+// nodes/NODE/arm.pid is reported (ALREADY-WATCHING, exit 3) and this one does not start.
+func claimWatch(pidFile, me string) {
+	host, err := os.Hostname()
+	if err != nil {
+		die("cannot read hostname: " + err.Error())
+	}
+	data, err := os.ReadFile(pidFile)
+	switch {
+	case err == nil:
+		f := strings.Fields(string(data))
+		if len(f) == 2 && f[1] != host {
+			say("ALREADY-WATCHING " + me + " pid " + f[0] + " on host " + f[1] + " (cannot check it from here; remove " + pidFile + " if that watch is gone)")
+			os.Exit(3)
+		}
+		if len(f) == 2 {
+			if pid, perr := strconv.Atoi(f[0]); perr == nil && pid != os.Getpid() && armAlive(pid) {
+				say("ALREADY-WATCHING " + me + " pid " + f[0] + " (a watch for this node is running; do not start another)")
+				os.Exit(3)
+			}
+		}
+	case !os.IsNotExist(err):
+		die("cannot read " + pidFile + ": " + err.Error())
+	}
+	tmp := fmt.Sprintf("%s.tmp.%d", pidFile, os.Getpid())
+	if err := os.WriteFile(tmp, []byte(fmt.Sprintf("%d %s\n", os.Getpid(), host)), 0o664); err != nil {
+		die("cannot write " + pidFile + ": " + err.Error())
+	}
+	if err := os.Rename(tmp, pidFile); err != nil {
+		die("cannot write " + pidFile + ": " + err.Error())
+	}
+}
+
+// armAlive reports whether pid is a running channel-arm (any implementation).
+func armAlive(pid int) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	args := strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
+	for i, a := range args {
+		switch filepath.Base(a) {
+		case "channel-arm":
+			return true
+		case "channel.py":
+			if i+1 < len(args) && args[i+1] == "arm" {
+				return true
+			}
+		case "channel":
+			for _, b := range args[i+1:] {
+				if b == "--arm" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func announce(inbox, shown string) string {
@@ -1050,26 +1112,30 @@ func watchOldest(inbox, shown string) {
 
 func usePoll() bool { return os.Getenv("CHANNEL_POLL") == "1" }
 
+// tryInotify starts inotifywait. CHANNEL_POLL=1 is the only way to list the inbox
+// instead; if inotifywait cannot run, the command fails rather than switching.
 func tryInotify(args []string) io.Reader {
 	if usePoll() {
 		return nil
 	}
+	const fix = " (install inotify-tools, or set CHANNEL_POLL=1 to list the inbox every 0.2s)"
 	if _, err := exec.LookPath(args[0]); err != nil {
-		return nil
+		die("inotifywait not found" + fix)
 	}
 	cmd := exec.Command(args[0], args[1:]...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil
+		die("cannot start inotifywait: " + err.Error() + fix)
 	}
-	cmd.Stderr = io.Discard
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
 	if err := cmd.Start(); err != nil {
-		return nil
+		die("cannot start inotifywait: " + err.Error() + fix)
 	}
 	time.Sleep(50 * time.Millisecond)
 	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
 		_ = cmd.Wait()
-		return nil
+		die("inotifywait exited at start: " + strings.TrimSpace(errb.String()) + fix)
 	}
 	return &held{Reader: stdout, cmd: cmd}
 }
@@ -1114,10 +1180,7 @@ func waitUntilRemoved(inbox, name string) {
 		}
 	}
 	if fileExists(target) {
-		note("inotifywait ended; listing the inbox until the pending file is removed.")
-		for fileExists(target) {
-			time.Sleep(poll)
-		}
+		die("inotifywait ended unexpectedly while waiting for " + target + " to be removed; nothing was sent.")
 	}
 }
 
@@ -1513,10 +1576,15 @@ var (
 )
 
 func envInt(name string, def int) int {
-	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v >= 0 {
-		return v
+	s := os.Getenv(name)
+	if s == "" {
+		return def
 	}
-	return def
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 0 {
+		die(name + " must be a whole number >= 0, got " + strconv.Quote(s))
+	}
+	return v
 }
 
 // logEvent writes one key=value line to syslog (tag agent-channel) unless
@@ -1537,18 +1605,29 @@ func logEvent(event string, kv ...string) {
 		if strings.Contains(line, "result=fail") || strings.Contains(line, "result=timeout") {
 			prio = syslog.LOG_USER | syslog.LOG_WARNING
 		}
-		if w, err := syslog.New(prio, "agent-channel"); err == nil {
-			_ = w.Info(line)
+		w, err := syslog.New(prio, "agent-channel")
+		if err == nil {
 			if prio&0x7 == syslog.LOG_WARNING {
-				_ = w.Warning(line)
+				err = w.Warning(line)
+			} else {
+				err = w.Info(line)
 			}
 			w.Close()
 		}
+		if err != nil {
+			note("WARNING: syslog write failed (" + err.Error() + "; CHANNEL_SYSLOG=0 turns syslog off): " + line)
+		}
 	}
 	if f := os.Getenv("CHANNEL_LOG_FILE"); f != "" {
-		if fh, err := os.OpenFile(f, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o660); err == nil {
-			fmt.Fprintf(fh, "%s agent-channel %s\n", time.Now().Format(time.RFC3339), line)
-			fh.Close()
+		fh, err := os.OpenFile(f, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o660)
+		if err == nil {
+			_, err = fmt.Fprintf(fh, "%s agent-channel %s\n", time.Now().Format(time.RFC3339), line)
+			if cerr := fh.Close(); err == nil {
+				err = cerr
+			}
+		}
+		if err != nil {
+			note("WARNING: CHANNEL_LOG_FILE write failed: " + err.Error())
 		}
 	}
 }
@@ -1604,11 +1683,18 @@ func handleControl(inbox string, files []string) []string {
 			scope, run := bodyField(full, "SCOPE"), bodyField(full, "RUN")
 			_ = os.Remove(full)
 			logEvent("ping-answered", "node", armMe, "from", from, "nonce", nonce, "scope", scope, "run", run)
-			if scope == "all" && safeRun.MatchString(run) {
-				spawnCheckAll(armPlan.path, armMe, run)
+			if scope == "all" {
+				if safeRun.MatchString(run) {
+					spawnCheckAll(armPlan.path, armMe, run)
+				} else {
+					note("check-all PING from " + from + " has a bad RUN " + strconv.Quote(run) + "; not passed on")
+					logEvent("checkall", "result", "fail", "node", armMe, "run", run, "why", "bad run id")
+				}
 			}
 		case "PONG":
-			_ = os.Rename(full, pongPath(armPlan, armMe, nonce))
+			if err := os.Rename(full, pongPath(armPlan, armMe, nonce)); err != nil {
+				note("cannot file PONG for channel-ping: " + err.Error())
+			}
 			logEvent("pong-received", "node", armMe, "from", from, "nonce", nonce)
 		default:
 			rest = append(rest, name)
@@ -1790,14 +1876,16 @@ func bodyField(path, key string) string {
 // (rate limit, run already seen) whether this node propagates.
 func spawnCheckAll(plan, me, run string) {
 	exe, err := os.Executable()
-	if err != nil {
-		return
+	if err == nil {
+		cmd := exec.Command(exe, "--ping", "--run", run, plan, me)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if err = cmd.Start(); err == nil {
+			_ = cmd.Process.Release()
+			return
+		}
 	}
-	cmd := exec.Command(exe, "--ping", "--run", run, plan, me)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if cmd.Start() == nil {
-		_ = cmd.Process.Release()
-	}
+	note("check-all run " + run + " not passed on: " + err.Error())
+	logEvent("checkall", "result", "fail", "node", me, "run", run, "why", err.Error())
 }
 
 // checkAllAllowed records RUN for this node and says whether it may propagate:
@@ -1822,11 +1910,21 @@ func checkAllAllowed(node, me, run string, origin bool) bool {
 			return false
 		}
 	}
-	if fh, err := os.OpenFile(seenPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o660); err == nil {
-		fmt.Fprintf(fh, "%s %d\n", run, time.Now().Unix())
-		fh.Close()
+	fh, err := os.OpenFile(seenPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o660)
+	if err == nil {
+		_, err = fmt.Fprintf(fh, "%s %d\n", run, time.Now().Unix())
+		if cerr := fh.Close(); err == nil {
+			err = cerr
+		}
 	}
-	_ = os.WriteFile(stamp, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o660)
-	_ = os.Chtimes(stamp, time.Now(), time.Now())
+	if err == nil {
+		err = os.WriteFile(stamp, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o660)
+	}
+	if err != nil {
+		// Without the record the run and rate checks cannot stop a loop, so do not pass it on.
+		note("check-all run " + run + " not started: cannot record it: " + err.Error())
+		logEvent("checkall", "result", "fail", "node", me, "run", run, "why", "cannot record run")
+		return false
+	}
 	return true
 }

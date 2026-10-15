@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/syslog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,7 +28,7 @@ import (
 const poll = 200 * time.Millisecond
 
 var (
-	ops = []string{"<->", ">-<", "<-", "->", "--", "-<", ">-"}
+	ops    = []string{"<->", ">-<", "<-", "->", "--", "-<", ">-"}
 	nameRE = regexp.MustCompile(`^(\d{8}-\d{6}\.\d{3})__(.+)__(\d+)\.md$`)
 	nodeRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]*$`)
 	msgRE  = regexp.MustCompile(`(?m)^[ \t]*message[ \t]+([A-Za-z][A-Za-z0-9_.-]*)[ \t]*\{`)
@@ -51,14 +52,24 @@ type plan struct {
 }
 
 // Optional per-node webhook: node NAME PATH webhook=URL [webhook_key=TOKEN|webhook_key_file=PATH (relative: diag dir)]
-type hook struct{ url, keyFile, key string }
+type hook struct {
+	url, keyFile, key   string
+	retries, backoffMax int
+}
 
 func die(msg string) {
 	fmt.Fprintln(os.Stderr, msg)
 	os.Exit(1)
 }
 
-func say(line string) { fmt.Println(line) }
+// quiet hides stdout lines while channel-arm answers a PING, so the agent is not woken.
+var quiet bool
+
+func say(line string) {
+	if !quiet {
+		fmt.Println(line)
+	}
+}
 
 func note(msg string) { fmt.Fprintln(os.Stderr, msg) }
 
@@ -69,7 +80,9 @@ With no mode, this prints help and exits.
 
   channel --setup FILE NODE [-n|--dry-run] [--whatineedtoknow]
   channel --arm   FILE NODE [--whatineedtoknow]
-  channel --send  FILE NODE DEST VERB BODY [REF ...] [--whatineedtoknow]
+  channel --send  FILE NODE DEST VERB [BODYFILE|-|-m TEXT ...] [REF ...] [--whatineedtoknow]
+  channel --ping  FILE NODE [--force] [--every MIN] [--timeout SEC]
+  channel --status FILE
 
 channel-setup, channel-arm, and channel-send are names for this same program.
 The name selects the mode, so those forms do not need --setup, --arm, or --send.
@@ -89,22 +102,52 @@ Give only the key: the tool sends Authorization: Bearer KEY. A leading
 After channel-send queues a message to NAME, it POSTs JSON
   {"target","from","verb","inbox","file"}
 to URL with Content-Type: application/json.
+Optional webhook_retries=N (default 3) and webhook_backoff_max=SEC (default 30):
+network errors, 5xx and 429 are retried with exponential backoff.
 Success prints "WEBHOOK NAME CODE RESPONSE". Any failure prints a WARNING on
 stderr; the message stays queued and the exit status is still 0.
+
+PING and PONG (body NONCE: <value>) are built in on every arrow; channel-arm
+answers PING itself. Events go to syslog, tag agent-channel, as key=value
+(CHANNEL_SYSLOG=0 disables; CHANNEL_LOG_FILE=PATH also appends to a file).
 `)
 }
 
 func main() {
 	nameMode := modeFromName(os.Args[0])
-	opts, rest, err := gnuGetopt(os.Args[1:], "hn", []string{
-		"help", "dry-run", "whatineedtoknow", "setup", "arm", "send",
+	opts, rest, err := gnuGetopt(os.Args[1:], "hnm:", []string{
+		"help", "dry-run", "whatineedtoknow", "setup", "arm", "send", "ping", "status",
+		"force", "every=", "timeout=",
 	})
 	if err != nil {
 		die(err.Error())
 	}
 	dry, what, helpFlag := false, false, false
 	flagMode := ""
+	var msgs []string
 	for _, opt := range opts {
+		switch {
+		case strings.HasPrefix(opt, "-m="):
+			msgs = append(msgs, opt[3:])
+			continue
+		case opt == "--force":
+			pingForce = true
+			continue
+		case strings.HasPrefix(opt, "--every="):
+			v, err := strconv.Atoi(opt[8:])
+			if err != nil || v < 0 {
+				die("--every needs whole minutes")
+			}
+			pingEvery = v
+			continue
+		case strings.HasPrefix(opt, "--timeout="):
+			v, err := strconv.Atoi(opt[10:])
+			if err != nil || v <= 0 {
+				die("--timeout needs whole seconds")
+			}
+			pingTimeout = v
+			continue
+		}
 		switch opt {
 		case "-h", "--help":
 			helpFlag = true
@@ -112,10 +155,10 @@ func main() {
 			dry = true
 		case "--whatineedtoknow":
 			what = true
-		case "--setup", "--arm", "--send":
+		case "--setup", "--arm", "--send", "--ping", "--status":
 			m := strings.TrimPrefix(opt, "--")
 			if flagMode != "" && flagMode != m {
-				die("pick one of --setup, --arm, or --send")
+				die("pick one of --setup, --arm, --send, --ping, or --status")
 			}
 			flagMode = m
 		}
@@ -133,7 +176,7 @@ func main() {
 	}
 	if mode == "" {
 		if dry || what || len(rest) > 0 {
-			die("no mode; use --setup, --arm, or --send")
+			die("no mode; use --setup, --arm, --send, --ping, or --status")
 		}
 		help()
 		return
@@ -142,7 +185,22 @@ func main() {
 	if nameMode == "" {
 		invoked = "channel --" + mode
 	}
+	if len(msgs) > 0 && mode != "send" {
+		die("-m is only for channel-send")
+	}
 	switch mode {
+	case "ping":
+		if dry || what || len(rest) != 2 {
+			die("usage: " + invoked + " FILE NODE [--force] [--every MIN] [--timeout SEC]")
+		}
+		cmdPing(rest[0], rest[1])
+		return
+	case "status":
+		if dry || what || len(rest) != 1 {
+			die("usage: " + invoked + " FILE")
+		}
+		cmdStatus(rest[0])
+		return
 	case "setup":
 		if len(rest) != 2 {
 			die("usage: " + invoked + " FILE NODE [-n|--dry-run] [--whatineedtoknow]")
@@ -174,10 +232,33 @@ func main() {
 			showWhat(rest[0], rest[1])
 			return
 		}
-		if len(rest) < 5 {
-			die("usage: " + invoked + " FILE NODE RECIPIENT VERB BODYFILE [REF ...]")
+		if len(rest) < 4 {
+			die("usage: " + invoked + " FILE NODE RECIPIENT VERB [BODYFILE|-|-m TEXT...] [REF ...]")
 		}
-		cmdSend(rest[0], rest[1], rest[2], rest[3], rest[4], rest[5:])
+		var bodyText []byte
+		var refs []string
+		switch {
+		case len(msgs) > 0:
+			bodyText = []byte(strings.Join(msgs, "\n\n") + "\n")
+			refs = rest[4:]
+		case len(rest) == 4 || rest[4] == "-":
+			b, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				die("cannot read the body from stdin")
+			}
+			bodyText = b
+			if len(rest) > 4 {
+				refs = rest[5:]
+			}
+		default:
+			b, err := os.ReadFile(rest[4])
+			if err != nil {
+				die("no body file " + rest[4])
+			}
+			bodyText = b
+			refs = rest[5:]
+		}
+		cmdSend(rest[0], rest[1], rest[2], rest[3], bodyText, refs)
 	default:
 		die("unknown mode " + mode)
 	}
@@ -192,6 +273,10 @@ func modeFromName(argv0 string) string {
 		return "arm"
 	case "channel-send":
 		return "send"
+	case "channel-ping":
+		return "ping"
+	case "channel-status":
+		return "status"
 	default:
 		return ""
 	}
@@ -219,8 +304,23 @@ func gnuGetopt(args []string, short string, long []string) ([]string, []string, 
 		}
 		if strings.HasPrefix(a, "--") {
 			name := strings.TrimPrefix(a, "--")
+			val, hasVal := "", false
 			if eq := strings.IndexByte(name, '='); eq >= 0 {
-				return nil, nil, fmt.Errorf("option --%s must not have a value", name[:eq])
+				name, val, hasVal = name[:eq], name[eq+1:], true
+			}
+			if knownLong[name+"="] {
+				if !hasVal {
+					if i+1 >= len(args) {
+						return nil, nil, fmt.Errorf("option --%s needs a value", name)
+					}
+					i++
+					val = args[i]
+				}
+				opts = append(opts, "--"+name+"="+val)
+				continue
+			}
+			if hasVal {
+				return nil, nil, fmt.Errorf("option --%s must not have a value", name)
 			}
 			if !knownLong[name] {
 				return nil, nil, fmt.Errorf("option --%s not recognized", name)
@@ -228,9 +328,24 @@ func gnuGetopt(args []string, short string, long []string) ([]string, []string, 
 			opts = append(opts, "--"+name)
 			continue
 		}
-		for _, c := range a[1:] {
-			if !knownShort[byte(c)] {
+		for j := 1; j < len(a); j++ {
+			c := a[j]
+			if !knownShort[c] {
 				return nil, nil, fmt.Errorf("option -%c not recognized", c)
+			}
+			{
+				if k := strings.IndexByte(short, c); k+1 < len(short) && short[k+1] == ':' {
+					val := a[j+1:]
+					if val == "" {
+						if i+1 >= len(args) {
+							return nil, nil, fmt.Errorf("option -%c needs a value", c)
+						}
+						i++
+						val = args[i]
+					}
+					opts = append(opts, "-"+string(c)+"="+val)
+					break
+				}
 			}
 			opts = append(opts, "-"+string(c))
 		}
@@ -563,7 +678,7 @@ func parseKey(text string, lineBase int) plan {
 		parts := strings.Fields(line)
 		if parts[0] == "node" && len(parts) >= 3 {
 			name, inbox := parts[1], parts[2]
-			var h hook
+			h := hook{retries: 3, backoffMax: 30}
 			for _, kv := range parts[3:] {
 				eq := strings.Index(kv, "=")
 				if eq < 1 {
@@ -583,8 +698,18 @@ func parseKey(text string, lineBase int) plan {
 					h.keyFile = val
 				case "webhook_key":
 					h.key = val
+				case "webhook_retries", "webhook_backoff_max":
+					v, err := strconv.Atoi(val)
+					if err != nil || v < 0 {
+						die(fmt.Sprintf("line %d: %s must be a whole number >= 0", n, key))
+					}
+					if key == "webhook_retries" {
+						h.retries = v
+					} else {
+						h.backoffMax = v
+					}
 				default:
-					die(fmt.Sprintf("line %d: unknown node option %s (allowed: webhook, webhook_key_file, webhook_key)", n, key))
+					die(fmt.Sprintf("line %d: unknown node option %s (allowed: webhook, webhook_key_file, webhook_key, webhook_retries, webhook_backoff_max)", n, key))
 				}
 			}
 			if h.keyFile != "" && h.key != "" {
@@ -691,18 +816,22 @@ func emitAct(me string, p plan) {
 		"inbox: {INBOX}",
 		"watch: {BIN}/channel-arm {PLAN} {NODE}",
 		"  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.",
-		"read: a message file has FROM, TO, SEQ, VERB and REFS (paths relative to the plan directory, or - none), then a --- line, then the body.",
-		"  Handle the oldest FILE first, one file at a time.",
+		"  The watch answers PING for you (it sends PONG and removes the PING) and never shows it. With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING.",
+		"start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.",
+		"read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.",
+		"  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.",
 		"send: {BIN}/channel-send {PLAN} {NODE} DEST VERB BODYFILE [REF ...]",
-		"  DEST is a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below).",
-		"  BODYFILE is the path of a file you write first, holding that verb's body lines below.",
-		"  Copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.",
+		"  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB -m 'TEXT' [-m 'TEXT' ...] [REF ...]   (each -m is one block of lines; blocks are joined by a blank line)",
+		"  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB - [REF ...]   (- or no BODYFILE reads the body from stdin)",
+		"  DEST must be a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below). PING and PONG are built in on every arrow; their body is NONCE: <value>.",
+		"  Body: copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.",
 		"  Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.",
-		"  REF files are optional; they are copied into refs/ and listed in the message.",
-		"  On a -> arrow the send waits until DEST removes your previous message; on -< it queues.",
-		"done: rm the FILE from {INBOX} when you have finished handling it. Removing it is the acknowledgement.",
-		"  You may move a FILE into {INBOX}/claimed/ while you work on it (the watch ignores subfolders, so it shows the next file); rm it from there only after your reply is sent.",
-		"after a start or a compact, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again.",
+		"  REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.",
+		"  On a -> arrow the send waits until DEST removes your previous message; on -< it queues. PING and PONG never wait.",
+		"done: rm the FILE when you have finished it (from claimed/ only after your reply is sent). Removing it is the acknowledgement.",
+		"tools: {BIN}/channel-ping {PLAN} {NODE} tests each of your arrows (skipped if run in the last 30 minutes; --force, --every MIN).",
+		"  {BIN}/channel-status {PLAN} shows each inbox's message count, oldest age, and claimed files.",
+		"after a start or a compact, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again, then check claimed/ (see start).",
 		"",
 	} {
 		say(r.Replace(line))
@@ -836,6 +965,7 @@ func messageNames(dir string) []string {
 func cmdArm(path, me string) {
 	p := loadPlan(path)
 	requireMe(me, p)
+	armPlan, armMe, armActive = p, me, true
 	inbox := p.nodes[me]
 	requireDir(inbox, "run channel-setup "+path+" "+me)
 	proc := tryInotify([]string{
@@ -866,7 +996,7 @@ func announce(inbox, shown string) string {
 	if err != nil || !info.IsDir() {
 		die("inbox disappeared: " + inbox)
 	}
-	files := messageNames(inbox)
+	files := handleControl(inbox, messageNames(inbox))
 	oldest := ""
 	if len(files) > 0 {
 		oldest = files[0]
@@ -877,10 +1007,14 @@ func announce(inbox, shown string) string {
 	if shown != "" && fileExists(filepath.Join(inbox, shown)) {
 		return shown
 	}
+	if shown != "" {
+		logEvent("consumed", "node", armMe, "file", filepath.Join(inbox, shown))
+	}
 	if oldest == "" {
 		return ""
 	}
 	say("FILE " + filepath.Join(inbox, oldest))
+	logEvent("deliver", "node", armMe, "pending", strconv.Itoa(len(files)), "file", filepath.Join(inbox, oldest))
 	return oldest
 }
 
@@ -1022,9 +1156,27 @@ func senderOf(name string) string {
 	return m[2]
 }
 
-func cmdSend(path, me, recipient, verb, bodyPath string, refs []string) {
+func cmdSend(path, me, recipient, verb string, bodyText []byte, refs []string) {
 	p := loadPlan(path)
 	requireMe(me, p)
+	sendMessage(p, me, recipient, verb, bodyText, refs)
+}
+
+func isControl(verb string) bool { return verb == "PING" || verb == "PONG" }
+
+// A PING or PONG is a control message (never waits, handled by channel-arm) only when its body has a NONCE line.
+func hasNonce(body string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "NONCE:") && strings.TrimSpace(line[6:]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func sendMessage(p plan, me, recipient, verb string, bodyText []byte, refs []string) string {
+	path := p.path
 	if _, ok := p.nodes[recipient]; !ok {
 		die("unknown node (recipient=" + recipient + ")")
 	}
@@ -1039,14 +1191,14 @@ func cmdSend(path, me, recipient, verb, bodyPath string, refs []string) {
 		die(me + " is not allowed to send to " + recipient)
 	}
 	words := p.verbs[me+"\x00"+recipient]
-	if !containsLine(words, verb) {
+	if !containsLine(words, verb) && !isControl(verb) {
 		die("verb " + verb + " is not allowed on " + me + " -> " + recipient)
 	}
-	bodyText, err := os.ReadFile(bodyPath)
-	if err != nil {
-		die("no body file " + bodyPath)
+	template := p.messages[verb].body
+	if isControl(verb) && len(template) == 0 {
+		template = []string{"NONCE: <nonce>"}
 	}
-	checkBody(verb, p.messages[verb].body, string(bodyText))
+	checkBody(verb, template, string(bodyText))
 	for _, ref := range refs {
 		if !fileExists(ref) {
 			die("no referenced file " + ref)
@@ -1055,7 +1207,7 @@ func cmdSend(path, me, recipient, verb, bodyPath string, refs []string) {
 	requireDir(p.nodes[me], "run channel-setup "+p.path+" "+me)
 	inbox := p.nodes[recipient]
 	requireDir(inbox, "run channel-setup "+p.path+" "+recipient)
-	if found.mode == "wait" {
+	if found.mode == "wait" && !(isControl(verb) && hasNonce(string(bodyText))) {
 		for _, name := range messageNames(inbox) {
 			if senderOf(name) == me {
 				waitUntilRemoved(inbox, name)
@@ -1109,7 +1261,9 @@ func cmdSend(path, me, recipient, verb, bodyPath string, refs []string) {
 	dest := filepath.Join(inbox, filename)
 	publishReplace(tmp, dest)
 	say("SENT " + dest)
+	logEvent("send", "plan", path, "from", me, "to", recipient, "verb", verb, "seq", strconv.Itoa(current), "refs", strconv.Itoa(len(copied)), "file", dest)
 	fireWebhook(p, recipient, me, verb, inbox, dest)
+	return dest
 }
 
 // fireWebhook POSTs after a successful send. Failures only warn; the message stays queued.
@@ -1150,10 +1304,38 @@ func fireWebhook(p plan, target, from, verb, inbox, file string) {
 		Inbox  string `json:"inbox"`
 		File   string `json:"file"`
 	}{target, from, verb, inbox, file})
-	req, err := http.NewRequest("POST", h.url, bytes.NewReader(body))
+	delay := 1
+	for attempt := 0; ; attempt++ {
+		why, retry := postOnce(h.url, key, body, target)
+		shown := strings.Replace(why, "\x00", " ", 1)
+		if why == "" {
+			logEvent("webhook", "result", "ok", "to", target, "from", from, "verb", verb, "attempts", strconv.Itoa(attempt+1), "file", file)
+			return
+		}
+		if !retry || attempt >= h.retries {
+			logEvent("webhook", "result", "fail", "to", target, "from", from, "verb", verb, "attempts", strconv.Itoa(attempt+1), "error", shown, "file", file)
+			if code, text, ok := strings.Cut(why, "\x00"); ok {
+				warn("failed (" + code + ") " + text)
+			} else {
+				warn("failed (" + why + ")")
+			}
+			return
+		}
+		wait := delay
+		if wait > h.backoffMax {
+			wait = h.backoffMax
+		}
+		note(fmt.Sprintf("webhook for %s: attempt %d failed (%s); retrying in %ds", target, attempt+1, shown, wait))
+		time.Sleep(time.Duration(wait) * time.Second)
+		delay *= 2
+	}
+}
+
+// postOnce returns "" on success, else the reason and whether a retry may help.
+func postOnce(url, key string, body []byte, target string) (string, bool) {
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
-		warn("failed (" + err.Error() + ")")
-		return
+		return err.Error(), false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if key != "" {
@@ -1161,47 +1343,50 @@ func fireWebhook(p plan, target, from, verb, inbox, file string) {
 	}
 	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
-		warn("failed (" + err.Error() + ")")
-		return
+		return err.Error(), true
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
 	text := strings.ReplaceAll(string(rb), "\n", " ")
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		say(fmt.Sprintf("WEBHOOK %s %d %s", target, resp.StatusCode, text))
-	} else {
-		warn(fmt.Sprintf("failed (%d) %s", resp.StatusCode, text))
+		return "", false
 	}
+	return fmt.Sprintf("%d\x00%s", resp.StatusCode, text), resp.StatusCode >= 500 || resp.StatusCode == 429
 }
 
 func nextSeq(seqPath string) int {
-	lockPath := strings.TrimSuffix(seqPath, ".txt") + ".lock"
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o660)
-	if err != nil {
+	// Lock-free: each sequence number is a file created with O_EXCL in out-seq.d/.
+	// A collision tries the next number; a crash at worst skips one. out-seq.txt is
+	// only a hint (last number used) so the search starts near the end.
+	dir := strings.TrimSuffix(seqPath, ".txt") + ".d"
+	if err := os.MkdirAll(dir, 0o775); err != nil {
 		die(err.Error())
 	}
-	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		die(err.Error())
-	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	current := 1
 	if data, err := os.ReadFile(seqPath); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			parts := strings.Fields(line)
 			if len(parts) == 2 && parts[0] == "next" {
-				n, err := strconv.Atoi(parts[1])
-				if err == nil {
+				if n, err := strconv.Atoi(parts[1]); err == nil {
 					current = n + 1
 				}
 			}
 		}
 	}
-	if err := os.WriteFile(seqPath+".tmp", []byte(fmt.Sprintf("next %d\n", current)), 0o660); err != nil {
-		die(err.Error())
+	for ; ; current++ {
+		f, err := os.OpenFile(filepath.Join(dir, strconv.Itoa(current)), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o660)
+		if err == nil {
+			f.Close()
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			die(err.Error())
+		}
 	}
-	if err := os.Rename(seqPath+".tmp", seqPath); err != nil {
-		die(err.Error())
+	tmp := fmt.Sprintf("%s.tmp.%d", seqPath, os.Getpid())
+	if err := os.WriteFile(tmp, []byte(fmt.Sprintf("next %d\n", current)), 0o660); err == nil {
+		_ = os.Rename(tmp, seqPath)
 	}
 	return current
 }
@@ -1230,5 +1415,261 @@ func publishReplace(tmp, dest string) {
 			die(tmp + " and " + dest + " are on different filesystems, so the rename would not be atomic")
 		}
 		die(err.Error())
+	}
+}
+
+var (
+	armPlan     plan
+	armMe       string
+	armActive   bool
+	pingForce   bool
+	pingEvery   = envInt("CHANNEL_PING_EVERY", 30)
+	pingTimeout = envInt("CHANNEL_PING_TIMEOUT", 300)
+)
+
+func envInt(name string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v >= 0 {
+		return v
+	}
+	return def
+}
+
+// logEvent writes one key=value line to syslog (tag agent-channel) unless
+// CHANNEL_SYSLOG=0, and appends it to CHANNEL_LOG_FILE when that is set.
+func logEvent(event string, kv ...string) {
+	var b strings.Builder
+	b.WriteString("event=" + event)
+	for i := 0; i+1 < len(kv); i += 2 {
+		v := kv[i+1]
+		if v == "" || strings.ContainsAny(v, " \t\"=") {
+			v = strconv.Quote(v)
+		}
+		b.WriteString(" " + kv[i] + "=" + v)
+	}
+	line := b.String()
+	if os.Getenv("CHANNEL_SYSLOG") != "0" {
+		prio := syslog.LOG_USER | syslog.LOG_INFO
+		if strings.Contains(line, "result=fail") || strings.Contains(line, "result=timeout") {
+			prio = syslog.LOG_USER | syslog.LOG_WARNING
+		}
+		if w, err := syslog.New(prio, "agent-channel"); err == nil {
+			_ = w.Info(line)
+			if prio&0x7 == syslog.LOG_WARNING {
+				_ = w.Warning(line)
+			}
+			w.Close()
+		}
+	}
+	if f := os.Getenv("CHANNEL_LOG_FILE"); f != "" {
+		if fh, err := os.OpenFile(f, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o660); err == nil {
+			fmt.Fprintf(fh, "%s agent-channel %s\n", time.Now().Format(time.RFC3339), line)
+			fh.Close()
+		}
+	}
+}
+
+// readHead returns the VERB and FROM header values and the NONCE body line of a message file.
+func readHead(path string) (verb, from, nonce string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	inBody := false
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "---" && !inBody:
+			inBody = true
+		case !inBody && strings.HasPrefix(line, "VERB: "):
+			verb = strings.TrimSpace(line[6:])
+		case !inBody && strings.HasPrefix(line, "FROM: "):
+			from = strings.TrimSpace(line[6:])
+		case inBody && strings.HasPrefix(line, "NONCE:") && nonce == "":
+			nonce = strings.TrimSpace(line[6:])
+		}
+	}
+	return
+}
+
+var safeRE = regexp.MustCompile(`[^A-Za-z0-9_.-]`)
+
+func pongPath(p plan, me, nonce string) string {
+	return filepath.Join(filepath.Dir(p.nodes[me]), "pong-"+safeRE.ReplaceAllString(nonce, "_"))
+}
+
+// handleControl answers PING and files PONG for channel-ping, so the agent never sees either.
+func handleControl(inbox string, files []string) []string {
+	if !armActive {
+		return files
+	}
+	var rest []string
+	for _, name := range files {
+		full := filepath.Join(inbox, name)
+		verb, from, nonce := readHead(full)
+		if nonce == "" {
+			verb = ""
+		}
+		switch verb {
+		case "PING":
+			if hasEdge(armPlan, armMe, from) && nonce != "" {
+				quiet = true
+				sendMessage(armPlan, armMe, from, "PONG", []byte("NONCE: "+nonce+"\n"), nil)
+				quiet = false
+			}
+			_ = os.Remove(full)
+			logEvent("ping-answered", "node", armMe, "from", from, "nonce", nonce)
+		case "PONG":
+			_ = os.Rename(full, pongPath(armPlan, armMe, nonce))
+			logEvent("pong-received", "node", armMe, "from", from, "nonce", nonce)
+		default:
+			rest = append(rest, name)
+		}
+	}
+	return rest
+}
+
+func hasEdge(p plan, src, dst string) bool {
+	for _, e := range p.edges {
+		if e.src == src && e.dst == dst {
+			return true
+		}
+	}
+	return false
+}
+
+func cmdPing(path, me string) {
+	p := loadPlan(path)
+	requireMe(me, p)
+	node := filepath.Dir(p.nodes[me])
+	requireDir(p.nodes[me], "run channel-setup "+path+" "+me)
+	stamp := filepath.Join(node, "ping.stamp")
+	if info, err := os.Stat(stamp); err == nil && !pingForce {
+		age := time.Since(info.ModTime())
+		if age < time.Duration(pingEvery)*time.Minute {
+			say(fmt.Sprintf("SKIP %s pinged %ds ago (limit every %d min; --force to override)", me, int(age.Seconds()), pingEvery))
+			return
+		}
+	}
+	_ = os.WriteFile(stamp, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o660)
+	_ = os.Chtimes(stamp, time.Now(), time.Now())
+	type probe struct {
+		dest, nonce, file string
+		twoWay, done      bool
+	}
+	var probes []*probe
+	start := time.Now()
+	for _, e := range p.edges {
+		if e.src != me {
+			continue
+		}
+		nonce := fmt.Sprintf("%s-%s-%s-%d", me, e.dst, start.Format("20060102-150405"), os.Getpid())
+		pr := &probe{dest: e.dst, nonce: nonce, twoWay: hasEdge(p, e.dst, me)}
+		pr.file = sendMessage(p, me, e.dst, "PING", []byte("NONCE: "+nonce+"\n"), nil)
+		probes = append(probes, pr)
+	}
+	deadline := start.Add(time.Duration(pingTimeout) * time.Second)
+	left := len(probes)
+	for left > 0 && time.Now().Before(deadline) {
+		for _, pr := range probes {
+			if pr.done {
+				continue
+			}
+			ok := false
+			if pr.twoWay {
+				pp := pongPath(p, me, pr.nonce)
+				if fileExists(pp) {
+					_ = os.Remove(pp)
+					ok = true
+				} else {
+					for _, name := range messageNames(p.nodes[me]) {
+						full := filepath.Join(p.nodes[me], name)
+						if v, _, n := readHead(full); v == "PONG" && n == pr.nonce {
+							_ = os.Remove(full)
+							ok = true
+							break
+						}
+					}
+				}
+			} else if !fileExists(pr.file) {
+				ok = true
+			}
+			if ok {
+				pr.done = true
+				left--
+				kind := "PONG"
+				if !pr.twoWay {
+					kind = "CONSUMED"
+				}
+				secs := fmt.Sprintf("%.1fs", time.Since(start).Seconds())
+				say(kind + " " + pr.dest + " " + secs)
+				logEvent("ping", "result", "ok", "from", me, "to", pr.dest, "kind", strings.ToLower(kind), "seconds", secs)
+			}
+		}
+		time.Sleep(poll)
+	}
+	failed := false
+	for _, pr := range probes {
+		if pr.done {
+			continue
+		}
+		failed = true
+		want := "no PONG"
+		if !pr.twoWay {
+			want = "PING not consumed"
+		}
+		say("TIMEOUT " + pr.dest + " (" + want + " after " + strconv.Itoa(pingTimeout) + "s)")
+		logEvent("ping", "result", "timeout", "from", me, "to", pr.dest, "nonce", pr.nonce)
+	}
+	if failed {
+		os.Exit(1)
+	}
+}
+
+func cmdStatus(path string) {
+	p := loadPlan(path)
+	now := time.Now()
+	for _, name := range p.nodeOrder {
+		inbox := p.nodes[name]
+		entries, err := os.ReadDir(inbox)
+		if err != nil {
+			why := "missing"
+			if errors.Is(err, os.ErrPermission) {
+				why = "no permission"
+			}
+			say("node " + name + " " + inbox + " " + why)
+			continue
+		}
+		files := messageNames(inbox)
+		_ = entries
+		line := fmt.Sprintf("node %s %s messages %d", name, inbox, len(files))
+		if len(files) > 0 {
+			if info, err := os.Stat(filepath.Join(inbox, files[0])); err == nil {
+				line += fmt.Sprintf(" oldest %ds", int(now.Sub(info.ModTime()).Seconds()))
+			}
+		}
+		claimedDir := filepath.Join(inbox, "claimed")
+		var claimed []string
+		if ce, err := os.ReadDir(claimedDir); err == nil {
+			for _, c := range ce {
+				if c.IsDir() || strings.HasSuffix(c.Name(), ".owner") {
+					continue
+				}
+				item := c.Name()
+				if info, err := c.Info(); err == nil {
+					item += fmt.Sprintf(" %ds", int(now.Sub(info.ModTime()).Seconds()))
+				}
+				if ob, err := os.ReadFile(filepath.Join(claimedDir, c.Name()+".owner")); err == nil {
+					item += " owner=" + strings.TrimSpace(strings.SplitN(string(ob), "\n", 2)[0])
+				}
+				claimed = append(claimed, item)
+			}
+		} else if errors.Is(err, os.ErrPermission) {
+			line += " claimed no-permission"
+		}
+		line += fmt.Sprintf(" claimed %d", len(claimed))
+		say(line)
+		for _, c := range claimed {
+			say("  claimed " + c)
+		}
 	}
 }

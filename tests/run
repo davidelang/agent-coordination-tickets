@@ -34,7 +34,7 @@ bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1" >&2; }
 
 # The how-to-act header names the running binary's directory, which differs
 # between the shell, Python, and Go builds; compare it as a bare command name.
-norm_bin() { sed -E 's#[^ ]*/(channel-(arm|send)) #\1 #g' "$1"; }
+norm_bin() { sed -E 's#[^ ]*/(channel-(arm|send|ping|status)) #\1 #g' "$1"; }
 
 same() {
   norm_bin "$2" > "$2.norm"
@@ -168,14 +168,14 @@ same "arm --help is help" "$TMP/go-h" "$TMP/go-help"
 capture "$TMP/sh-nomode" "$TMP/sh-nomode.err" "$TMP/sh-nomode.rc" "$SH" "$ROOT/example/comms.diag"
 capture "$TMP/go-nomode" "$TMP/go-nomode.err" "$TMP/go-nomode.rc" "$GO" "$ROOT/example/comms.diag"
 same "no mode stderr" "$TMP/sh-nomode.err" "$TMP/go-nomode.err"
-expect_text "no mode text" "$TMP/sh-nomode.err" "no mode; use --setup, --arm, or --send"
+expect_text "no mode text" "$TMP/sh-nomode.err" "no mode; use --setup, --arm, --send, --ping, or --status"
 expect_rc "no mode exit" 1 "$TMP/sh-nomode.rc"
 expect_rc "go no mode exit" 1 "$TMP/go-nomode.rc"
 
 capture "$TMP/sh-pick" "$TMP/sh-pick.err" "$TMP/sh-pick.rc" "$SH" --setup --arm
 capture "$TMP/go-pick" "$TMP/go-pick.err" "$TMP/go-pick.rc" "$GO" --arm --send
 same "two mode flags" "$TMP/sh-pick.err" "$TMP/go-pick.err"
-expect_text "pick one" "$TMP/sh-pick.err" "pick one of --setup, --arm, or --send"
+expect_text "pick one" "$TMP/sh-pick.err" "pick one of --setup, --arm, --send, --ping, or --status"
 expect_rc "pick one exit" 1 "$TMP/sh-pick.rc"
 
 capture "$TMP/sh-conf" "$TMP/sh-conf.err" "$TMP/sh-conf.rc" "$ROOT/bin/channel-arm" --setup
@@ -192,7 +192,7 @@ expect_rc "setup usage exit" 1 "$TMP/sh-use.rc"
 capture "$TMP/sh-use2" "$TMP/sh-use2.err" "$TMP/sh-use2.rc" "$SH" --send
 capture "$TMP/go-use2" "$TMP/go-use2.err" "$TMP/go-use2.rc" "$GO" --send
 same "send usage via flag" "$TMP/sh-use2.err" "$TMP/go-use2.err"
-expect_text "send usage text" "$TMP/sh-use2.err" "usage: channel --send FILE NODE RECIPIENT VERB BODYFILE [REF ...]"
+expect_text "send usage text" "$TMP/sh-use2.err" "usage: channel --send FILE NODE RECIPIENT VERB [BODYFILE|-|-m TEXT...] [REF ...]"
 
 capture "$TMP/sh-badopt" "$TMP/sh-badopt.err" "$TMP/sh-badopt.rc" "$SH" --nope
 capture "$TMP/go-badopt" "$TMP/go-badopt.err" "$TMP/go-badopt.rc" "$GO" --nope
@@ -730,6 +730,101 @@ DIAG
   sed 's|webhook=http://127.0.0.1:[0-9]*/'$impl'-x |bogus=1 |' "$D" > "$WH/bad.diag"
   if "$P" --send "$WH/bad.diag" a b GO "$WH/body" 2>&1 | grep -q 'unknown node option bogus'; then ok "$impl unknown option rejected"; else bad "$impl unknown option rejected"; fi
 done
+
+# --- body sources, built-in PING/PONG, channel-ping, channel-status, lock-free seq, logging ---
+X=$TMP/x
+mkdir -p "$X"
+cat > "$X/x.diag" <<EOF
+blockdiag {
+  a <-> b;
+  a -< c;
+}
+/*
+node a $X/nodes/a/inbox
+node b $X/nodes/b/inbox
+node c $X/nodes/c/inbox
+verb a b NOTE
+verb b a NOTE
+verb a c NOTE
+message NOTE {
+A note.
+body: {
+NOTE: <text>
+}
+}
+*/
+EOF
+for n in a b c; do "$ROOT/go/channel-setup" "$X/x.diag" $n >/dev/null; done
+export CHANNEL_SYSLOG=0 CHANNEL_LOG_FILE="$X/log.txt"
+for impl in go sh py; do
+  case $impl in
+    go) S() { "$ROOT/go/channel-send" "$@"; }; PG() { "$ROOT/go/channel-ping" "$@"; }; ST() { "$ROOT/go/channel-status" "$@"; }; ARM="$ROOT/go/channel-arm" ;;
+    sh) S() { "$ROOT/bin/channel-send" "$@"; }; PG() { "$ROOT/bin/channel-ping" "$@"; }; ST() { "$ROOT/bin/channel-status" "$@"; }; ARM="$ROOT/bin/channel-arm" ;;
+    py) S() { python3 "$PY" send "$@"; }; PG() { python3 "$PY" ping "$@"; }; ST() { python3 "$PY" status "$@"; }; ARM="python3 $PY arm" ;;
+  esac
+  rm -f "$X"/nodes/*/inbox/*.md
+  S "$X/x.diag" a c NOTE -m 'NOTE: one' -m 'second block' /etc/hostname /etc/hostname > "$X/$impl-m.out" 2>&1
+  f=$(sed -n 's/^SENT //p' "$X/$impl-m.out")
+  if [ -n "$f" ] && grep -q '^second block$' "$f" && [ "$(grep -c '^- refs/' "$f")" = 2 ]; then ok "$impl -m blocks and two refs"; else bad "$impl -m blocks and two refs"; fi
+  printf 'NOTE: from stdin\n' | S "$X/x.diag" a c NOTE > "$X/$impl-in.out" 2>&1
+  f=$(sed -n 's/^SENT //p' "$X/$impl-in.out")
+  if [ -n "$f" ] && grep -q '^NOTE: from stdin$' "$f"; then ok "$impl body from stdin"; else bad "$impl body from stdin"; fi
+  printf 'NOTE: dash\n' | S "$X/x.diag" a c NOTE - /etc/hostname > "$X/$impl-d.out" 2>&1
+  f=$(sed -n 's/^SENT //p' "$X/$impl-d.out")
+  if [ -n "$f" ] && grep -q '^NOTE: dash$' "$f" && grep -q '^- refs/' "$f"; then ok "$impl body from - with ref"; else bad "$impl body from - with ref"; fi
+  if S "$X/x.diag" a c PING -m 'NONCE: n1' >/dev/null 2>&1; then ok "$impl built-in PING on any arrow"; else bad "$impl built-in PING on any arrow"; fi
+  if ! S "$X/x.diag" a c PING -m 'hello' >/dev/null 2>&1; then ok "$impl PING needs NONCE"; else bad "$impl PING needs NONCE"; fi
+  rm -f "$X"/nodes/*/inbox/*.md
+  S "$X/x.diag" a b PING -m 'NONCE: w1' >/dev/null 2>&1
+  S "$X/x.diag" a b PING -m 'NONCE: w2' > "$X/$impl-nw" 2>&1 &
+  pw=$!
+  sleep 3
+  if kill -0 "$pw" 2>/dev/null; then kill "$pw" 2>/dev/null || true; bad "$impl PING never waits"; else ok "$impl PING never waits"; fi
+  wait "$pw" 2>/dev/null || true
+  rm -f "$X"/nodes/*/inbox/*.md "$X"/nodes/*/ping.stamp
+  timeout 15 $ARM "$X/x.diag" b > "$X/$impl-armb" 2>&1 &
+  pb=$!
+  timeout 15 $ARM "$X/x.diag" c > "$X/$impl-armc" 2>&1 &
+  pc=$!
+  sleep 1
+  rc=0; PG "$X/x.diag" a --timeout 10 > "$X/$impl-ping" 2>&1 || rc=$?
+  if [ "$rc" = 0 ] && grep -q '^PONG b ' "$X/$impl-ping" && grep -q '^CONSUMED c ' "$X/$impl-ping"; then ok "$impl channel-ping two-way and one-way"; else bad "$impl channel-ping: $(cat "$X/$impl-ping")"; fi
+  if [ "$(cat "$X/$impl-armb")" = READY ] && [ "$(cat "$X/$impl-armc")" = READY ]; then ok "$impl arm hides PING/PONG"; else bad "$impl arm hides PING/PONG: $(cat "$X/$impl-armb" "$X/$impl-armc")"; fi
+  PG "$X/x.diag" a > "$X/$impl-skip" 2>&1
+  if grep -q '^SKIP a pinged' "$X/$impl-skip"; then ok "$impl ping rate limit"; else bad "$impl ping rate limit"; fi
+  for pp in $pb $pc; do pkill -9 -P "$pp" 2>/dev/null || true; kill -9 "$pp" 2>/dev/null || true; done
+  pkill -9 -f "arm $X/x.diag" 2>/dev/null || true
+  wait "$pb" "$pc" 2>/dev/null || true
+  sleep 0.5
+  rm -f "$X"/nodes/*/inbox/*.md
+  rc=0; PG "$X/x.diag" a --force --timeout 1 > "$X/$impl-to" 2>&1 || rc=$?
+  if [ "$rc" = 1 ] && grep -q '^TIMEOUT b (no PONG' "$X/$impl-to" && grep -q '^TIMEOUT c (PING not consumed' "$X/$impl-to"; then ok "$impl ping timeout"; else bad "$impl ping timeout"; fi
+  rm -f "$X"/nodes/*/inbox/*.md
+  mkdir -p "$X/nodes/b/inbox/claimed"
+  : > "$X/nodes/b/inbox/claimed/m.md"
+  echo bot > "$X/nodes/b/inbox/claimed/m.md.owner"
+  chmod 000 "$X/nodes/c/inbox"
+  ST "$X/x.diag" > "$X/$impl-st" 2>&1
+  chmod 2775 "$X/nodes/c/inbox"
+  if grep -q "^node b .* messages 0 claimed 1$" "$X/$impl-st" && grep -q '^  claimed m.md [0-9]*s owner=bot$' "$X/$impl-st" && grep -q "^node c .* no permission$" "$X/$impl-st"; then ok "$impl channel-status"; else bad "$impl channel-status: $(cat "$X/$impl-st")"; fi
+  rm -rf "$X/nodes/b/inbox/claimed"
+done
+if [ ! -e "$X/nodes/a/out-seq.lock" ] && [ -d "$X/nodes/a/out-seq.d" ]; then ok "seq uses out-seq.d, no lock file"; else bad "seq uses out-seq.d, no lock file"; fi
+rm -f "$X"/nodes/*/inbox/*.md
+timeout 5 "$ROOT/go/channel-arm" "$X/x.diag" b > "$X/arm-deliver" 2>&1 &
+pd=$!
+sleep 0.5
+"$ROOT/go/channel-send" "$X/x.diag" a b NOTE -m 'NOTE: d' >/dev/null 2>&1
+sleep 0.5
+rm -f "$X"/nodes/b/inbox/*.md
+sleep 0.5
+kill "$pd" 2>/dev/null || true
+wait "$pd" 2>/dev/null || true
+if grep -q '^FILE ' "$X/arm-deliver"; then ok "arm shows a real message"; else bad "arm shows a real message"; fi
+for e in send ping ping-answered deliver consumed; do
+  if grep -q " agent-channel event=$e " "$X/log.txt"; then ok "log has event=$e"; else bad "log has event=$e"; fi
+done
+unset CHANNEL_LOG_FILE
 
 printf '%s\n' "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

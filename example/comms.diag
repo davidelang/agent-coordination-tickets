@@ -123,4 +123,19 @@ PLAN: <path/to/plan, or none>
 REASON: <what the human asked, and how it ended>
 }
 }
+# PING and PONG are built in on every arrow; channel-ping sends them and channel-arm
+# answers them, so no verb line or message block is needed. Shape, for reference:
+# message PING {
+# Connectivity test. Reply PONG with the same NONCE, remove this file, do nothing else.
+# body: {
+# NONCE: <unique id>
+# }
+# }
+# message PONG {
+# Reply to PING.
+# body: {
+# NONCE: <the PING's NONCE>
+# }
+# }
+
 */

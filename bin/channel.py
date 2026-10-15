@@ -4,6 +4,10 @@
 import errno
 import fcntl
 import getopt
+import json
+import syslog
+import urllib.error
+import urllib.request
 import os
 import re
 import shutil
@@ -203,6 +207,38 @@ def extract_messages(text):
     return messages, "".join(chars)
 
 
+HOOKS = {}
+OPTS = {"msgs": [], "force": False,
+        "every": int(os.environ.get("CHANNEL_PING_EVERY", "30") or 30),
+        "timeout": int(os.environ.get("CHANNEL_PING_TIMEOUT", "300") or 300)}
+ARM = {"me": None, "plan": None}
+
+
+def log_event(event, **kv):
+    """One key=value line to syslog (tag agent-channel) unless CHANNEL_SYSLOG=0, and to CHANNEL_LOG_FILE."""
+    parts = [f"event={event}"]
+    for key, val in kv.items():
+        val = str(val)
+        if val == "" or any(c in val for c in ' \t"='):
+            val = '"' + val.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        parts.append(f"{key}={val}")
+    line = " ".join(parts)
+    if os.environ.get("CHANNEL_SYSLOG", "1") != "0":
+        prio = syslog.LOG_WARNING if ("result=fail" in line or "result=timeout" in line) else syslog.LOG_INFO
+        try:
+            syslog.openlog("agent-channel", 0, syslog.LOG_USER)
+            syslog.syslog(prio, line)
+        except OSError:
+            pass
+    log_file = os.environ.get("CHANNEL_LOG_FILE")
+    if log_file:
+        try:
+            with open(log_file, "a") as handle:
+                handle.write(datetime.now().astimezone().isoformat(timespec="seconds") + " agent-channel " + line + "\n")
+        except OSError:
+            pass
+
+
 def parse_key(text, line_base=0):
     messages, blanked = extract_messages(text)
     nodes = {}
@@ -212,8 +248,35 @@ def parse_key(text, line_base=0):
         if not line or line in {"/*", "*/"} or line.startswith("#") or line.startswith("//"):
             continue
         parts = line.split()
-        if parts[0] == "node" and len(parts) == 3:
+        if parts[0] == "node" and len(parts) >= 3:
             name, inbox = parts[1], parts[2]
+            hook = {"url": "", "key_file": "", "key": "", "retries": 3, "backoff_max": 30}
+            for kv in parts[3:]:
+                key, eq, val = kv.partition("=")
+                if not eq or not key:
+                    die(f"line {lineno}: node option must be key=value ({kv})")
+                if not val:
+                    die(f"line {lineno}: {key} is empty")
+                if key == "webhook":
+                    if not re.match(r"https?://", val):
+                        die(f"line {lineno}: webhook must start with http:// or https://")
+                    hook["url"] = val
+                elif key == "webhook_key_file":
+                    hook["key_file"] = val
+                elif key == "webhook_key":
+                    hook["key"] = val
+                elif key in ("webhook_retries", "webhook_backoff_max"):
+                    if not val.isdigit():
+                        die(f"line {lineno}: {key} must be a whole number >= 0")
+                    hook["retries" if key == "webhook_retries" else "backoff_max"] = int(val)
+                else:
+                    die(f"line {lineno}: unknown node option {key} (allowed: webhook, webhook_key_file, webhook_key, webhook_retries, webhook_backoff_max)")
+            if hook["key_file"] and hook["key"]:
+                die(f"line {lineno}: use webhook_key_file or webhook_key, not both")
+            if not hook["url"] and (hook["key_file"] or hook["key"]):
+                die(f"line {lineno}: webhook key given without webhook=URL")
+            if hook["url"]:
+                HOOKS[name] = hook
             if not valid_node(name):
                 die(f"line {lineno}: node name must be letters, digits, dot, underscore, or hyphen, and not contain __")
             if name in nodes:
@@ -225,7 +288,7 @@ def parse_key(text, line_base=0):
                 die(f"line {lineno}: verb {src} {dst} is listed twice")
             verbs[(src, dst)] = words
         else:
-            die(f"line {lineno}: expected 'node NAME PATH', 'verb SRC DST WORD...', or 'message NAME {{ ... }}'")
+            die(f"line {lineno}: expected 'node NAME PATH [webhook=URL [webhook_key_file=PATH|webhook_key=TOKEN]]', 'verb SRC DST WORD...', or 'message NAME {{ ... }}'")
     return nodes, verbs, messages
 
 
@@ -299,6 +362,26 @@ def write_map(path, found):
     os.replace(tmp, path)
 
 
+def next_seq(seq_path):
+    """Lock-free: create out-seq.d/N with O_EXCL; on collision try N+1. out-seq.txt is a hint."""
+    seq_dir = seq_path.with_suffix(".d")
+    seq_dir.mkdir(parents=True, exist_ok=True)
+    current = read_map(seq_path).get("next", 0) + 1
+    while True:
+        try:
+            os.close(os.open(seq_dir / str(current), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o660))
+            break
+        except FileExistsError:
+            current += 1
+    try:
+        tmp = seq_path.with_name(f"{seq_path.name}.tmp.{os.getpid()}")
+        tmp.write_text(f"next {current}\n")
+        os.replace(tmp, seq_path)
+    except OSError:
+        pass
+    return current
+
+
 def lock_exclusive(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(path, "a+")
@@ -348,7 +431,7 @@ def split_args(argv):
     before, among, or after the file and node. A lone -- ends the options.
     """
     try:
-        found, rest = getopt.gnu_getopt(argv, "n", ["dry-run", "whatineedtoknow"])
+        found, rest = getopt.gnu_getopt(argv, "nm:", ["dry-run", "whatineedtoknow", "force", "every=", "timeout="])
     except getopt.GetoptError as exc:
         die(str(exc))
     dry_run = False
@@ -358,6 +441,14 @@ def split_args(argv):
             dry_run = True
         elif opt == "--whatineedtoknow":
             what = True
+        elif opt == "-m":
+            OPTS["msgs"].append(_value)
+        elif opt == "--force":
+            OPTS["force"] = True
+        elif opt in ("--every", "--timeout"):
+            if not _value.isdigit():
+                die(f"{opt} needs a whole number")
+            OPTS[opt[2:]] = int(_value)
     return dry_run, what, rest
 
 
@@ -375,18 +466,22 @@ ACT_LINES = [
     'inbox: {INBOX}',
     'watch: {BIN}/channel-arm {PLAN} {NODE}',
     '  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.',
-    'read: a message file has FROM, TO, SEQ, VERB and REFS (paths relative to the plan directory, or - none), then a --- line, then the body.',
-    '  Handle the oldest FILE first, one file at a time.',
+    '  The watch answers PING for you (it sends PONG and removes the PING) and never shows it. With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING.',
+    'start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.',
+    'read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.',
+    '  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.',
     'send: {BIN}/channel-send {PLAN} {NODE} DEST VERB BODYFILE [REF ...]',
-    '  DEST is a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below).',
-    "  BODYFILE is the path of a file you write first, holding that verb's body lines below.",
-    '  Copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.',
+    "  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB -m 'TEXT' [-m 'TEXT' ...] [REF ...]   (each -m is one block of lines; blocks are joined by a blank line)",
+    '  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB - [REF ...]   (- or no BODYFILE reads the body from stdin)',
+    '  DEST must be a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below). PING and PONG are built in on every arrow; their body is NONCE: <value>.',
+    '  Body: copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.',
     '  Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.',
-    '  REF files are optional; they are copied into refs/ and listed in the message.',
-    '  On a -> arrow the send waits until DEST removes your previous message; on -< it queues.',
-    'done: rm the FILE from {INBOX} when you have finished handling it. Removing it is the acknowledgement.',
-    '  You may move a FILE into {INBOX}/claimed/ while you work on it (the watch ignores subfolders, so it shows the next file); rm it from there only after your reply is sent.',
-    'after a start or a compact, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again.',
+    '  REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.',
+    '  On a -> arrow the send waits until DEST removes your previous message; on -< it queues. PING and PONG never wait.',
+    'done: rm the FILE when you have finished it (from claimed/ only after your reply is sent). Removing it is the acknowledgement.',
+    'tools: {BIN}/channel-ping {PLAN} {NODE} tests each of your arrows (skipped if run in the last 30 minutes; --force, --every MIN).',
+    "  {BIN}/channel-status {PLAN} shows each inbox's message count, oldest age, and claimed files.",
+    'after a start or a compact, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again, then check claimed/ (see start).',
     '',
 ]
 
@@ -520,8 +615,11 @@ def announce(inbox, shown):
     """Print the oldest inbox file when it is not the one already announced."""
     if not inbox.is_dir():
         die(f"inbox disappeared: {inbox}")
+    handle_control(inbox)
     files = message_names(inbox)
     oldest = files[0].name if files else None
+    if shown and shown != oldest and not (inbox / shown).is_file():
+        log_event("consumed", node=ARM["me"], file=inbox / shown)
     if oldest == shown:
         return shown
     if shown and (inbox / shown).is_file() and oldest == shown:
@@ -531,6 +629,7 @@ def announce(inbox, shown):
     if shown and (inbox / shown).is_file():
         return shown
     say(f"FILE {inbox / oldest}")
+    log_event("deliver", node=ARM["me"], file=inbox / oldest)
     return oldest
 
 
@@ -541,8 +640,10 @@ def watch_oldest(inbox, shown):
 
 
 def cmd_arm(plan_path, me):
-    plan_path, nodes, _verbs, _messages, _edges = load_plan(plan_path)
+    loaded = load_plan(plan_path)
+    plan_path, nodes, _verbs, _messages, _edges = loaded
     require_me(me, nodes, plan_path)
+    ARM["me"], ARM["plan"] = me, loaded
     inbox = nodes[me]
     require_dir(inbox, f"run channel-setup {plan_path} {me}")
     proc = try_inotify(
@@ -650,9 +751,17 @@ def check_body(verb, template, text):
             die(f"{verb} body is missing the line: {raw}")
 
 
-def cmd_send(plan_path, me, recipient, verb, body, refs):
-    plan_file, nodes, verbs, messages, edges = load_plan(plan_path)
-    require_me(me, nodes, plan_file)
+CONTROL = ("PING", "PONG")
+
+
+def cmd_send(plan_path, me, recipient, verb, body_text, refs):
+    loaded = load_plan(plan_path)
+    require_me(me, loaded[1], loaded[0])
+    return send_message(loaded, me, recipient, verb, body_text, refs)
+
+
+def send_message(loaded, me, recipient, verb, body_text, refs):
+    plan_file, nodes, verbs, messages, edges = loaded
     if recipient not in nodes:
         die(f"unknown node (recipient={recipient})")
     found = edge_between(edges, me, recipient)
@@ -660,12 +769,10 @@ def cmd_send(plan_path, me, recipient, verb, body, refs):
         die(f"{me} is not allowed to send to {recipient}")
     _src, _dst, mode, _label = found
     allowed = verbs.get((me, recipient), [])
-    if verb not in allowed:
+    if verb not in allowed and verb not in CONTROL:
         die(f"verb {verb} is not allowed on {me} -> {recipient}")
-    body = Path(body)
-    if not body.is_file():
-        die(f"no body file {body}")
-    check_body(verb, messages[verb]["body"], body.read_text())
+    template = messages[verb]["body"] if verb in messages else ["NONCE: <nonce>"]
+    check_body(verb, template, body_text)
     published = []
     for ref in refs:
         source = Path(ref)
@@ -675,7 +782,8 @@ def cmd_send(plan_path, me, recipient, verb, body, refs):
     require_dir(nodes[me], f"run channel-setup {plan_file} {me}")
     inbox = nodes[recipient]
     require_dir(inbox, f"run channel-setup {plan_file} {recipient}")
-    if mode == "wait":
+    control = verb in CONTROL and re.search(r"^[ \t]*NONCE:[ \t]*\S", body_text, re.M)
+    if mode == "wait" and not control:
         pending = [entry for entry in message_names(inbox) if parse_message_name(entry.name)[0] == me]
         for entry in pending:
             wait_until_removed(inbox, entry.name)
@@ -683,12 +791,7 @@ def cmd_send(plan_path, me, recipient, verb, body, refs):
         if not source.is_file():
             die(f"no referenced file {source}")
     seq_path = out_seq_path(nodes[me])
-    handle = lock_exclusive(seq_path.with_suffix(".lock"))
-    try:
-        current = read_map(seq_path).get("next", 0) + 1
-        write_map(seq_path, {"next": current})
-    finally:
-        handle.close()
+    current = next_seq(seq_path)
     now = datetime.now()
     stamp = now.strftime("%Y%m%d-%H%M%S") + f".{now.microsecond // 1000:03d}"
     refs_dir = plan_file.parent / "refs"
@@ -710,7 +813,7 @@ def cmd_send(plan_path, me, recipient, verb, body, refs):
     if not copied:
         header.append("- none")
     header.append("---")
-    text = "\n".join(header) + "\n" + body.read_text()
+    text = "\n".join(header) + "\n" + body_text
     if not text.endswith("\n"):
         text += "\n"
     filename = f"{stamp}__{me}__{current:04d}.md"
@@ -720,6 +823,197 @@ def cmd_send(plan_path, me, recipient, verb, body, refs):
     dest = inbox / filename
     publish_replace(tmp, dest)
     say(f"SENT {dest}")
+    log_event("send", plan=plan_file, **{"from": me}, to=recipient, verb=verb, seq=current, refs=len(copied), file=dest)
+    fire_webhook(plan_file, recipient, me, verb, inbox, dest)
+    return dest
+
+
+def fire_webhook(plan_file, target, sender, verb, inbox, file):
+    hook = HOOKS.get(target)
+    if not hook:
+        return
+    key = hook["key"]
+    if hook["key_file"]:
+        key_file = Path(hook["key_file"])
+        if not key_file.is_absolute():
+            key_file = plan_file.resolve().parent / key_file
+        try:
+            key = key_file.read_text().split("\n", 1)[0].rstrip("\r")
+        except OSError:
+            note(f"WARNING: webhook for {target} not fired: cannot read webhook_key_file {key_file} (message is queued)")
+            return
+    for prefix in ("Authorization: Bearer ", "Bearer "):
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+            break
+    payload = json.dumps({"target": target, "from": sender, "verb": verb, "inbox": str(inbox), "file": str(file)}, separators=(",", ":")).encode()
+    delay = 1
+    attempt = 0
+    while True:
+        attempt += 1
+        req = urllib.request.Request(hook["url"], data=payload, method="POST", headers={"Content-Type": "application/json"})
+        if key:
+            req.add_header("Authorization", "Bearer " + key)
+        why, retry = "", False
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                text = resp.read(300).decode(errors="replace").replace("\n", " ")
+                say(f"WEBHOOK {target} {resp.status} {text}")
+                log_event("webhook", result="ok", to=target, **{"from": sender}, verb=verb, attempts=attempt, file=file)
+                return
+        except urllib.error.HTTPError as exc:
+            why, retry = f"{exc.code} {exc.read(300).decode(errors='replace')}", exc.code >= 500 or exc.code == 429
+        except (urllib.error.URLError, OSError) as exc:
+            why, retry = str(exc), True
+        if not retry or attempt > hook["retries"]:
+            log_event("webhook", result="fail", to=target, **{"from": sender}, verb=verb, attempts=attempt, error=why, file=file)
+            note(f"WARNING: webhook for {target} failed ({why}) (message is queued)")
+            return
+        wait = min(delay, hook["backoff_max"])
+        note(f"webhook for {target}: attempt {attempt} failed ({why}); retrying in {wait}s")
+        time.sleep(wait)
+        delay *= 2
+
+
+def read_head(path):
+    verb = sender = nonce = ""
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return verb, sender, nonce
+    in_body = False
+    for line in lines:
+        line = line.strip()
+        if line == "---" and not in_body:
+            in_body = True
+        elif not in_body and line.startswith("VERB: "):
+            verb = line[6:].strip()
+        elif not in_body and line.startswith("FROM: "):
+            sender = line[6:].strip()
+        elif in_body and line.startswith("NONCE:") and not nonce:
+            nonce = line[6:].strip()
+    return verb, sender, nonce
+
+
+def pong_path(nodes, me, nonce):
+    return node_dir(nodes[me]) / ("pong-" + re.sub(r"[^A-Za-z0-9_.-]", "_", nonce))
+
+
+def handle_control(inbox):
+    """channel-arm answers PING and files PONG for channel-ping; the agent never sees either."""
+    me, loaded = ARM["me"], ARM["plan"]
+    if not me:
+        return
+    for entry in message_names(inbox):
+        verb, sender, nonce = read_head(entry)
+        if not nonce:
+            continue
+        if verb == "PING":
+            if nonce and edge_between(loaded[4], me, sender):
+                import contextlib, io
+                with contextlib.redirect_stdout(io.StringIO()):
+                    send_message(loaded, me, sender, "PONG", f"NONCE: {nonce}\n", [])
+            entry.unlink(missing_ok=True)
+            log_event("ping-answered", node=me, **{"from": sender}, nonce=nonce)
+        elif verb == "PONG":
+            try:
+                os.replace(entry, pong_path(loaded[1], me, nonce))
+            except OSError:
+                pass
+            log_event("pong-received", node=me, **{"from": sender}, nonce=nonce)
+
+
+def cmd_ping(plan_path, me):
+    loaded = load_plan(plan_path)
+    plan_file, nodes, _verbs, _messages, edges = loaded
+    require_me(me, nodes, plan_file)
+    require_dir(nodes[me], f"run channel-setup {plan_file} {me}")
+    stamp = node_dir(nodes[me]) / "ping.stamp"
+    if stamp.is_file() and not OPTS["force"]:
+        age = time.time() - stamp.stat().st_mtime
+        if age < OPTS["every"] * 60:
+            say(f"SKIP {me} pinged {int(age)}s ago (limit every {OPTS['every']} min; --force to override)")
+            return
+    stamp.write_text(datetime.now().astimezone().isoformat(timespec="seconds") + "\n")
+    start = time.time()
+    probes = []
+    for src, dst, _mode, _label in edges:
+        if src != me:
+            continue
+        nonce = f"{me}-{dst}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+        sent = send_message(loaded, me, dst, "PING", f"NONCE: {nonce}\n", [])
+        probes.append({"dest": dst, "nonce": nonce, "file": sent, "two": edge_between(edges, dst, me) is not None, "done": False})
+    deadline = start + OPTS["timeout"]
+    while any(not pr["done"] for pr in probes) and time.time() < deadline:
+        for pr in probes:
+            if pr["done"]:
+                continue
+            ok = False
+            if pr["two"]:
+                pp = pong_path(nodes, me, pr["nonce"])
+                if pp.is_file():
+                    pp.unlink()
+                    ok = True
+                else:
+                    for entry in message_names(nodes[me]):
+                        verb, _sender, nonce = read_head(entry)
+                        if verb == "PONG" and nonce == pr["nonce"]:
+                            entry.unlink(missing_ok=True)
+                            ok = True
+                            break
+            elif not Path(pr["file"]).is_file():
+                ok = True
+            if ok:
+                pr["done"] = True
+                kind = "PONG" if pr["two"] else "CONSUMED"
+                secs = f"{time.time() - start:.1f}s"
+                say(f"{kind} {pr['dest']} {secs}")
+                log_event("ping", result="ok", **{"from": me}, to=pr["dest"], kind=kind.lower(), seconds=secs)
+        time.sleep(POLL_SECONDS)
+    failed = False
+    for pr in probes:
+        if pr["done"]:
+            continue
+        failed = True
+        want = "no PONG" if pr["two"] else "PING not consumed"
+        say(f"TIMEOUT {pr['dest']} ({want} after {OPTS['timeout']}s)")
+        log_event("ping", result="timeout", **{"from": me}, to=pr["dest"], nonce=pr["nonce"])
+    if failed:
+        sys.exit(1)
+
+
+def cmd_status(plan_path):
+    _plan_file, nodes, _verbs, _messages, _edges = load_plan(plan_path)
+    now = time.time()
+    for name, inbox in nodes.items():
+        try:
+            os.listdir(inbox)
+        except PermissionError:
+            say(f"node {name} {inbox} no permission")
+            continue
+        except OSError:
+            say(f"node {name} {inbox} missing")
+            continue
+        files = message_names(inbox)
+        line = f"node {name} {inbox} messages {len(files)}"
+        if files:
+            line += f" oldest {int(now - files[0].stat().st_mtime)}s"
+        claimed = []
+        cdir = inbox / "claimed"
+        try:
+            for entry in sorted(cdir.iterdir()) if cdir.is_dir() else []:
+                if entry.is_dir() or entry.name.endswith(".owner"):
+                    continue
+                item = f"{entry.name} {int(now - entry.stat().st_mtime)}s"
+                owner = cdir / (entry.name + ".owner")
+                if owner.is_file():
+                    item += " owner=" + owner.read_text().split("\n", 1)[0].strip()
+                claimed.append(item)
+        except PermissionError:
+            line += " claimed no-permission"
+        say(f"{line} claimed {len(claimed)}")
+        for item in claimed:
+            say(f"  claimed {item}")
 
 
 def main(argv):
@@ -731,6 +1025,8 @@ def main(argv):
         die("usage: channel.py setup|arm|send ...")
     command = argv[1]
     dry_run, what, args = split_args(argv[2:])
+    if OPTS["msgs"] and command != "send":
+        die("-m is only for channel-send")
     if command == "setup":
         if len(args) != 2:
             die("usage: channel-setup FILE NODE [-n|--dry-run] [--whatineedtoknow]")
@@ -754,9 +1050,26 @@ def main(argv):
                 die("usage: channel-send FILE NODE --whatineedtoknow")
             show_what(args[0], args[1])
             return
-        if len(args) < 5:
-            die("usage: channel-send FILE NODE RECIPIENT VERB BODYFILE [REF ...]")
-        cmd_send(args[0], args[1], args[2], args[3], args[4], args[5:])
+        if len(args) < 4:
+            die("usage: channel-send FILE NODE RECIPIENT VERB [BODYFILE|-|-m TEXT...] [REF ...]")
+        if OPTS["msgs"]:
+            body_text, refs = "\n\n".join(OPTS["msgs"]) + "\n", args[4:]
+        elif len(args) == 4 or args[4] == "-":
+            body_text, refs = sys.stdin.read(), args[5:]
+        else:
+            body = Path(args[4])
+            if not body.is_file():
+                die(f"no body file {body}")
+            body_text, refs = body.read_text(), args[5:]
+        cmd_send(args[0], args[1], args[2], args[3], body_text, refs)
+    elif command == "ping":
+        if dry_run or what or len(args) != 2:
+            die("usage: channel-ping FILE NODE [--force] [--every MIN] [--timeout SEC]")
+        cmd_ping(args[0], args[1])
+    elif command == "status":
+        if dry_run or what or len(args) != 1:
+            die("usage: channel-status FILE")
+        cmd_status(args[0])
     else:
         die(f"unknown command {command}")
 

@@ -19,7 +19,9 @@ With no mode, this prints help and exits.
 
   channel --setup FILE NODE [-n|--dry-run] [--whatineedtoknow]
   channel --arm   FILE NODE [--whatineedtoknow]
-  channel --send  FILE NODE DEST VERB BODY [REF ...] [--whatineedtoknow]
+  channel --send  FILE NODE DEST VERB [BODYFILE|-|-m TEXT ...] [REF ...] [--whatineedtoknow]
+  channel --ping  FILE NODE [--force] [--every MIN] [--timeout SEC]
+  channel --status FILE
 
 channel-setup, channel-arm, and channel-send are names for this same program.
 The name selects the mode, so those forms do not need --setup, --arm, or --send.
@@ -39,8 +41,14 @@ Give only the key: the tool sends Authorization: Bearer KEY. A leading
 After channel-send queues a message to NAME, it POSTs JSON
   {"target","from","verb","inbox","file"}
 to URL with Content-Type: application/json.
+Optional webhook_retries=N (default 3) and webhook_backoff_max=SEC (default 30):
+network errors, 5xx and 429 are retried with exponential backoff.
 Success prints "WEBHOOK NAME CODE RESPONSE". Any failure prints a WARNING on
 stderr; the message stays queued and the exit status is still 0.
+
+PING and PONG (body NONCE: <value>) are built in on every arrow; channel-arm
+answers PING itself. Events go to syslog, tag agent-channel, as key=value
+(CHANNEL_SYSLOG=0 disables; CHANNEL_LOG_FILE=PATH also appends to a file).
 EOF
 }
 
@@ -54,24 +62,40 @@ case "$base" in
   channel-setup) name_mode=setup ;;
   channel-arm) name_mode=arm ;;
   channel-send) name_mode=send ;;
+  channel-ping) name_mode=ping ;;
+  channel-status) name_mode=status ;;
   *) name_mode= ;;
 esac
 
-parsed=$(getopt -n "$base" -o hn -l help,dry-run,whatineedtoknow,setup,arm,send -- "$@") || exit 1
+parsed=$(getopt -n "$base" -o hnm: -l help,dry-run,whatineedtoknow,setup,arm,send,ping,status,force,every:,timeout: -- "$@") || exit 1
 eval set -- "$parsed"
 
 dry=0
 what=0
 flag_mode=
+MSGS=$(mktemp)
+nmsg=0
+ping_force=0
+ping_every=${CHANNEL_PING_EVERY:-30}
+ping_timeout=${CHANNEL_PING_TIMEOUT:-300}
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) help; exit 0 ;;
     -n|--dry-run) dry=1; shift ;;
     --whatineedtoknow) what=1; shift ;;
-    --setup|--arm|--send)
+    -m)
+      [ "$nmsg" -eq 0 ] || printf '\n' >> "$MSGS"
+      printf '%s\n' "$2" >> "$MSGS"
+      nmsg=$((nmsg + 1))
+      shift 2
+      ;;
+    --force) ping_force=1; shift ;;
+    --every) ping_every=$2; shift 2 ;;
+    --timeout) ping_timeout=$2; shift 2 ;;
+    --setup|--arm|--send|--ping|--status)
       m=${1#--}
       if [ -n "$flag_mode" ] && [ "$flag_mode" != "$m" ]; then
-        die "pick one of --setup, --arm, or --send"
+        die "pick one of --setup, --arm, --send, --ping, or --status"
       fi
       flag_mode=$m
       shift
@@ -90,7 +114,7 @@ if [ -n "$flag_mode" ]; then
 fi
 if [ -z "$mode" ]; then
   if [ "$dry" -eq 1 ] || [ "$what" -eq 1 ] || [ $# -gt 0 ]; then
-    die "no mode; use --setup, --arm, or --send"
+    die "no mode; use --setup, --arm, --send, --ping, or --status"
   fi
   help
   exit 0
@@ -104,7 +128,34 @@ fi
 
 PARSE=$(mktemp)
 SHOWN=$(mktemp)
-trap 'rm -f "$PARSE" "$SHOWN"' EXIT INT TERM
+BODYTMP=$(mktemp)
+trap 'rm -f "$PARSE" "$SHOWN" "$MSGS" "$BODYTMP"' EXIT INT TERM
+[ "$nmsg" -eq 0 ] || [ "$mode" = send ] || die "-m is only for channel-send"
+bindir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# One key=value line to syslog (tag agent-channel) unless CHANNEL_SYSLOG=0,
+# and to CHANNEL_LOG_FILE when set.
+log_event() {
+  line="event=$1"
+  shift
+  while [ $# -ge 2 ]; do
+    v=$2
+    case "$v" in
+      ""|*[\ \"=]*|*"	"*) v=\"$(printf '%s' "$v" | sed 's/\\/\\\\/g; s/"/\\"/g')\" ;;
+    esac
+    line="$line $1=$v"
+    shift 2
+  done
+  if [ "${CHANNEL_SYSLOG:-1}" != 0 ] && command -v logger >/dev/null 2>&1; then
+    case "$line" in
+      *result=fail*|*result=timeout*) logger -t agent-channel -p user.warning -- "$line" 2>/dev/null || true ;;
+      *) logger -t agent-channel -p user.info -- "$line" 2>/dev/null || true ;;
+    esac
+  fi
+  if [ -n "${CHANNEL_LOG_FILE:-}" ]; then
+    printf '%s agent-channel %s\n' "$(date +%Y-%m-%dT%H:%M:%S%:z)" "$line" >> "$CHANNEL_LOG_FILE" 2>/dev/null || true
+  fi
+}
 
 parse_plan() {
   awk -v plan="$1" '
@@ -390,7 +441,7 @@ function parse_key(text, base,    nlines, i, line, nf, f, name, inbox, src, dst,
     nf = split(line, f, /[ \t]+/)
     if (f[1] == "node" && nf >= 3) {
       name = f[2]; inbox = f[3]
-      wurl = ""; wfile = ""; wkey = ""
+      wurl = ""; wfile = ""; wkey = ""; wret = 3; wmax = 30
       for (k = 4; k <= nf; k++) {
         kv = f[k]; eq = index(kv, "=")
         if (eq < 2) die("line " base + i ": node option must be key=value (" kv ")")
@@ -402,7 +453,11 @@ function parse_key(text, base,    nlines, i, line, nf, f, name, inbox, src, dst,
         } else if (key == "webhook_key_file") {
           wfile = val
         } else if (key == "webhook_key") wkey = val
-        else die("line " base + i ": unknown node option " key " (allowed: webhook, webhook_key_file, webhook_key)")
+        else if (key == "webhook_retries" || key == "webhook_backoff_max") {
+          if (val !~ /^[0-9]+$/) die("line " base + i ": " key " must be a whole number >= 0")
+          if (key == "webhook_retries") wret = val + 0; else wmax = val + 0
+        }
+        else die("line " base + i ": unknown node option " key " (allowed: webhook, webhook_key_file, webhook_key, webhook_retries, webhook_backoff_max)")
       }
       if (wfile != "" && wkey != "") die("line " base + i ": use webhook_key_file or webhook_key, not both")
       if (wurl == "" && (wfile != "" || wkey != "")) die("line " base + i ": webhook key given without webhook=URL")
@@ -410,7 +465,7 @@ function parse_key(text, base,    nlines, i, line, nf, f, name, inbox, src, dst,
       for (k = 1; k <= node_n; k++) if (n_name[k] == name) die("line " base + i ": node " name " is listed twice")
       if (substr(inbox, 1, 1) != "/") die("line " base + i ": inbox path must be absolute")
       node_n++; n_name[node_n] = name; n_path[node_n] = inbox
-      n_wurl[node_n] = wurl; n_wfile[node_n] = wfile; n_wkey[node_n] = wkey
+      n_wurl[node_n] = wurl; n_wfile[node_n] = wfile; n_wkey[node_n] = wkey; n_wret[node_n] = wret; n_wmax[node_n] = wmax
     } else if (f[1] == "verb" && nf >= 4) {
       src = f[2]; dst = f[3]; words = ""
       for (k = 4; k <= nf; k++) words = words (k == 4 ? "" : " ") f[k]
@@ -461,7 +516,7 @@ BEGIN {
   if (prob != "") { printf "%s", prob > "/dev/stderr"; exit 1 }
   for (i = 1; i <= out_n; i++) print "E\t" o_src[i] "\t" o_dst[i] "\t" o_mode[i] "\t" o_label[i]
   for (i = 1; i <= node_n; i++) print "N\t" n_name[i] "\t" n_path[i]
-  for (i = 1; i <= node_n; i++) if (n_wurl[i] != "") print "W\t" n_name[i] "\t" n_wurl[i] "\t" n_wfile[i] "\t" n_wkey[i]
+  for (i = 1; i <= node_n; i++) if (n_wurl[i] != "") print "W\t" n_name[i] "\t" n_wurl[i] "\t" n_wfile[i] "\t" n_wkey[i] "\t" n_wret[i] "\t" n_wmax[i]
   for (i = 1; i <= verb_n; i++) print "V\t" v_src[i] "\t" v_dst[i] "\t" v_words[i]
   for (i = 1; i <= msg_n; i++) {
     print "M\t" msg_name[i]
@@ -513,18 +568,22 @@ plan: $plan
 inbox: $inbox
 watch: $bindir/channel-arm $plan $me
   Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.
-read: a message file has FROM, TO, SEQ, VERB and REFS (paths relative to the plan directory, or - none), then a --- line, then the body.
-  Handle the oldest FILE first, one file at a time.
+  The watch answers PING for you (it sends PONG and removes the PING) and never shows it. With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING.
+start: before new messages, look in $inbox/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.
+read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.
+  Handle the oldest FILE first, one file at a time. You may move it into $inbox/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.
 send: $bindir/channel-send $plan $me DEST VERB BODYFILE [REF ...]
-  DEST is a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below).
-  BODYFILE is the path of a file you write first, holding that verb's body lines below.
-  Copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.
+  or:  $bindir/channel-send $plan $me DEST VERB -m 'TEXT' [-m 'TEXT' ...] [REF ...]   (each -m is one block of lines; blocks are joined by a blank line)
+  or:  $bindir/channel-send $plan $me DEST VERB - [REF ...]   (- or no BODYFILE reads the body from stdin)
+  DEST must be a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below). PING and PONG are built in on every arrow; their body is NONCE: <value>.
+  Body: copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.
   Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.
-  REF files are optional; they are copied into refs/ and listed in the message.
-  On a -> arrow the send waits until DEST removes your previous message; on -< it queues.
-done: rm the FILE from $inbox when you have finished handling it. Removing it is the acknowledgement.
-  You may move a FILE into $inbox/claimed/ while you work on it (the watch ignores subfolders, so it shows the next file); rm it from there only after your reply is sent.
-after a start or a compact, run $bindir/channel-arm $plan $me --whatineedtoknow again.
+  REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.
+  On a -> arrow the send waits until DEST removes your previous message; on -< it queues. PING and PONG never wait.
+done: rm the FILE when you have finished it (from claimed/ only after your reply is sent). Removing it is the acknowledgement.
+tools: $bindir/channel-ping $plan $me tests each of your arrows (skipped if run in the last 30 minutes; --force, --every MIN).
+  $bindir/channel-status $plan shows each inbox's message count, oldest age, and claimed files.
+after a start or a compact, run $bindir/channel-arm $plan $me --whatineedtoknow again, then check claimed/ (see start).
 
 ACTEOF
 }
@@ -597,6 +656,8 @@ fire_webhook() {
   wurl=$(printf '%s\n' "$wline" | cut -f3)
   wfile=$(printf '%s\n' "$wline" | cut -f4)
   wkey=$(printf '%s\n' "$wline" | cut -f5)
+  wret=$(printf '%s\n' "$wline" | cut -f6)
+  wmax=$(printf '%s\n' "$wline" | cut -f7)
   if [ -n "$wfile" ]; then
     case "$wfile" in /*) ;; *) wfile=$(cd "$(dirname "$PLAN")" && pwd)/$wfile ;; esac
     if [ ! -r "$wfile" ]; then
@@ -612,22 +673,88 @@ fire_webhook() {
   fi
   payload=$(printf '{"target":"%s","from":"%s","verb":"%s","inbox":"%s","file":"%s"}' \
     "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" "$(json_str "$5")")
-  wout=$(mktemp) || { note "WARNING: webhook for $1 not fired: mktemp failed (message is queued)"; return 0; }
-  if [ -n "$wkey" ]; then
-    code=$(printf 'header = "Authorization: Bearer %s"\n' "$wkey" | curl -sS -o "$wout" -w '%{http_code}' \
-      --connect-timeout 5 --max-time 15 -X POST -K - -H 'Content-Type: application/json' \
-      --data-binary "$payload" -- "$wurl" 2>&1) || code="curl error: $code"
-  else
-    code=$(curl -sS -o "$wout" -w '%{http_code}' --connect-timeout 5 --max-time 15 -X POST \
-      -H 'Content-Type: application/json' --data-binary "$payload" -- "$wurl" 2>&1) || code="curl error: $code"
-  fi
-  code=$(printf '%s' "$code" | tr '\n' ' ')
-  resp=$(head -c 300 "$wout" 2>/dev/null | tr '\n' ' '); rm -f "$wout"
-  case "$code" in
-    2[0-9][0-9]) say "WEBHOOK $1 $code $resp" ;;
-    *) note "WARNING: webhook for $1 failed ($code) ${resp} (message is queued)" ;;
-  esac
+  attempt=0
+  delay=1
+  while :; do
+    attempt=$((attempt + 1))
+    wout=$(mktemp) || { note "WARNING: webhook for $1 not fired: mktemp failed (message is queued)"; return 0; }
+    if [ -n "$wkey" ]; then
+      code=$(printf 'header = "Authorization: Bearer %s"\n' "$wkey" | curl -sS -o "$wout" -w '%{http_code}' \
+        --connect-timeout 5 --max-time 15 -X POST -K - -H 'Content-Type: application/json' \
+        --data-binary "$payload" -- "$wurl" 2>&1) || code="curl error: $code"
+    else
+      code=$(curl -sS -o "$wout" -w '%{http_code}' --connect-timeout 5 --max-time 15 -X POST \
+        -H 'Content-Type: application/json' --data-binary "$payload" -- "$wurl" 2>&1) || code="curl error: $code"
+    fi
+    code=$(printf '%s' "$code" | tr '\n' ' ')
+    resp=$(head -c 300 "$wout" 2>/dev/null | tr '\n' ' '); rm -f "$wout"
+    case "$code" in
+      2[0-9][0-9])
+        say "WEBHOOK $1 $code $resp"
+        log_event webhook result ok to "$1" from "$2" verb "$3" attempts "$attempt" file "$5"
+        return 0
+        ;;
+      5[0-9][0-9]|429|curl*|000*) retry=1 ;;
+      *) retry=0 ;;
+    esac
+    if [ "$retry" -eq 0 ] || [ "$attempt" -gt "${wret:-3}" ]; then
+      log_event webhook result fail to "$1" from "$2" verb "$3" attempts "$attempt" error "$code $resp" file "$5"
+      note "WARNING: webhook for $1 failed ($code) ${resp} (message is queued)"
+      return 0
+    fi
+    wait=$delay
+    [ "$wait" -le "${wmax:-30}" ] || wait=${wmax:-30}
+    note "webhook for $1: attempt $attempt failed ($code); retrying in ${wait}s"
+    sleep "$wait"
+    delay=$((delay * 2))
+  done
   return 0
+}
+
+# VERB, FROM and NONCE of a message file, tab-separated.
+read_head() {
+  awk 'BEGIN { body = 0 }
+    !body && $0 == "---" { body = 1; next }
+    !body && /^VERB: / { v = substr($0, 7) }
+    !body && /^FROM: / { f = substr($0, 7) }
+    body && /^[ \t]*NONCE:/ && n == "" { n = $0; sub(/^[ \t]*NONCE:[ \t]*/, "", n); sub(/[ \t]+$/, "", n) }
+    END { printf "%s\t%s\t%s\n", v, f, n }' "$1" 2>/dev/null
+}
+
+has_edge() {
+  awk -F '\t' -v s="$1" -v d="$2" '$1=="E" && $2==s && $3==d { found=1 } END { exit !found }' "$PARSE"
+}
+
+pong_path() {
+  printf '%s/pong-%s\n' "$(dirname "$(node_path "$1")")" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9_.-' '_')"
+}
+
+# channel-arm answers PING and files PONG for channel-ping; the agent never sees either.
+handle_control() {
+  [ -n "${ARM_ME:-}" ] || return 0
+  for cpath in "$1"/*; do
+    [ -f "$cpath" ] || continue
+    cbase=$(basename "$cpath")
+    printf '%s\n' "$cbase" | grep -Eq '^[0-9]{8}-[0-9]{6}\.[0-9]{3}__.+__[0-9]+\.md$' || continue
+    head=$(read_head "$cpath")
+    cverb=$(printf '%s' "$head" | cut -f1)
+    cfrom=$(printf '%s' "$head" | cut -f2)
+    cnonce=$(printf '%s' "$head" | cut -f3)
+    [ -n "$cnonce" ] || continue
+    case "$cverb" in
+      PING)
+        if [ -n "$cnonce" ] && has_edge "$ARM_ME" "$cfrom"; then
+          "$bindir/channel-send" "$PLAN" "$ARM_ME" "$cfrom" PONG -m "NONCE: $cnonce" >/dev/null 2>&1 || note "PONG to $cfrom failed"
+        fi
+        rm -f -- "$cpath"
+        log_event ping-answered node "$ARM_ME" from "$cfrom" nonce "$cnonce"
+        ;;
+      PONG)
+        mv -f -- "$cpath" "$(pong_path "$ARM_ME" "$cnonce")" 2>/dev/null || true
+        log_event pong-received node "$ARM_ME" from "$cfrom" nonce "$cnonce"
+        ;;
+    esac
+  done
 }
 
 oldest_name() {
@@ -650,6 +777,7 @@ announce() {
   inbox=$1
   [ -d "$inbox" ] || die "inbox disappeared: $inbox"
   shown=$(cat "$SHOWN" 2>/dev/null || true)
+  handle_control "$inbox"
   oldest=$(oldest_name "$inbox")
   if [ "$oldest" = "$shown" ]; then
     return 0
@@ -657,11 +785,13 @@ announce() {
   if [ -n "$shown" ] && [ -f "$inbox/$shown" ]; then
     return 0
   fi
+  [ -z "$shown" ] || log_event consumed node "$ARM_ME" file "$inbox/$shown"
   if [ -z "$oldest" ]; then
     : > "$SHOWN"
     return 0
   fi
   say "FILE $inbox/$oldest"
+  log_event deliver node "$ARM_ME" file "$inbox/$oldest"
   printf '%s\n' "$oldest" > "$SHOWN"
 }
 
@@ -753,6 +883,7 @@ cmd_arm() {
   fi
   inbox=$(node_path "$2")
   [ -d "$inbox" ] || die "no directory $inbox; run channel-setup $PLAN $2"
+  ARM_ME=$2
   if try_inotify; then
     say "READY"
     announce "$inbox"
@@ -843,13 +974,22 @@ cmd_send() {
     emit_what "$2"
     return 0
   fi
-  [ $# -ge 5 ] || die "usage: $invoked FILE NODE RECIPIENT VERB BODYFILE [REF ...]"
+  [ $# -ge 4 ] || die "usage: $invoked FILE NODE RECIPIENT VERB [BODYFILE|-|-m TEXT...] [REF ...]"
   PLAN=$1
   me=$2
   recipient=$3
   verb=$4
-  body=$5
-  shift 5
+  shift 4
+  if [ "$nmsg" -gt 0 ]; then
+    body=$MSGS
+  elif [ $# -eq 0 ] || [ "$1" = - ]; then
+    cat > "$BODYTMP" || die "cannot read the body from stdin"
+    body=$BODYTMP
+    [ $# -eq 0 ] || shift
+  else
+    body=$1
+    shift
+  fi
   [ -f "$PLAN" ] || die "no plan file $PLAN"
   parse_plan "$PLAN"
   require_me "$me"
@@ -858,12 +998,23 @@ cmd_send() {
     || die "$me is not allowed to send to $recipient"
   words=$(awk -F '\t' -v s="$me" -v d="$recipient" '$1=="V" && $2==s && $3==d { print $4 }' "$PARSE")
   ok=0
+  control=0
+  case "$verb" in PING|PONG) control=1; ok=1 ;; esac
   for w in $words; do
     [ "$w" = "$verb" ] && ok=1
   done
   [ "$ok" -eq 1 ] || die "verb $verb is not allowed on $me -> $recipient"
   [ -f "$body" ] || die "no body file $body"
-  check_body "$verb" "$body"
+  if [ "$control" -eq 1 ] && ! awk '{ sub(/^[ \t]+/, "") } /^NONCE:[ \t]*[^ \t]/ { f=1 } END { exit !f }' "$body"; then
+    control_wait=1
+  else
+    control_wait=0
+  fi
+  if [ "$control" -eq 1 ] && ! awk -F '\t' -v v="$verb" '$1=="M" && $2==v { f=1 } END { exit !f }' "$PARSE"; then
+    awk '{ sub(/^[ \t]+/, "") } /^NONCE:[ \t]*[^ \t<]/ { f=1 } END { exit !f }' "$body" || die "$verb body is missing a value for: NONCE: <nonce>"
+  else
+    check_body "$verb" "$body"
+  fi
   for ref in "$@"; do
     [ -f "$ref" ] || die "no referenced file $ref"
   done
@@ -871,7 +1022,7 @@ cmd_send() {
   inbox=$(node_path "$recipient")
   [ -d "$mine" ] || die "no directory $mine; run channel-setup $PLAN $me"
   [ -d "$inbox" ] || die "no directory $inbox; run channel-setup $PLAN $recipient"
-  if [ "$mode_edge" = wait ]; then
+  if [ "$mode_edge" = wait ] && { [ "$control" -eq 0 ] || [ "$control_wait" -eq 1 ]; }; then
     for path in "$inbox"/*; do
       [ -f "$path" ] || continue
       base=$(basename "$path")
@@ -886,21 +1037,23 @@ cmd_send() {
   node=$(dirname "$mine")
   refs=$(dirname "$PLAN")/refs
   [ -d "$refs" ] || die "no directory $refs; run channel-setup $PLAN $me"
-  lock=$node/out-seq.lock
+  # Lock-free sequence: create out-seq.d/N with noclobber; on collision try N+1.
+  # A crash at worst skips a number. out-seq.txt is only a hint (last number used).
+  seqd=$node/out-seq.d
   seqf=$node/out-seq.txt
-  current=$(
-    flock -x 9
-    n=0
-    if [ -f "$seqf" ]; then
-      while read -r k v _; do
-        if [ "$k" = next ]; then n=$v; fi
-      done < "$seqf"
-    fi
-    n=$((n + 1))
-    printf 'next %s\n' "$n" > "$seqf.tmp"
-    mv -f "$seqf.tmp" "$seqf"
-    printf '%s\n' "$n"
-  ) 9>"$lock"
+  mkdir -p "$seqd"
+  current=1
+  if [ -f "$seqf" ]; then
+    while read -r k v _; do
+      if [ "$k" = next ]; then current=$((v + 1)); fi
+    done < "$seqf"
+  fi
+  while ! (set -C; : > "$seqd/$current") 2>/dev/null; do
+    [ -d "$seqd" ] || die "cannot create $seqd/$current"
+    [ -e "$seqd/$current" ] || die "cannot create $seqd/$current"
+    current=$((current + 1))
+  done
+  printf 'next %s\n' "$current" > "$seqf.tmp.$$" && mv -f "$seqf.tmp.$$" "$seqf" || true
   stamp=$(date +%Y%m%d-%H%M%S.%3N)
   seq4=$(printf '%04d' "$current")
   copied=
@@ -940,10 +1093,134 @@ cmd_send() {
   fi
   mv -f -- "$tmp" "$inbox/$filename"
   say "SENT $inbox/$filename"
+  nrefs=0
+  for _r in "$@"; do nrefs=$((nrefs + 1)); done
+  log_event send plan "$PLAN" from "$me" to "$recipient" verb "$verb" seq "$current" refs "$nrefs" file "$inbox/$filename"
+  LAST_SENT=$inbox/$filename
   fire_webhook "$recipient" "$me" "$verb" "$inbox" "$inbox/$filename" || true
 }
 
+cmd_ping() {
+  [ "$dry" -eq 0 ] && [ "$what" -eq 0 ] && [ $# -eq 2 ] || die "usage: $invoked FILE NODE [--force] [--every MIN] [--timeout SEC]"
+  PLAN=$1
+  me=$2
+  [ -f "$PLAN" ] || die "no plan file $PLAN"
+  parse_plan "$PLAN"
+  require_me "$me"
+  myinbox=$(node_path "$me")
+  [ -d "$myinbox" ] || die "no directory $myinbox; run channel-setup $PLAN $me"
+  stamp=$(dirname "$myinbox")/ping.stamp
+  now=$(date +%s)
+  if [ -f "$stamp" ] && [ "$ping_force" -eq 0 ]; then
+    age=$((now - $(stat -c %Y "$stamp")))
+    if [ "$age" -lt $((ping_every * 60)) ]; then
+      say "SKIP $me pinged ${age}s ago (limit every $ping_every min; --force to override)"
+      return 0
+    fi
+  fi
+  date +%Y-%m-%dT%H:%M:%S%:z > "$stamp"
+  probes=$(mktemp)
+  for dest in $(awk -F '\t' -v s="$me" '$1=="E" && $2==s { print $3 }' "$PARSE"); do
+    nonce=$me-$dest-$(date +%Y%m%d-%H%M%S)-$$
+    sent=$("$bindir/channel-send" "$PLAN" "$me" "$dest" PING -m "NONCE: $nonce" | awk '/^SENT / { print substr($0, 6) }')
+    two=0
+    has_edge "$dest" "$me" && two=1
+    printf '%s\t%s\t%s\t%s\n' "$dest" "$nonce" "$sent" "$two" >> "$probes"
+  done
+  start=$(date +%s.%N)
+  deadline=$(( $(date +%s) + ping_timeout ))
+  done_list=
+  failed=0
+  while :; do
+    left=0
+    while IFS='	' read -r dest nonce sent two; do
+      case " $done_list " in *" $dest "*) continue ;; esac
+      ok=0
+      if [ "$two" = 1 ]; then
+        pp=$(pong_path "$me" "$nonce")
+        if [ -f "$pp" ]; then
+          rm -f -- "$pp"; ok=1
+        else
+          for mp in "$myinbox"/*.md; do
+            [ -f "$mp" ] || continue
+            h=$(read_head "$mp")
+            if [ "$(printf '%s' "$h" | cut -f1)" = PONG ] && [ "$(printf '%s' "$h" | cut -f3)" = "$nonce" ]; then
+              rm -f -- "$mp"; ok=1; break
+            fi
+          done
+        fi
+        kind=PONG
+      else
+        [ -f "$sent" ] || ok=1
+        kind=CONSUMED
+      fi
+      if [ "$ok" -eq 1 ]; then
+        secs=$(awk -v a="$start" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1fs", b - a }')
+        say "$kind $dest $secs"
+        log_event ping result ok from "$me" to "$dest" kind "$(printf '%s' "$kind" | tr A-Z a-z)" seconds "$secs"
+        done_list="$done_list $dest"
+      else
+        left=$((left + 1))
+      fi
+    done < "$probes"
+    [ "$left" -gt 0 ] || break
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    sleep 0.2
+  done
+  while IFS='	' read -r dest nonce sent two; do
+    case " $done_list " in *" $dest "*) continue ;; esac
+    failed=1
+    if [ "$two" = 1 ]; then want="no PONG"; else want="PING not consumed"; fi
+    say "TIMEOUT $dest ($want after ${ping_timeout}s)"
+    log_event ping result timeout from "$me" to "$dest" nonce "$nonce"
+  done < "$probes"
+  rm -f "$probes"
+  [ "$failed" -eq 0 ] || exit 1
+}
+
+cmd_status() {
+  [ "$dry" -eq 0 ] && [ "$what" -eq 0 ] && [ $# -eq 1 ] || die "usage: $invoked FILE"
+  PLAN=$1
+  [ -f "$PLAN" ] || die "no plan file $PLAN"
+  parse_plan "$PLAN"
+  now=$(date +%s)
+  awk -F '\t' '$1=="N" { print $2 "\t" $3 }' "$PARSE" | while IFS='	' read -r name inbox; do
+    if [ ! -e "$inbox" ]; then say "node $name $inbox missing"; continue; fi
+    if ! ls -- "$inbox" >/dev/null 2>&1; then say "node $name $inbox no permission"; continue; fi
+    count=0
+    oldest=
+    for mp in "$inbox"/*; do
+      [ -f "$mp" ] || continue
+      printf '%s\n' "$(basename "$mp")" | grep -Eq '^[0-9]{8}-[0-9]{6}\.[0-9]{3}__.+__[0-9]+\.md$' || continue
+      count=$((count + 1))
+      [ -n "$oldest" ] || oldest=$mp
+    done
+    line="node $name $inbox messages $count"
+    [ -z "$oldest" ] || line="$line oldest $((now - $(stat -c %Y "$oldest")))s"
+    cl=$inbox/claimed
+    ccount=0
+    clist=
+    if [ -d "$cl" ] && ! ls -- "$cl" >/dev/null 2>&1; then
+      line="$line claimed no-permission"
+    elif [ -d "$cl" ]; then
+      for cp in "$cl"/*; do
+        [ -f "$cp" ] || continue
+        case "$cp" in *.owner) continue ;; esac
+        ccount=$((ccount + 1))
+        item="$(basename "$cp") $((now - $(stat -c %Y "$cp")))s"
+        [ ! -f "$cp.owner" ] || item="$item owner=$(head -n 1 "$cp.owner")"
+        clist="$clist
+  claimed $item"
+      done
+    fi
+    say "$line claimed $ccount"
+    [ -z "$clist" ] || printf '%s\n' "${clist#?}"
+  done
+}
+
 case "$mode" in
+  ping) cmd_ping "$@" ;;
+  status) cmd_status "$@" ;;
   setup) cmd_setup "$@" ;;
   arm) cmd_arm "$@" ;;
   send) cmd_send "$@" ;;

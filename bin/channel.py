@@ -208,8 +208,8 @@ def extract_messages(text):
 
 
 HOOKS = {}
-OPTS = {"msgs": [], "force": False,
-        "every": int(os.environ.get("CHANNEL_PING_EVERY", "30") or 30),
+OPTS = {"msgs": [], "all": False, "run": "",
+        "every": int(os.environ.get("CHANNEL_CHECKALL_EVERY", "30") or 30),
         "timeout": int(os.environ.get("CHANNEL_PING_TIMEOUT", "300") or 300)}
 ARM = {"me": None, "plan": None}
 
@@ -250,7 +250,7 @@ def parse_key(text, line_base=0):
         parts = line.split()
         if parts[0] == "node" and len(parts) >= 3:
             name, inbox = parts[1], parts[2]
-            hook = {"url": "", "key_file": "", "key": "", "retries": 3, "backoff_max": 30}
+            hook = {"url": "", "key_file": "", "key": "", "retries": 12, "backoff_max": 1800}
             for kv in parts[3:]:
                 key, eq, val = kv.partition("=")
                 if not eq or not key:
@@ -265,10 +265,15 @@ def parse_key(text, line_base=0):
                     hook["key_file"] = val
                 elif key == "webhook_key":
                     hook["key"] = val
-                elif key in ("webhook_retries", "webhook_backoff_max"):
+                elif key == "webhook_retries":
                     if not val.isdigit():
                         die(f"line {lineno}: {key} must be a whole number >= 0")
-                    hook["retries" if key == "webhook_retries" else "backoff_max"] = int(val)
+                    hook["retries"] = int(val)
+                elif key == "webhook_backoff_max":
+                    m = re.fullmatch(r"(\d+)([smh]?)", val)
+                    if not m:
+                        die(f"line {lineno}: webhook_backoff_max must be a number with an optional unit s, m, or h (e.g. 30m)")
+                    hook["backoff_max"] = int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
                 else:
                     die(f"line {lineno}: unknown node option {key} (allowed: webhook, webhook_key_file, webhook_key, webhook_retries, webhook_backoff_max)")
             if hook["key_file"] and hook["key"]:
@@ -431,7 +436,7 @@ def split_args(argv):
     before, among, or after the file and node. A lone -- ends the options.
     """
     try:
-        found, rest = getopt.gnu_getopt(argv, "nm:", ["dry-run", "whatineedtoknow", "force", "every=", "timeout="])
+        found, rest = getopt.gnu_getopt(argv, "nm:", ["dry-run", "whatineedtoknow", "all", "run=", "every=", "timeout="])
     except getopt.GetoptError as exc:
         die(str(exc))
     dry_run = False
@@ -443,8 +448,12 @@ def split_args(argv):
             what = True
         elif opt == "-m":
             OPTS["msgs"].append(_value)
-        elif opt == "--force":
-            OPTS["force"] = True
+        elif opt == "--all":
+            OPTS["all"] = True
+        elif opt == "--run":
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", _value):
+                die("--run must be letters, digits, dot, underscore, or hyphen")
+            OPTS["run"], OPTS["all"] = _value, True
         elif opt in ("--every", "--timeout"):
             if not _value.isdigit():
                 die(f"{opt} needs a whole number")
@@ -466,7 +475,8 @@ ACT_LINES = [
     'inbox: {INBOX}',
     'watch: {BIN}/channel-arm {PLAN} {NODE}',
     '  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.',
-    '  The watch answers PING for you (it sends PONG and removes the PING) and never shows it. With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING.',
+    '  The watch answers PING for you (it sends PONG and removes the PING) and never shows it; for a check-all PING (body has SCOPE: all) it also starts the check on your own arrows.',
+    '  With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run {BIN}/channel-ping --run <id> {PLAN} {NODE} (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).',
     'start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.',
     'read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.',
     '  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.',
@@ -479,7 +489,7 @@ ACT_LINES = [
     '  REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.',
     '  On a -> arrow the send waits until DEST removes your previous message; on -< it queues. PING and PONG never wait.',
     'done: rm the FILE when you have finished it (from claimed/ only after your reply is sent). Removing it is the acknowledgement.',
-    'tools: {BIN}/channel-ping {PLAN} {NODE} tests each of your arrows (skipped if run in the last 30 minutes; --force, --every MIN).',
+    'tools: {BIN}/channel-ping {PLAN} {NODE} tests each of your arrows now; with --all every node it reaches passes the check on, so all links get tested.',
     "  {BIN}/channel-status {PLAN} shows each inbox's message count, oldest age, and claimed files.",
     'after a start or a compact, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again, then check claimed/ (see start).',
     '',
@@ -847,32 +857,56 @@ def fire_webhook(plan_file, target, sender, verb, inbox, file):
             key = key[len(prefix):]
             break
     payload = json.dumps({"target": target, "from": sender, "verb": verb, "inbox": str(inbox), "file": str(file)}, separators=(",", ":")).encode()
-    delay = 1
-    attempt = 0
-    while True:
-        attempt += 1
-        req = urllib.request.Request(hook["url"], data=payload, method="POST", headers={"Content-Type": "application/json"})
-        if key:
-            req.add_header("Authorization", "Bearer " + key)
-        why, retry = "", False
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                text = resp.read(300).decode(errors="replace").replace("\n", " ")
-                say(f"WEBHOOK {target} {resp.status} {text}")
+    code, text, retry = post_once(hook["url"], key, payload)
+    if code and 200 <= code < 300:
+        say(f"WEBHOOK {target} {code} {text}")
+        log_event("webhook", result="ok", to=target, **{"from": sender}, verb=verb, attempts=1, file=file)
+        return
+    why = f"{code}) {text}" if code else f"{text})"
+    shown = f"{code} {text}" if code else text
+    if not retry or hook["retries"] == 0:
+        log_event("webhook", result="fail", to=target, **{"from": sender}, verb=verb, attempts=1, error=shown, file=file)
+        note(f"WARNING: webhook for {target} failed ({why} (message is queued)")
+        return
+    log_event("webhook", result="retrying", to=target, **{"from": sender}, verb=verb, attempts=1, error=shown, file=file)
+    note(f"WARNING: webhook for {target} failed ({why}; retrying in the background (up to {hook['retries']} more tries, backoff up to {hook['backoff_max']}s; outcome in syslog) (message is queued)")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.fork() != 0:
+        return
+    # Detached child: own session, no stdio; retries, logs the outcome, exits.
+    try:
+        os.setsid()
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        delay = 1
+        for attempt in range(2, hook["retries"] + 2):
+            time.sleep(min(delay, hook["backoff_max"]))
+            delay *= 2
+            code, text, retry = post_once(hook["url"], key, payload)
+            if code and 200 <= code < 300:
                 log_event("webhook", result="ok", to=target, **{"from": sender}, verb=verb, attempts=attempt, file=file)
-                return
-        except urllib.error.HTTPError as exc:
-            why, retry = f"{exc.code} {exc.read(300).decode(errors='replace')}", exc.code >= 500 or exc.code == 429
-        except (urllib.error.URLError, OSError) as exc:
-            why, retry = str(exc), True
-        if not retry or attempt > hook["retries"]:
-            log_event("webhook", result="fail", to=target, **{"from": sender}, verb=verb, attempts=attempt, error=why, file=file)
-            note(f"WARNING: webhook for {target} failed ({why}) (message is queued)")
-            return
-        wait = min(delay, hook["backoff_max"])
-        note(f"webhook for {target}: attempt {attempt} failed ({why}); retrying in {wait}s")
-        time.sleep(wait)
-        delay *= 2
+                break
+            if not retry or attempt == hook["retries"] + 1:
+                log_event("webhook", result="fail", to=target, **{"from": sender}, verb=verb, attempts=attempt, error=f"{code or ''} {text}".strip(), file=file)
+                break
+    finally:
+        os._exit(0)
+
+
+def post_once(url, key, payload):
+    """One POST. Returns (status or 0, text, retry)."""
+    req = urllib.request.Request(url, data=payload, method="POST", headers={"Content-Type": "application/json"})
+    if key:
+        req.add_header("Authorization", "Bearer " + key)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, resp.read(300).decode(errors="replace").replace("\n", " "), False
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(300).decode(errors="replace").replace("\n", " "), exc.code >= 500 or exc.code == 429
+    except (urllib.error.URLError, OSError) as exc:
+        return 0, str(exc), True
 
 
 def read_head(path):
@@ -913,8 +947,13 @@ def handle_control(inbox):
                 import contextlib, io
                 with contextlib.redirect_stdout(io.StringIO()):
                     send_message(loaded, me, sender, "PONG", f"NONCE: {nonce}\n", [])
+            scope, run = body_field(entry, "SCOPE"), body_field(entry, "RUN")
             entry.unlink(missing_ok=True)
-            log_event("ping-answered", node=me, **{"from": sender}, nonce=nonce)
+            log_event("ping-answered", node=me, **{"from": sender}, nonce=nonce, scope=scope, run=run)
+            if scope == "all" and re.fullmatch(r"[A-Za-z0-9_.-]+", run):
+                subprocess.Popen([sys.executable, os.path.abspath(__file__), "ping", "--run", run, str(loaded[0]), me],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
         elif verb == "PONG":
             try:
                 os.replace(entry, pong_path(loaded[1], me, nonce))
@@ -923,25 +962,64 @@ def handle_control(inbox):
             log_event("pong-received", node=me, **{"from": sender}, nonce=nonce)
 
 
+def check_all_allowed(node, me, run, origin):
+    """Record RUN; refuse if it was handled here, or (propagated) if a check-all ran within OPTS['every'] minutes."""
+    seen = node / "checkall-runs"
+    if seen.is_file() and any(line.split()[:1] == [run] for line in seen.read_text().splitlines()):
+        say(f"SKIP {me} already handled check-all run {run}")
+        log_event("checkall", result="skip", node=me, run=run, why="run already handled")
+        return False
+    stamp = node / "checkall.stamp"
+    if stamp.is_file() and not origin:
+        age = time.time() - stamp.stat().st_mtime
+        if age < OPTS["every"] * 60:
+            say(f"SKIP {me} ran a check-all {int(age)}s ago (limit every {OPTS['every']} min)")
+            log_event("checkall", result="skip", node=me, run=run, why="rate limit")
+            return False
+    with open(seen, "a") as handle:
+        handle.write(f"{run} {int(time.time())}\n")
+    stamp.write_text(datetime.now().astimezone().isoformat(timespec="seconds") + "\n")
+    return True
+
+
+def body_field(path, key):
+    try:
+        text = Path(path).read_text()
+    except OSError:
+        return ""
+    _head, sep, body = text.partition("\n---\n")
+    if not sep:
+        return ""
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith(key + ":"):
+            return line[len(key) + 1:].strip()
+    return ""
+
+
 def cmd_ping(plan_path, me):
     loaded = load_plan(plan_path)
     plan_file, nodes, _verbs, _messages, edges = loaded
     require_me(me, nodes, plan_file)
     require_dir(nodes[me], f"run channel-setup {plan_file} {me}")
-    stamp = node_dir(nodes[me]) / "ping.stamp"
-    if stamp.is_file() and not OPTS["force"]:
-        age = time.time() - stamp.stat().st_mtime
-        if age < OPTS["every"] * 60:
-            say(f"SKIP {me} pinged {int(age)}s ago (limit every {OPTS['every']} min; --force to override)")
+    extra = ""
+    run = OPTS["run"]
+    if OPTS["all"]:
+        origin = not run
+        if origin:
+            run = f"{me}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+        if not check_all_allowed(node_dir(nodes[me]), me, run, origin):
             return
-    stamp.write_text(datetime.now().astimezone().isoformat(timespec="seconds") + "\n")
+        extra = f"SCOPE: all\nRUN: {run}\n"
+        say(f"CHECKALL {me} run {run}")
+        log_event("checkall", result="start", node=me, run=run)
     start = time.time()
     probes = []
     for src, dst, _mode, _label in edges:
         if src != me:
             continue
         nonce = f"{me}-{dst}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
-        sent = send_message(loaded, me, dst, "PING", f"NONCE: {nonce}\n", [])
+        sent = send_message(loaded, me, dst, "PING", f"NONCE: {nonce}\n{extra}", [])
         probes.append({"dest": dst, "nonce": nonce, "file": sent, "two": edge_between(edges, dst, me) is not None, "done": False})
     deadline = start + OPTS["timeout"]
     while any(not pr["done"] for pr in probes) and time.time() < deadline:
@@ -968,7 +1046,7 @@ def cmd_ping(plan_path, me):
                 kind = "PONG" if pr["two"] else "CONSUMED"
                 secs = f"{time.time() - start:.1f}s"
                 say(f"{kind} {pr['dest']} {secs}")
-                log_event("ping", result="ok", **{"from": me}, to=pr["dest"], kind=kind.lower(), seconds=secs)
+                log_event("ping", result="ok", **{"from": me}, to=pr["dest"], kind=kind.lower(), seconds=secs, run=run)
         time.sleep(POLL_SECONDS)
     failed = False
     for pr in probes:
@@ -977,7 +1055,7 @@ def cmd_ping(plan_path, me):
         failed = True
         want = "no PONG" if pr["two"] else "PING not consumed"
         say(f"TIMEOUT {pr['dest']} ({want} after {OPTS['timeout']}s)")
-        log_event("ping", result="timeout", **{"from": me}, to=pr["dest"], nonce=pr["nonce"])
+        log_event("ping", result="timeout", **{"from": me}, to=pr["dest"], nonce=pr["nonce"], run=run)
     if failed:
         sys.exit(1)
 
@@ -1064,7 +1142,7 @@ def main(argv):
         cmd_send(args[0], args[1], args[2], args[3], body_text, refs)
     elif command == "ping":
         if dry_run or what or len(args) != 2:
-            die("usage: channel-ping FILE NODE [--force] [--every MIN] [--timeout SEC]")
+            die("usage: channel-ping FILE NODE [--all [--every MIN]] [--timeout SEC]")
         cmd_ping(args[0], args[1])
     elif command == "status":
         if dry_run or what or len(args) != 1:

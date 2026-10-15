@@ -8,6 +8,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -81,7 +82,7 @@ With no mode, this prints help and exits.
   channel --setup FILE NODE [-n|--dry-run] [--whatineedtoknow]
   channel --arm   FILE NODE [--whatineedtoknow]
   channel --send  FILE NODE DEST VERB [BODYFILE|-|-m TEXT ...] [REF ...] [--whatineedtoknow]
-  channel --ping  FILE NODE [--force] [--every MIN] [--timeout SEC]
+  channel --ping  FILE NODE [--all [--every MIN]] [--timeout SEC]
   channel --status FILE
 
 channel-setup, channel-arm, and channel-send are names for this same program.
@@ -102,13 +103,17 @@ Give only the key: the tool sends Authorization: Bearer KEY. A leading
 After channel-send queues a message to NAME, it POSTs JSON
   {"target","from","verb","inbox","file"}
 to URL with Content-Type: application/json.
-Optional webhook_retries=N (default 3) and webhook_backoff_max=SEC (default 30):
-network errors, 5xx and 429 are retried with exponential backoff.
+Optional webhook_retries=N (default 12) and webhook_backoff_max=T (default 30m;
+T is N, Ns, Nm or Nh): network errors, 5xx and 429 are retried with exponential
+backoff (1s, 2s, 4s, ... capped at T) in a detached background process, so the
+send returns after the first try; the final outcome goes to syslog.
 Success prints "WEBHOOK NAME CODE RESPONSE". Any failure prints a WARNING on
 stderr; the message stays queued and the exit status is still 0.
 
 PING and PONG (body NONCE: <value>) are built in on every arrow; channel-arm
-answers PING itself. Events go to syslog, tag agent-channel, as key=value
+answers PING itself. channel-ping always sends; with --all it starts a
+check-all: every node reached also checks its own arrows (once per run id,
+and at most once per --every minutes, default 30, env CHANNEL_CHECKALL_EVERY). Events go to syslog, tag agent-channel, as key=value
 (CHANNEL_SYSLOG=0 disables; CHANNEL_LOG_FILE=PATH also appends to a file).
 `)
 }
@@ -117,7 +122,7 @@ func main() {
 	nameMode := modeFromName(os.Args[0])
 	opts, rest, err := gnuGetopt(os.Args[1:], "hnm:", []string{
 		"help", "dry-run", "whatineedtoknow", "setup", "arm", "send", "ping", "status",
-		"force", "every=", "timeout=",
+		"all", "run=", "every=", "timeout=", "webhook-retry",
 	})
 	if err != nil {
 		die(err.Error())
@@ -130,15 +135,25 @@ func main() {
 		case strings.HasPrefix(opt, "-m="):
 			msgs = append(msgs, opt[3:])
 			continue
-		case opt == "--force":
-			pingForce = true
+		case opt == "--all":
+			pingAll = true
 			continue
+		case strings.HasPrefix(opt, "--run="):
+			pingRun = opt[6:]
+			if !safeRun.MatchString(pingRun) {
+				die("--run must be letters, digits, dot, underscore, or hyphen")
+			}
+			pingAll = true
+			continue
+		case opt == "--webhook-retry":
+			runWebhookJob()
+			return
 		case strings.HasPrefix(opt, "--every="):
 			v, err := strconv.Atoi(opt[8:])
 			if err != nil || v < 0 {
 				die("--every needs whole minutes")
 			}
-			pingEvery = v
+			checkEvery = v
 			continue
 		case strings.HasPrefix(opt, "--timeout="):
 			v, err := strconv.Atoi(opt[10:])
@@ -191,7 +206,7 @@ func main() {
 	switch mode {
 	case "ping":
 		if dry || what || len(rest) != 2 {
-			die("usage: " + invoked + " FILE NODE [--force] [--every MIN] [--timeout SEC]")
+			die("usage: " + invoked + " FILE NODE [--all [--every MIN]] [--timeout SEC]")
 		}
 		cmdPing(rest[0], rest[1])
 		return
@@ -678,7 +693,7 @@ func parseKey(text string, lineBase int) plan {
 		parts := strings.Fields(line)
 		if parts[0] == "node" && len(parts) >= 3 {
 			name, inbox := parts[1], parts[2]
-			h := hook{retries: 3, backoffMax: 30}
+			h := hook{retries: 12, backoffMax: 1800}
 			for _, kv := range parts[3:] {
 				eq := strings.Index(kv, "=")
 				if eq < 1 {
@@ -698,16 +713,18 @@ func parseKey(text string, lineBase int) plan {
 					h.keyFile = val
 				case "webhook_key":
 					h.key = val
-				case "webhook_retries", "webhook_backoff_max":
+				case "webhook_retries":
 					v, err := strconv.Atoi(val)
 					if err != nil || v < 0 {
 						die(fmt.Sprintf("line %d: %s must be a whole number >= 0", n, key))
 					}
-					if key == "webhook_retries" {
-						h.retries = v
-					} else {
-						h.backoffMax = v
+					h.retries = v
+				case "webhook_backoff_max":
+					v, ok := parseSeconds(val)
+					if !ok {
+						die(fmt.Sprintf("line %d: webhook_backoff_max must be a number with an optional unit s, m, or h (e.g. 30m)", n))
 					}
+					h.backoffMax = v
 				default:
 					die(fmt.Sprintf("line %d: unknown node option %s (allowed: webhook, webhook_key_file, webhook_key, webhook_retries, webhook_backoff_max)", n, key))
 				}
@@ -816,7 +833,8 @@ func emitAct(me string, p plan) {
 		"inbox: {INBOX}",
 		"watch: {BIN}/channel-arm {PLAN} {NODE}",
 		"  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.",
-		"  The watch answers PING for you (it sends PONG and removes the PING) and never shows it. With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING.",
+		"  The watch answers PING for you (it sends PONG and removes the PING) and never shows it; for a check-all PING (body has SCOPE: all) it also starts the check on your own arrows.",
+		"  With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run {BIN}/channel-ping --run <id> {PLAN} {NODE} (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).",
 		"start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.",
 		"read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.",
 		"  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.",
@@ -829,7 +847,7 @@ func emitAct(me string, p plan) {
 		"  REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.",
 		"  On a -> arrow the send waits until DEST removes your previous message; on -< it queues. PING and PONG never wait.",
 		"done: rm the FILE when you have finished it (from claimed/ only after your reply is sent). Removing it is the acknowledgement.",
-		"tools: {BIN}/channel-ping {PLAN} {NODE} tests each of your arrows (skipped if run in the last 30 minutes; --force, --every MIN).",
+		"tools: {BIN}/channel-ping {PLAN} {NODE} tests each of your arrows now; with --all every node it reaches passes the check on, so all links get tested.",
 		"  {BIN}/channel-status {PLAN} shows each inbox's message count, oldest age, and claimed files.",
 		"after a start or a compact, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again, then check claimed/ (see start).",
 		"",
@@ -1304,31 +1322,96 @@ func fireWebhook(p plan, target, from, verb, inbox, file string) {
 		Inbox  string `json:"inbox"`
 		File   string `json:"file"`
 	}{target, from, verb, inbox, file})
+	why, retry := postOnce(h.url, key, body, target)
+	if why == "" {
+		logEvent("webhook", "result", "ok", "to", target, "from", from, "verb", verb, "attempts", "1", "file", file)
+		return
+	}
+	shown := strings.Replace(why, "\x00", " ", 1)
+	msg := "failed (" + why + ")"
+	if code, text, ok := strings.Cut(why, "\x00"); ok {
+		msg = "failed (" + code + ") " + text
+	}
+	if !retry || h.retries == 0 {
+		logEvent("webhook", "result", "fail", "to", target, "from", from, "verb", verb, "attempts", "1", "error", shown, "file", file)
+		warn(msg)
+		return
+	}
+	job := webhookJob{URL: h.url, Key: key, Body: base64.StdEncoding.EncodeToString(body), Target: target, From: from, Verb: verb, File: file, Retries: h.retries, BackoffMax: h.backoffMax}
+	if err := spawnWebhookJob(job); err != nil {
+		logEvent("webhook", "result", "fail", "to", target, "from", from, "verb", verb, "attempts", "1", "error", shown+"; background retry not started: "+err.Error(), "file", file)
+		warn(msg + "; background retry not started")
+		return
+	}
+	logEvent("webhook", "result", "retrying", "to", target, "from", from, "verb", verb, "attempts", "1", "error", shown, "file", file)
+	note(fmt.Sprintf("WARNING: webhook for %s %s; retrying in the background (up to %d more tries, backoff up to %ds; outcome in syslog) (message is queued)", target, msg, h.retries, h.backoffMax))
+}
+
+type webhookJob struct {
+	URL, Key, Body, Target, From, Verb, File string
+	Retries, BackoffMax                      int
+}
+
+// spawnWebhookJob re-runs this binary detached (own session, no stdio) to retry the POST.
+// The job, including the key, travels in the environment, never on a command line.
+func spawnWebhookJob(job webhookJob) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	data, _ := json.Marshal(job)
+	cmd := exec.Command(exe, "--webhook-retry")
+	cmd.Env = append(os.Environ(), "CHANNEL_WEBHOOK_JOB="+string(data))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
+}
+
+func runWebhookJob() {
+	var job webhookJob
+	if err := json.Unmarshal([]byte(os.Getenv("CHANNEL_WEBHOOK_JOB")), &job); err != nil {
+		os.Exit(2)
+	}
+	body, _ := base64.StdEncoding.DecodeString(job.Body)
+	quiet = true
 	delay := 1
-	for attempt := 0; ; attempt++ {
-		why, retry := postOnce(h.url, key, body, target)
-		shown := strings.Replace(why, "\x00", " ", 1)
-		if why == "" {
-			logEvent("webhook", "result", "ok", "to", target, "from", from, "verb", verb, "attempts", strconv.Itoa(attempt+1), "file", file)
-			return
-		}
-		if !retry || attempt >= h.retries {
-			logEvent("webhook", "result", "fail", "to", target, "from", from, "verb", verb, "attempts", strconv.Itoa(attempt+1), "error", shown, "file", file)
-			if code, text, ok := strings.Cut(why, "\x00"); ok {
-				warn("failed (" + code + ") " + text)
-			} else {
-				warn("failed (" + why + ")")
-			}
-			return
-		}
+	for attempt := 2; attempt <= job.Retries+1; attempt++ {
 		wait := delay
-		if wait > h.backoffMax {
-			wait = h.backoffMax
+		if wait > job.BackoffMax {
+			wait = job.BackoffMax
 		}
-		note(fmt.Sprintf("webhook for %s: attempt %d failed (%s); retrying in %ds", target, attempt+1, shown, wait))
 		time.Sleep(time.Duration(wait) * time.Second)
 		delay *= 2
+		why, retry := postOnce(job.URL, job.Key, body, job.Target)
+		if why == "" {
+			logEvent("webhook", "result", "ok", "to", job.Target, "from", job.From, "verb", job.Verb, "attempts", strconv.Itoa(attempt), "file", job.File)
+			return
+		}
+		if !retry || attempt == job.Retries+1 {
+			logEvent("webhook", "result", "fail", "to", job.Target, "from", job.From, "verb", job.Verb, "attempts", strconv.Itoa(attempt), "error", strings.Replace(why, "\x00", " ", 1), "file", job.File)
+			return
+		}
 	}
+}
+
+// parseSeconds reads N, Ns, Nm, or Nh.
+func parseSeconds(val string) (int, bool) {
+	mult := 1
+	switch {
+	case strings.HasSuffix(val, "s"):
+		val = strings.TrimSuffix(val, "s")
+	case strings.HasSuffix(val, "m"):
+		val, mult = strings.TrimSuffix(val, "m"), 60
+	case strings.HasSuffix(val, "h"):
+		val, mult = strings.TrimSuffix(val, "h"), 3600
+	}
+	v, err := strconv.Atoi(val)
+	if err != nil || v < 0 {
+		return 0, false
+	}
+	return v * mult, true
 }
 
 // postOnce returns "" on success, else the reason and whether a retry may help.
@@ -1422,8 +1505,10 @@ var (
 	armPlan     plan
 	armMe       string
 	armActive   bool
-	pingForce   bool
-	pingEvery   = envInt("CHANNEL_PING_EVERY", 30)
+	pingAll     bool
+	pingRun     string
+	checkEvery  = envInt("CHANNEL_CHECKALL_EVERY", 30)
+	safeRun     = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 	pingTimeout = envInt("CHANNEL_PING_TIMEOUT", 300)
 )
 
@@ -1516,8 +1601,12 @@ func handleControl(inbox string, files []string) []string {
 				sendMessage(armPlan, armMe, from, "PONG", []byte("NONCE: "+nonce+"\n"), nil)
 				quiet = false
 			}
+			scope, run := bodyField(full, "SCOPE"), bodyField(full, "RUN")
 			_ = os.Remove(full)
-			logEvent("ping-answered", "node", armMe, "from", from, "nonce", nonce)
+			logEvent("ping-answered", "node", armMe, "from", from, "nonce", nonce, "scope", scope, "run", run)
+			if scope == "all" && safeRun.MatchString(run) {
+				spawnCheckAll(armPlan.path, armMe, run)
+			}
 		case "PONG":
 			_ = os.Rename(full, pongPath(armPlan, armMe, nonce))
 			logEvent("pong-received", "node", armMe, "from", from, "nonce", nonce)
@@ -1542,16 +1631,20 @@ func cmdPing(path, me string) {
 	requireMe(me, p)
 	node := filepath.Dir(p.nodes[me])
 	requireDir(p.nodes[me], "run channel-setup "+path+" "+me)
-	stamp := filepath.Join(node, "ping.stamp")
-	if info, err := os.Stat(stamp); err == nil && !pingForce {
-		age := time.Since(info.ModTime())
-		if age < time.Duration(pingEvery)*time.Minute {
-			say(fmt.Sprintf("SKIP %s pinged %ds ago (limit every %d min; --force to override)", me, int(age.Seconds()), pingEvery))
+	extra := ""
+	run := pingRun
+	if pingAll {
+		origin := run == ""
+		if origin {
+			run = fmt.Sprintf("%s-%s-%d", me, time.Now().Format("20060102-150405"), os.Getpid())
+		}
+		if !checkAllAllowed(node, me, run, origin) {
 			return
 		}
+		extra = "SCOPE: all\nRUN: " + run + "\n"
+		say("CHECKALL " + me + " run " + run)
+		logEvent("checkall", "result", "start", "node", me, "run", run)
 	}
-	_ = os.WriteFile(stamp, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o660)
-	_ = os.Chtimes(stamp, time.Now(), time.Now())
 	type probe struct {
 		dest, nonce, file string
 		twoWay, done      bool
@@ -1564,7 +1657,7 @@ func cmdPing(path, me string) {
 		}
 		nonce := fmt.Sprintf("%s-%s-%s-%d", me, e.dst, start.Format("20060102-150405"), os.Getpid())
 		pr := &probe{dest: e.dst, nonce: nonce, twoWay: hasEdge(p, e.dst, me)}
-		pr.file = sendMessage(p, me, e.dst, "PING", []byte("NONCE: "+nonce+"\n"), nil)
+		pr.file = sendMessage(p, me, e.dst, "PING", []byte("NONCE: "+nonce+"\n"+extra), nil)
 		probes = append(probes, pr)
 	}
 	deadline := start.Add(time.Duration(pingTimeout) * time.Second)
@@ -1602,7 +1695,7 @@ func cmdPing(path, me string) {
 				}
 				secs := fmt.Sprintf("%.1fs", time.Since(start).Seconds())
 				say(kind + " " + pr.dest + " " + secs)
-				logEvent("ping", "result", "ok", "from", me, "to", pr.dest, "kind", strings.ToLower(kind), "seconds", secs)
+				logEvent("ping", "result", "ok", "from", me, "to", pr.dest, "kind", strings.ToLower(kind), "seconds", secs, "run", run)
 			}
 		}
 		time.Sleep(poll)
@@ -1618,7 +1711,7 @@ func cmdPing(path, me string) {
 			want = "PING not consumed"
 		}
 		say("TIMEOUT " + pr.dest + " (" + want + " after " + strconv.Itoa(pingTimeout) + "s)")
-		logEvent("ping", "result", "timeout", "from", me, "to", pr.dest, "nonce", pr.nonce)
+		logEvent("ping", "result", "timeout", "from", me, "to", pr.dest, "nonce", pr.nonce, "run", run)
 	}
 	if failed {
 		os.Exit(1)
@@ -1672,4 +1765,68 @@ func cmdStatus(path string) {
 			say("  claimed " + c)
 		}
 	}
+}
+
+// bodyField returns the value of the first "KEY: value" line after the --- separator.
+func bodyField(path, key string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	_, body, ok := strings.Cut(string(data), "\n---\n")
+	if !ok {
+		return ""
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, key+":") {
+			return strings.TrimSpace(line[len(key)+1:])
+		}
+	}
+	return ""
+}
+
+// spawnCheckAll runs "channel --ping --run RUN PLAN NODE" detached; that run decides
+// (rate limit, run already seen) whether this node propagates.
+func spawnCheckAll(plan, me, run string) {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(exe, "--ping", "--run", run, plan, me)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if cmd.Start() == nil {
+		_ = cmd.Process.Release()
+	}
+}
+
+// checkAllAllowed records RUN for this node and says whether it may propagate:
+// not if it already handled RUN, and not if it ran a check-all within checkEvery minutes.
+func checkAllAllowed(node, me, run string, origin bool) bool {
+	seenPath := filepath.Join(node, "checkall-runs")
+	if data, err := os.ReadFile(seenPath); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if f := strings.Fields(line); len(f) > 0 && f[0] == run {
+				say("SKIP " + me + " already handled check-all run " + run)
+				logEvent("checkall", "result", "skip", "node", me, "run", run, "why", "run already handled")
+				return false
+			}
+		}
+	}
+	stamp := filepath.Join(node, "checkall.stamp")
+	if info, err := os.Stat(stamp); err == nil && !origin {
+		age := time.Since(info.ModTime())
+		if age < time.Duration(checkEvery)*time.Minute {
+			say(fmt.Sprintf("SKIP %s ran a check-all %ds ago (limit every %d min)", me, int(age.Seconds()), checkEvery))
+			logEvent("checkall", "result", "skip", "node", me, "run", run, "why", "rate limit")
+			return false
+		}
+	}
+	if fh, err := os.OpenFile(seenPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o660); err == nil {
+		fmt.Fprintf(fh, "%s %d\n", run, time.Now().Unix())
+		fh.Close()
+	}
+	_ = os.WriteFile(stamp, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o660)
+	_ = os.Chtimes(stamp, time.Now(), time.Now())
+	return true
 }

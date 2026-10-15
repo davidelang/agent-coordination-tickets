@@ -19,6 +19,7 @@ pass=0
 fail=0
 
 cleanup() {
+  pkill -9 -f "$TMP/" 2>/dev/null || true
   if [ -f "$PIDS" ]; then
     while read -r p; do
       kill "$p" 2>/dev/null || true
@@ -665,7 +666,9 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(s):
         b=s.rfile.read(int(s.headers["Content-Length"]))
         open(sys.argv[1],"a").write(s.path+" "+str(s.headers.get("Authorization"))+" "+str(s.headers.get("Content-Type"))+" "+b.decode()+"\n")
-        s.send_response(500 if "fail" in s.path else 200); s.end_headers(); s.wfile.write(b"{\"success\":true}")
+        n=sum(1 for l in open(sys.argv[1]) if l.split(" ",1)[0]==s.path)
+        code=500 if "fail" in s.path else (503 if "flaky" in s.path and n<2 else 200)
+        s.send_response(code); s.end_headers(); s.wfile.write(b"{\"success\":true}")
     def log_message(s,*a): pass
 h=http.server.HTTPServer(("127.0.0.1",0),H); open(sys.argv[2],"w").write(str(h.server_port)); h.serve_forever()' "$WH/got" "$WH/port" &
 echo $! >> "$PIDS"
@@ -686,6 +689,7 @@ blockdiag {
   a -< i;
   a -< f;
   a -< x;
+  a -< g;
 }
 /*
 node a $N/a/inbox
@@ -693,7 +697,8 @@ node b $N/b/inbox
 node r $N/r/inbox webhook=http://127.0.0.1:$WP/$impl-r webhook_key_file=rel.key
 node s $N/s/inbox webhook=http://127.0.0.1:$WP/$impl-s webhook_key_file=$WH/abs.key
 node i $N/i/inbox webhook=http://127.0.0.1:$WP/$impl-i webhook_key=Bearer\ inl
-node f $N/f/inbox webhook=http://127.0.0.1:$WP/$impl-fail webhook_key=k
+node f $N/f/inbox webhook=http://127.0.0.1:$WP/$impl-fail webhook_key=k webhook_retries=0
+node g $N/g/inbox webhook=http://127.0.0.1:$WP/$impl-flaky webhook_retries=2 webhook_backoff_max=1s
 node x $N/x/inbox webhook=http://127.0.0.1:$WP/$impl-x webhook_key_file=missing.key
 verb a b GO
 verb a r GO
@@ -701,6 +706,7 @@ verb a s GO
 verb a i GO
 verb a f GO
 verb a x GO
+verb a g GO
 message GO {
 Go.
 body: {
@@ -710,14 +716,17 @@ ACTION: GO
 */
 DIAG
   sed -i 's/webhook_key=Bearer\\ inl/webhook_key=Bearer+inl/' "$D"
-  for n in a b r s i f x; do (cd "$WH" && "$P" --setup "plan/$impl.diag" $n >/dev/null 2>&1); done
-  for n in b r s i f x; do
+  for n in a b r s i f x g; do (cd "$WH" && "$P" --setup "plan/$impl.diag" $n >/dev/null 2>&1); done
+  for n in b r s i f x g; do
     (cd "$WH" && "$P" --send "plan/$impl.diag" a $n GO body >"$WH/$impl-$n.out" 2>"$WH/$impl-$n.err"); echo $? > "$WH/$impl-$n.rc"
   done
   for n in b r s i f x; do
     if [ "$(cat "$WH/$impl-$n.rc")" = 0 ] && [ "$(file_count '*.md' "$N/$n/inbox")" = 1 ]; then ok "$impl webhook $n send queued"; else bad "$impl webhook $n send queued"; fi
   done
   if ! grep -q WEBHOOK "$WH/$impl-b.out" && [ ! -s "$WH/$impl-b.err" ]; then ok "$impl no-webhook node silent"; else bad "$impl no-webhook node silent"; fi
+  if grep -q '^WARNING: webhook for g failed (503).*retrying in the background' "$WH/$impl-g.err"; then ok "$impl webhook retry goes to the background"; else bad "$impl webhook retry background: $(cat "$WH/$impl-g.err")"; fi
+  i=0; while [ "$(grep -c "^/$impl-flaky " "$WH/got")" -lt 2 ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  if [ "$(grep -c "^/$impl-flaky " "$WH/got")" = 2 ]; then ok "$impl background retry delivered"; else bad "$impl background retry delivered"; fi
   if grep -q "^/$impl-r Bearer relkey application/json {\"target\":\"r\",\"from\":\"a\",\"verb\":\"GO\",\"inbox\":\"$N/r/inbox\",\"file\":\"$N/r/inbox/" "$WH/got"; then ok "$impl relative key file from diag dir, header stripped"; else bad "$impl relative key file"; fi
   if grep -q "^/$impl-s Bearer abskey " "$WH/got"; then ok "$impl absolute key file"; else bad "$impl absolute key file"; fi
   if grep -q "^/$impl-i Bearer Bearer+inl " "$WH/got"; then ok "$impl inline key"; else bad "$impl inline key"; fi
@@ -781,23 +790,39 @@ for impl in go sh py; do
   sleep 3
   if kill -0 "$pw" 2>/dev/null; then kill "$pw" 2>/dev/null || true; bad "$impl PING never waits"; else ok "$impl PING never waits"; fi
   wait "$pw" 2>/dev/null || true
-  rm -f "$X"/nodes/*/inbox/*.md "$X"/nodes/*/ping.stamp
+  rm -f "$X"/nodes/*/inbox/*.md "$X"/nodes/*/checkall.stamp
   timeout 15 $ARM "$X/x.diag" b > "$X/$impl-armb" 2>&1 &
   pb=$!
   timeout 15 $ARM "$X/x.diag" c > "$X/$impl-armc" 2>&1 &
   pc=$!
+  timeout 15 $ARM "$X/x.diag" a > "$X/$impl-arma" 2>&1 &
+  pa=$!
   sleep 1
   rc=0; PG "$X/x.diag" a --timeout 10 > "$X/$impl-ping" 2>&1 || rc=$?
   if [ "$rc" = 0 ] && grep -q '^PONG b ' "$X/$impl-ping" && grep -q '^CONSUMED c ' "$X/$impl-ping"; then ok "$impl channel-ping two-way and one-way"; else bad "$impl channel-ping: $(cat "$X/$impl-ping")"; fi
   if [ "$(cat "$X/$impl-armb")" = READY ] && [ "$(cat "$X/$impl-armc")" = READY ]; then ok "$impl arm hides PING/PONG"; else bad "$impl arm hides PING/PONG: $(cat "$X/$impl-armb" "$X/$impl-armc")"; fi
-  PG "$X/x.diag" a > "$X/$impl-skip" 2>&1
-  if grep -q '^SKIP a pinged' "$X/$impl-skip"; then ok "$impl ping rate limit"; else bad "$impl ping rate limit"; fi
-  for pp in $pb $pc; do pkill -9 -P "$pp" 2>/dev/null || true; kill -9 "$pp" 2>/dev/null || true; done
+  rc=0; PG "$X/x.diag" a --timeout 10 > "$X/$impl-again" 2>&1 || rc=$?
+  if [ "$rc" = 0 ] && grep -q '^PONG b ' "$X/$impl-again"; then ok "$impl explicit ping is never rate-limited"; else bad "$impl explicit ping again: $(cat "$X/$impl-again")"; fi
+  rm -f "$X"/nodes/*/checkall-runs "$X"/nodes/*/checkall.stamp
+  : > "$X/log.txt"
+  rc=0; PG "$X/x.diag" a --all --timeout 10 > "$X/$impl-all" 2>&1 || rc=$?
+  if [ "$rc" = 0 ] && grep -q '^CHECKALL a run ' "$X/$impl-all" && grep -q '^PONG b ' "$X/$impl-all"; then ok "$impl check-all from origin"; else bad "$impl check-all: $(cat "$X/$impl-all")"; fi
+  i=0; while ! grep -q "event=checkall result=start node=b " "$X/log.txt" && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  if grep -q "event=checkall result=start node=b " "$X/log.txt"; then ok "$impl check-all propagates to b"; else bad "$impl check-all propagates to b"; fi
+  i=0; while ! grep -q "event=checkall result=skip node=a run=a-.* why=\"run already handled\"" "$X/log.txt" && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  if grep -q "event=checkall result=skip node=a run=a-.* why=\"run already handled\"" "$X/log.txt"; then ok "$impl check-all wave back to origin stops"; else bad "$impl check-all wave back to origin stops"; fi
+  i=0; while ! grep -q "event=ping result=ok from=b to=a kind=pong .*run=a-" "$X/log.txt" && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  if grep -q "event=ping result=ok from=b to=a kind=pong .*run=a-" "$X/log.txt"; then ok "$impl propagated node logs its own results"; else bad "$impl propagated node logs its own results"; fi
+  run2=$impl-second-run
+  rc=0; PG "$X/x.diag" b --run "$run2" > "$X/$impl-rl" 2>&1 || rc=$?
+  if grep -q '^SKIP b ran a check-all' "$X/$impl-rl"; then ok "$impl check-all rate limit stops re-propagation"; else bad "$impl check-all rate limit: $(cat "$X/$impl-rl")"; fi
+  for pp in $pb $pc $pa; do pkill -9 -P "$pp" 2>/dev/null || true; kill -9 "$pp" 2>/dev/null || true; done
   pkill -9 -f "arm $X/x.diag" 2>/dev/null || true
-  wait "$pb" "$pc" 2>/dev/null || true
+  wait "$pb" "$pc" "$pa" 2>/dev/null || true
+  pkill -9 -f "ping.*$X/x.diag" 2>/dev/null || true
   sleep 0.5
   rm -f "$X"/nodes/*/inbox/*.md
-  rc=0; PG "$X/x.diag" a --force --timeout 1 > "$X/$impl-to" 2>&1 || rc=$?
+  rc=0; PG "$X/x.diag" a --timeout 1 > "$X/$impl-to" 2>&1 || rc=$?
   if [ "$rc" = 1 ] && grep -q '^TIMEOUT b (no PONG' "$X/$impl-to" && grep -q '^TIMEOUT c (PING not consumed' "$X/$impl-to"; then ok "$impl ping timeout"; else bad "$impl ping timeout"; fi
   rm -f "$X"/nodes/*/inbox/*.md
   mkdir -p "$X/nodes/b/inbox/claimed"

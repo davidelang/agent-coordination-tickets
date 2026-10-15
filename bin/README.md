@@ -9,7 +9,7 @@ Each command takes the plan file and a bare node name. Options follow the `getop
 | `channel-setup FILE NODE [-n\|--dry-run] [--whatineedtoknow]` | Once per node, by a human. Creates that node's inbox and a `refs/` directory next to the plan file, all mode 2775 (setgid, group-writable, no sticky bit). Safe to rerun: on an existing node it prints `node NODE inbox PATH existing`, exits 0, and changes nothing, so a skill can call it whenever the inbox is missing. `-n` checks the plan, prints the directed edges, and creates nothing. |
 | `channel-arm FILE NODE [--whatineedtoknow]` | The receiver leaves this running. It prints `READY`, then `FILE <path>` for the oldest message in that inbox. When that file is removed, it prints the new oldest. It does not print a newer file while an older one is still there. |
 | `channel-send FILE NODE DEST VERB [BODYFILE\|-\|-m TEXT ...] [REF ...] [--whatineedtoknow]` | The sender. The body comes from BODYFILE, from stdin (`-` or no body argument), or from `-m TEXT` (repeatable like git; each `-m` is one block of lines, blocks joined by a blank line; with `-m`, every positional after VERB is a REF). A message may carry several REF files. Checks `VERB` is allowed on that arrow and that the body matches the message block. Copies refs into `refs/`, then renames the message into the destination inbox. On a `->` arrow it waits until this sender's previous file there is removed. The destination inbox has to exist already. |
-| `channel-ping FILE NODE [--force] [--every MIN] [--timeout SEC]` | Connectivity test. Sends a built-in PING on every arrow out of NODE. For a two-way link it waits for the PONG; for a one-way link it waits until the PING is removed (consumed). Prints `PONG DEST 0.2s`, `CONSUMED DEST 0.2s`, or `TIMEOUT DEST (...)` (exit 1). Rate-limited: skipped with `SKIP` if NODE pinged within `--every` minutes (default 30, env `CHANNEL_PING_EVERY`; stamp `nodes/NODE/ping.stamp`). `--force` ignores the limit; `--timeout` defaults to 300s (env `CHANNEL_PING_TIMEOUT`). |
+| `channel-ping FILE NODE [--all [--every MIN]] [--run ID] [--timeout SEC]` | Connectivity test. Sends a built-in PING on every arrow out of NODE. For a two-way link it waits for the PONG; for a one-way link it waits until the PING is removed (consumed). Prints `PONG DEST 0.2s`, `CONSUMED DEST 0.2s`, or `TIMEOUT DEST (...)` (exit 1). An explicit ping is never rate-limited. `--all` starts a check-all run that spreads over every link (see [Check-all](#check-all-links)); `--run ID` is how a receiving node joins a run. `--timeout` defaults to 300s (env `CHANNEL_PING_TIMEOUT`). |
 | `channel-status FILE` | One line per node: `node NAME INBOX messages N [oldest AGEs] claimed M`, then `  claimed FILE AGEs [owner=...]` for each claimed file. An inbox it cannot read prints `no permission` (or `missing`). |
 
 `--whatineedtoknow` starts with a "how to act" header filled in for that node: the absolute plan and inbox paths, the exact `channel-arm` watch and `channel-send` commands (the running binary's siblings), what goes in the body file, handling the oldest file first, and removing a file from the inbox when done. Then it prints the nodes this one talks to and the `message` blocks on those arrows, and exits. A bot needs nothing beyond that output. It does not create directories, send, or watch. Run it on `channel-arm` after a start or a compact. The flag is on all three so the dump is not a fourth command.
@@ -26,6 +26,29 @@ Every arrow carries PING and PONG without a `verb` or `message` line. The body i
 
 `channel-arm` handles them transparently: on a PING it sends PONG back (when the reverse arrow exists) and removes the PING; on a PONG it moves the file to `nodes/NODE/pong-NONCE` for `channel-ping` to collect. Neither is ever printed as `FILE`, so a watched agent is not woken. A node with no watch (for example a webhook-woken bot) sees the PING as a normal file and answers it by hand, as its `--whatineedtoknow` header says. A diag may still define PING/PONG blocks (see the commented example in `example/comms.diag`); a PING without a NONCE line is treated as an ordinary message.
 
+## Check-all (links)
+
+`channel-ping --all FILE NODE` checks every link reachable from NODE, not just its own arrows. The origin makes a run id (`NODE-YYYYmmdd-HHMMSS-PID`, printed as `CHECKALL NODE RUN`) and sends PINGs whose body is
+
+```
+NONCE: <value>
+SCOPE: all
+RUN: <run id>
+```
+
+A node that receives such a PING answers PONG as usual and then runs `channel-ping --run RUN FILE NODE`, which pings its own outgoing arrows with the same RUN. `channel-arm` does this transparently (detached, so the watch keeps going). A node without a watch (a webhook-woken bot) runs that command by hand; its `--whatineedtoknow` header says so.
+
+Propagation is what could loop, so `channel-ping --run` (never a plain ping) stops early, printing `SKIP`, in two cases:
+
+- this node already handled that run (run ids are recorded in `nodes/NODE/checkall-runs`, and the origin records its own run, so the wave coming back stops there), or
+- this node ran a check-all within the last `--every` minutes (default 30, env `CHANNEL_CHECKALL_EVERY`; stamp `nodes/NODE/checkall.stamp`).
+
+There are no locks; two waves racing on one node at worst both propagate once. Each node logs its own results (`event=ping ... run=RUN`) plus `event=checkall result=start|skip`; the origin also prints them. The origin waits only for its own arrows; results from further nodes are in syslog:
+
+```
+journalctl -t agent-channel | grep 'run=planner-20261014-'   # every result of one run
+```
+
 ## Logging
 
 Every send, delivery (`FILE` announced by `channel-arm`), consumption (announced file removed), PING answered, PONG received, ping result, and webhook result is logged as one `key=value` line to syslog with tag `agent-channel` (facility user; failures and timeouts at warning). `CHANNEL_SYSLOG=0` turns syslog off; `CHANNEL_LOG_FILE=/path` also appends each line, with a timestamp, to that file.
@@ -33,8 +56,9 @@ Every send, delivery (`FILE` announced by `channel-arm`), consumption (announced
 ```
 event=send plan=/p/x.diag from=planner to=coder verb=IMPLEMENT seq=12 refs=2 file=/p/nodes/coder/inbox/...
 event=deliver node=coder file=...            event=consumed node=coder file=...
-event=webhook result=ok|fail to=review from=planner verb=REVIEW attempts=2 [error="..."] file=...
-event=ping result=ok|timeout from=planner to=lab kind=pong|consumed seconds=0.4s
+event=webhook result=ok|fail|retrying to=review from=planner verb=REVIEW attempts=2 [error="..."] file=...
+event=ping result=ok|timeout from=planner to=lab kind=pong|consumed seconds=0.4s [run=RUN]
+event=checkall result=start|skip node=lab run=RUN [why="run already handled"|"rate limit"]
 ```
 
 Example alert queries:
@@ -62,8 +86,8 @@ node review /abs/inbox webhook=http://127.0.0.1:8765/hook                # no Au
 - `webhook_key=<token>` inline and `webhook_key_file=<path>` are both fully supported. A relative `webhook_key_file` is resolved from the diag file's directory, so a key file can sit next to the plan; an absolute path also works. The file's first line is the key.
 - Give only the key. The tool builds `Authorization: Bearer <key>`. A leading `Authorization: Bearer ` or `Bearer ` is stripped, so a pasted header line also works. The key never appears on a command line.
 - After the rename into the inbox, `channel-send` POSTs (connect timeout 5s, total 15s) with `Content-Type: application/json` and the body `{"target":NODE,"from":SENDER,"verb":VERB,"inbox":INBOX,"file":PATH}`.
-- Retries: a network error, timeout, 5xx, or 429 is retried with exponential backoff (1s, 2s, 4s, ... capped at `webhook_backoff_max` seconds, default 30) up to `webhook_retries` times (default 3; `0` disables). Other 4xx results are not retried. Each retry prints a note on stderr.
-- On a 2xx it prints `WEBHOOK NAME CODE RESPONSE`. On any other result (non-2xx, unreachable, unreadable key file, timeout) it prints a `WARNING:` line on stderr. The message stays queued and the exit status is unchanged.
+- Retries: `channel-send` makes the first POST itself. If it fails with a network error, timeout, 5xx, or 429, the send prints a `WARNING ... retrying in the background` line and returns at once; a detached background process (own session, survives the sender) retries with exponential backoff (1s, 2s, 4s, ... capped at `webhook_backoff_max`, default `30m`) up to `webhook_retries` more times (default 12, so the schedule reaches the 30m cap and spans about an hour; `0` disables retries). `webhook_backoff_max` takes `N` (seconds), `Ns`, `Nm` or `Nh`. Other 4xx results are not retried. The first failure is logged as `result=retrying`; the background job logs the final `result=ok` or `result=fail` with `attempts=`.
+- On a 2xx it prints `WEBHOOK NAME CODE RESPONSE`. On any other first result (non-2xx, unreachable, unreadable key file, timeout) it prints a `WARNING:` line on stderr. The message stays queued and the exit status is unchanged.
 - Nodes without a webhook behave exactly as before. `--whatineedtoknow` does not print webhook URLs or keys.
 
 ## In-progress files and restarts

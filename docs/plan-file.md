@@ -17,14 +17,14 @@ Messages to NAME are placed in that directory by an atomic rename. When NAME fin
 A node line may also carry a webhook, fired after each message queued to NAME:
 
 ```
-node NAME /absolute/inbox webhook=URL [webhook_key=TOKEN | webhook_key_file=PATH] [webhook_retries=N] [webhook_backoff_max=SEC]
+node NAME /absolute/inbox webhook=URL [webhook_key=TOKEN | webhook_key_file=PATH] [webhook_retries=N] [webhook_backoff_max=T]
 ```
 
-Give only the key; the tool sends `Authorization: Bearer <key>` (a leading `Bearer ` or `Authorization: Bearer ` is stripped). The inline key and the key file are both fully supported. A relative `webhook_key_file` is resolved from the plan file's directory, and the file's first line is the key. The POST body is `{"target","from","verb","inbox","file"}` as JSON. A failed POST is retried with exponential backoff (defaults: 3 retries, at most 30s between tries). A final failure prints a `WARNING`; the message stays queued and the send still succeeds. Details: [bin/README.md](../bin/README.md#webhooks-optional).
+Give only the key; the tool sends `Authorization: Bearer <key>` (a leading `Bearer ` or `Authorization: Bearer ` is stripped). The inline key and the key file are both fully supported. A relative `webhook_key_file` is resolved from the plan file's directory, and the file's first line is the key. The POST body is `{"target","from","verb","inbox","file"}` as JSON. A failed POST is retried in a detached background process with exponential backoff (defaults: `webhook_retries=12`, `webhook_backoff_max=30m`; the max accepts `N`, `Ns`, `Nm`, `Nh`), so the send returns after the first try. A failed first try prints a `WARNING`; the message stays queued, the send still succeeds, and the background outcome goes to syslog. Details: [bin/README.md](../bin/README.md#webhooks-optional).
 
 ## Built-in PING and PONG
 
-PING and PONG are allowed on every arrow without a verb line or message block (body `NONCE: <value>`). `channel-ping` uses them and `channel-arm` answers them. A plan may still spell them out; the commented block in `example/comms.diag` shows the shape.
+PING and PONG are allowed on every arrow without a verb line or message block (body `NONCE: <value>`). `channel-ping` uses them and `channel-arm` answers them; a PING with `SCOPE: all` and `RUN: <id>` lines is a check-all (`channel-ping --all`) and the receiver passes it on. A plan may still spell them out; the commented block in `example/comms.diag` shows the shape.
 
 ## verb
 

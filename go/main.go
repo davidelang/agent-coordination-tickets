@@ -59,8 +59,66 @@ type hook struct {
 }
 
 func die(msg string) {
+	if dieTrap {
+		panic(trapped{msg})
+	}
 	fmt.Fprintln(os.Stderr, msg)
 	os.Exit(1)
+}
+
+// dieTrap turns die into a recoverable panic inside tryDo, so channel-arm can
+// report a failed automatic reply instead of exiting.
+var dieTrap bool
+
+type trapped struct{ msg string }
+
+// tryDo runs f; a die inside f is returned as its message instead of exiting.
+func tryDo(f func()) (failure string) {
+	dieTrap = true
+	defer func() {
+		dieTrap = false
+		if r := recover(); r != nil {
+			t, ok := r.(trapped)
+			if !ok {
+				panic(r)
+			}
+			failure = t.msg
+		}
+	}()
+	f()
+	return ""
+}
+
+// controlBody builds the body of a built-in PING or PONG. When the plan defines a
+// message block for the verb, the body follows that block: literal lines are copied
+// and each "KEY: <...>" line is filled from fields by KEY; a placeholder with no
+// field is an error (CHANNEL-CONTROL-BODY). Fields the block does not mention are
+// appended as "KEY: value" lines. Without a block the body is the fields alone.
+func controlBody(p plan, verb string, keys []string, fields map[string]string) string {
+	used := map[string]bool{}
+	var out []string
+	for _, raw := range p.messages[verb].body {
+		open := strings.IndexByte(raw, '<')
+		close := strings.LastIndexByte(raw, '>')
+		if open < 0 || open >= close {
+			out = append(out, raw)
+			continue
+		}
+		prefix := raw[:open]
+		key := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(prefix), ":"))
+		v, ok := fields[key]
+		if !ok {
+			die("CHANNEL-CONTROL-BODY: the " + verb + " message block in " + p.path + " has the line \"" + raw + "\", which the tool cannot fill (it fills " + strings.Join(keys, ", ") + "). Change that line to one of those, or make it literal.")
+		}
+		out = append(out, prefix+v)
+		used[key] = true
+	}
+	for _, k := range keys {
+		if !used[k] {
+			out = append(out, k+": "+fields[k])
+		}
+	}
+	return strings.Join(out, "\n") + "\n"
 }
 
 // quiet hides stdout lines while channel-arm answers a PING, so the agent is not woken.
@@ -837,14 +895,15 @@ func emitAct(me string, p plan) {
 		"  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.",
 		"  If it prints ALREADY-WATCHING and exits, a watch for this node is already running: do not start another. If it exits with any other message, report that message and stop; do not work around it.",
 		"  The watch answers PING for you (it sends PONG and removes the PING) and never shows it; for a check-all PING (body has SCOPE: all) it also starts the check on your own arrows.",
-		"  With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run {BIN}/channel-ping --run <id> {PLAN} {NODE} (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).",
+		"  If it cannot answer a PING, it prints CHANNEL-AUTO-REPLY-FAILED on stderr (also in syslog), keeps running, and shows that PING as FILE: answer it by hand as below.",
+		"  With no watch running, or for a PING shown as FILE, answer it yourself: send PONG to its sender with the PING's NONCE line (plus the lines of the plan's PONG message block, if it has one), then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run {BIN}/channel-ping --run <id> {PLAN} {NODE} (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).",
 		"start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.",
 		"read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.",
 		"  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.",
 		"send: {BIN}/channel-send {PLAN} {NODE} DEST VERB BODYFILE [REF ...]",
 		"  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB -m 'TEXT' [-m 'TEXT' ...] [REF ...]   (each -m is one block of lines; blocks are joined by a blank line)",
 		"  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB - [REF ...]   (- or no BODYFILE reads the body from stdin)",
-		"  DEST must be a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below). PING and PONG are built in on every arrow; their body is NONCE: <value>.",
+		"  DEST must be a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below). PING and PONG are built in on every arrow; their body is NONCE: <value>, or what the plan's PING/PONG message block asks for (the tools fill only NONCE, SCOPE and RUN there; any other <...> line makes them fail with CHANNEL-CONTROL-BODY).",
 		"  Body: copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.",
 		"  Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.",
 		"  REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.",
@@ -1663,6 +1722,9 @@ func pongPath(p plan, me, nonce string) string {
 }
 
 // handleControl answers PING and files PONG for channel-ping, so the agent never sees either.
+// replyFailed holds PING files channel-arm could not answer; they are shown as FILE.
+var replyFailed = map[string]bool{}
+
 func handleControl(inbox string, files []string) []string {
 	if !armActive {
 		return files
@@ -1674,12 +1736,26 @@ func handleControl(inbox string, files []string) []string {
 		if nonce == "" {
 			verb = ""
 		}
+		if replyFailed[full] {
+			verb = ""
+		}
 		switch verb {
 		case "PING":
 			if hasEdge(armPlan, armMe, from) && nonce != "" {
 				quiet = true
-				sendMessage(armPlan, armMe, from, "PONG", []byte("NONCE: "+nonce+"\n"), nil)
+				failure := tryDo(func() {
+					body := controlBody(armPlan, "PONG", []string{"NONCE"}, map[string]string{"NONCE": nonce})
+					sendMessage(armPlan, armMe, from, "PONG", []byte(body), nil)
+				})
 				quiet = false
+				if failure != "" {
+					// Not silent and not fatal: warn, log, and show the PING as an ordinary FILE.
+					replyFailed[full] = true
+					note("CHANNEL-AUTO-REPLY-FAILED: channel-arm could not answer the PING from " + from + " (" + failure + "). The watch keeps running and shows that PING as FILE: answer it by hand (see the header), then rm it.")
+					logEvent("auto-reply", "result", "fail", "node", armMe, "from", from, "nonce", nonce, "why", failure, "file", full)
+					rest = append(rest, name)
+					continue
+				}
 			}
 			scope, run := bodyField(full, "SCOPE"), bodyField(full, "RUN")
 			_ = os.Remove(full)
@@ -1718,7 +1794,6 @@ func cmdPing(path, me string) {
 	requireMe(me, p)
 	node := filepath.Dir(p.nodes[me])
 	requireDir(p.nodes[me], "run channel-setup "+path+" "+me)
-	extra := ""
 	run := pingRun
 	if pingAll {
 		origin := run == ""
@@ -1728,7 +1803,6 @@ func cmdPing(path, me string) {
 		if !checkAllAllowed(node, me, run, origin) {
 			return
 		}
-		extra = "SCOPE: all\nRUN: " + run + "\n"
 		say("CHECKALL " + me + " run " + run)
 		logEvent("checkall", "result", "start", "node", me, "run", run)
 	}
@@ -1744,7 +1818,17 @@ func cmdPing(path, me string) {
 		}
 		nonce := fmt.Sprintf("%s-%s-%s-%d", me, e.dst, start.Format("20060102-150405"), os.Getpid())
 		pr := &probe{dest: e.dst, nonce: nonce, twoWay: hasEdge(p, e.dst, me)}
-		pr.file = sendMessage(p, me, e.dst, "PING", []byte("NONCE: "+nonce+"\n"+extra), nil)
+		keys, fields := []string{"NONCE"}, map[string]string{"NONCE": nonce}
+		if pingAll {
+			keys = append(keys, "SCOPE", "RUN")
+			fields["SCOPE"], fields["RUN"] = "all", run
+		}
+		var body string
+		if failure := tryDo(func() { body = controlBody(p, "PING", keys, fields) }); failure != "" {
+			logEvent("ping", "result", "fail", "from", me, "to", e.dst, "run", run, "why", failure)
+			die(failure)
+		}
+		pr.file = sendMessage(p, me, e.dst, "PING", []byte(body), nil)
 		probes = append(probes, pr)
 	}
 	deadline := start.Add(time.Duration(pingTimeout) * time.Second)

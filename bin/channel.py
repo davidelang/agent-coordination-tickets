@@ -35,6 +35,44 @@ def die(msg):
     raise SystemExit(1)
 
 
+def try_do(func):
+    """Run func; a die inside it is returned as its message instead of exiting."""
+    import contextlib, io
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            func()
+    except SystemExit:
+        return err.getvalue().strip() or "failed"
+    return ""
+
+
+def control_body(loaded, verb, keys, fields):
+    """Body of a built-in PING or PONG. With a message block for the verb, literal lines are
+    copied and each "KEY: <...>" line is filled from fields by KEY (no field: CHANNEL-CONTROL-BODY
+    error); fields the block does not mention are appended. Without a block, the fields alone."""
+    messages = loaded[3]
+    used, out = set(), []
+    for raw in (messages[verb]["body"] if verb in messages else []):
+        open_at, close_at = raw.find("<"), raw.rfind(">")
+        if open_at < 0 or open_at >= close_at:
+            out.append(raw)
+            continue
+        prefix = raw[:open_at]
+        key = prefix.strip()
+        if key.endswith(":"):
+            key = key[:-1].strip()
+        if key not in fields:
+            die(f'CHANNEL-CONTROL-BODY: the {verb} message block in {loaded[0]} has the line "{raw}", which the tool cannot fill (it fills {", ".join(keys)}). Change that line to one of those, or make it literal.')
+        out.append(prefix + fields[key])
+        used.add(key)
+    out += [f"{k}: {fields[k]}" for k in keys if k not in used]
+    return "\n".join(out) + "\n"
+
+
+REPLY_FAILED = set()
+
+
 def read_text(path):
     return Path(path).read_text()
 
@@ -482,14 +520,15 @@ ACT_LINES = [
     '  Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.',
     '  If it prints ALREADY-WATCHING and exits, a watch for this node is already running: do not start another. If it exits with any other message, report that message and stop; do not work around it.',
     '  The watch answers PING for you (it sends PONG and removes the PING) and never shows it; for a check-all PING (body has SCOPE: all) it also starts the check on your own arrows.',
-    '  With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run {BIN}/channel-ping --run <id> {PLAN} {NODE} (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).',
+    '  If it cannot answer a PING, it prints CHANNEL-AUTO-REPLY-FAILED on stderr (also in syslog), keeps running, and shows that PING as FILE: answer it by hand as below.',
+    "  With no watch running, or for a PING shown as FILE, answer it yourself: send PONG to its sender with the PING's NONCE line (plus the lines of the plan's PONG message block, if it has one), then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run {BIN}/channel-ping --run <id> {PLAN} {NODE} (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).",
     'start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.',
     'read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.',
     '  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.',
     'send: {BIN}/channel-send {PLAN} {NODE} DEST VERB BODYFILE [REF ...]',
     "  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB -m 'TEXT' [-m 'TEXT' ...] [REF ...]   (each -m is one block of lines; blocks are joined by a blank line)",
     '  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB - [REF ...]   (- or no BODYFILE reads the body from stdin)',
-    '  DEST must be a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below). PING and PONG are built in on every arrow; their body is NONCE: <value>.',
+    "  DEST must be a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below). PING and PONG are built in on every arrow; their body is NONCE: <value>, or what the plan's PING/PONG message block asks for (the tools fill only NONCE, SCOPE and RUN there; any other <...> line makes them fail with CHANNEL-CONTROL-BODY).",
     '  Body: copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.',
     '  Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.',
     '  REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.',
@@ -990,13 +1029,19 @@ def handle_control(inbox):
         return
     for entry in message_names(inbox):
         verb, sender, nonce = read_head(entry)
-        if not nonce:
+        if not nonce or str(entry) in REPLY_FAILED:
             continue
         if verb == "PING":
             if nonce and edge_between(loaded[4], me, sender):
-                import contextlib, io
-                with contextlib.redirect_stdout(io.StringIO()):
-                    send_message(loaded, me, sender, "PONG", f"NONCE: {nonce}\n", [])
+                failure = try_do(lambda: send_message(
+                    loaded, me, sender, "PONG", control_body(loaded, "PONG", ["NONCE"], {"NONCE": nonce}), []))
+                if failure:
+                    # Not silent and not fatal: warn, log, and show the PING as an ordinary FILE.
+                    REPLY_FAILED.add(str(entry))
+                    note(f"CHANNEL-AUTO-REPLY-FAILED: channel-arm could not answer the PING from {sender} ({failure}). "
+                         "The watch keeps running and shows that PING as FILE: answer it by hand (see the header), then rm it.")
+                    log_event("auto-reply", result="fail", node=me, **{"from": sender}, nonce=nonce, why=failure, file=entry)
+                    continue
             scope, run = body_field(entry, "SCOPE"), body_field(entry, "RUN")
             entry.unlink(missing_ok=True)
             log_event("ping-answered", node=me, **{"from": sender}, nonce=nonce, scope=scope, run=run)
@@ -1065,7 +1110,6 @@ def cmd_ping(plan_path, me):
     plan_file, nodes, _verbs, _messages, edges = loaded
     require_me(me, nodes, plan_file)
     require_dir(nodes[me], f"run channel-setup {plan_file} {me}")
-    extra = ""
     run = OPTS["run"]
     if OPTS["all"]:
         origin = not run
@@ -1073,7 +1117,6 @@ def cmd_ping(plan_path, me):
             run = f"{me}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
         if not check_all_allowed(node_dir(nodes[me]), me, run, origin):
             return
-        extra = f"SCOPE: all\nRUN: {run}\n"
         say(f"CHECKALL {me} run {run}")
         log_event("checkall", result="start", node=me, run=run)
     start = time.time()
@@ -1082,7 +1125,16 @@ def cmd_ping(plan_path, me):
         if src != me:
             continue
         nonce = f"{me}-{dst}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
-        sent = send_message(loaded, me, dst, "PING", f"NONCE: {nonce}\n{extra}", [])
+        keys, fields = ["NONCE"], {"NONCE": nonce}
+        if OPTS["all"]:
+            keys += ["SCOPE", "RUN"]
+            fields.update(SCOPE="all", RUN=run)
+        body = []
+        failure = try_do(lambda: body.append(control_body(loaded, "PING", keys, fields)))
+        if failure:
+            log_event("ping", result="fail", **{"from": me}, to=dst, run=run, why=failure)
+            die(failure)
+        sent = send_message(loaded, me, dst, "PING", body[0], [])
         probes.append({"dest": dst, "nonce": nonce, "file": sent, "two": edge_between(edges, dst, me) is not None, "done": False})
     deadline = start + OPTS["timeout"]
     while any(not pr["done"] for pr in probes) and time.time() < deadline:

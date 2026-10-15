@@ -26,6 +26,10 @@ Every arrow carries PING and PONG without a `verb` or `message` line. The body i
 
 `channel-arm` handles them transparently: on a PING it sends PONG back (when the reverse arrow exists) and removes the PING; on a PONG it moves the file to `nodes/NODE/pong-NONCE` for `channel-ping` to collect. Neither is ever printed as `FILE`, so a watched agent is not woken. A node with no watch (for example a webhook-woken bot) sees the PING as a normal file and answers it by hand, as its `--whatineedtoknow` header says. A diag may still define PING/PONG blocks (see the commented example in `example/comms.diag`); a PING without a NONCE line is treated as an ordinary message.
 
+When the diag defines a PING or PONG block, every body the tools build themselves (the PING from `channel-ping`, the PONG from `channel-arm`, the check-all `SCOPE`/`RUN` lines) follows that block: literal lines such as `ACTION: PONG` are copied, and each `KEY: <...>` line is filled by its key. The tools fill only `NONCE`, `SCOPE`, and `RUN`; keys the block does not mention are added as extra lines (extra lines are allowed). Any other `<...>` line in the block is an error that starts with `CHANNEL-CONTROL-BODY:` and names the line. Without a block the body is just those `KEY: value` lines.
+
+If `channel-arm` cannot send its automatic PONG (for example `CHANNEL-CONTROL-BODY`, or a missing inbox), it does not exit and does not drop the PING. It prints `CHANNEL-AUTO-REPLY-FAILED: ...` on stderr once, logs `event=auto-reply result=fail` at warning, leaves the PING in the inbox, and shows it as an ordinary `FILE <path>`; the agent answers it by hand (the header says how) and removes it. `channel-ping` with a block it cannot fill fails before sending anything and logs `event=ping result=fail`.
+
 ## Check-all (links)
 
 `channel-ping --all FILE NODE` checks every link reachable from NODE, not just its own arrows. The origin makes a run id (`NODE-YYYYmmdd-HHMMSS-PID`, printed as `CHECKALL NODE RUN`) and sends PINGs whose body is
@@ -58,7 +62,8 @@ event=send plan=/p/x.diag from=planner to=coder verb=IMPLEMENT seq=12 refs=2 fil
 event=deliver node=coder file=...            event=consumed node=coder file=...
 event=webhook result=ok|fail|retrying to=review from=planner verb=REVIEW attempts=2 [error="..."] file=...
 event=ping result=ok|timeout from=planner to=lab kind=pong|consumed seconds=0.4s [run=RUN]
-event=checkall result=start|skip node=lab run=RUN [why="run already handled"|"rate limit"]
+event=auto-reply result=fail node=lab from=planner nonce=N why="..." file=...
+event=checkall result=start|skip|fail node=lab run=RUN [why="run already handled"|"rate limit"]
 ```
 
 Example alert queries:

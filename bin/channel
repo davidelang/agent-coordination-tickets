@@ -140,8 +140,9 @@ fi
 
 PARSE=$(mktemp)
 SHOWN=$(mktemp)
+REPLYFAILED=$(mktemp)
 BODYTMP=$(mktemp)
-trap 'rm -f "$PARSE" "$SHOWN" "$MSGS" "$BODYTMP"' EXIT INT TERM
+trap 'rm -f "$PARSE" "$SHOWN" "$REPLYFAILED" "$MSGS" "$BODYTMP"' EXIT INT TERM
 [ "$nmsg" -eq 0 ] || [ "$mode" = send ] || die "-m is only for channel-send"
 bindir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
@@ -594,14 +595,15 @@ watch: $bindir/channel-arm $plan $me
   Leave the watch running as a persistent monitor. It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.
   If it prints ALREADY-WATCHING and exits, a watch for this node is already running: do not start another. If it exits with any other message, report that message and stop; do not work around it.
   The watch answers PING for you (it sends PONG and removes the PING) and never shows it; for a check-all PING (body has SCOPE: all) it also starts the check on your own arrows.
-  With no watch running, answer a PING yourself: send PONG to its sender with the same NONCE line, then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run $bindir/channel-ping --run <id> $plan $me (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).
+  If it cannot answer a PING, it prints CHANNEL-AUTO-REPLY-FAILED on stderr (also in syslog), keeps running, and shows that PING as FILE: answer it by hand as below.
+  With no watch running, or for a PING shown as FILE, answer it yourself: send PONG to its sender with the PING's NONCE line (plus the lines of the plan's PONG message block, if it has one), then rm the PING. If the PING also has SCOPE: all and RUN: <id>, then run $bindir/channel-ping --run <id> $plan $me (it does nothing if this node already handled that run or ran a check-all in the last 30 minutes).
 start: before new messages, look in $inbox/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.
 read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.
   Handle the oldest FILE first, one file at a time. You may move it into $inbox/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.
 send: $bindir/channel-send $plan $me DEST VERB BODYFILE [REF ...]
   or:  $bindir/channel-send $plan $me DEST VERB -m 'TEXT' [-m 'TEXT' ...] [REF ...]   (each -m is one block of lines; blocks are joined by a blank line)
   or:  $bindir/channel-send $plan $me DEST VERB - [REF ...]   (- or no BODYFILE reads the body from stdin)
-  DEST must be a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below). PING and PONG are built in on every arrow; their body is NONCE: <value>.
+  DEST must be a node you have an arrow to and VERB must be listed on that arrow (see the verb lines below). PING and PONG are built in on every arrow; their body is NONCE: <value>, or what the plan's PING/PONG message block asks for (the tools fill only NONCE, SCOPE and RUN there; any other <...> line makes them fail with CHANNEL-CONTROL-BODY).
   Body: copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.
   Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.
   REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.
@@ -778,6 +780,53 @@ pong_path() {
   printf '%s/pong-%s\n' "$(dirname "$(node_path "$1")")" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9_.-' '_')"
 }
 
+# control_body VERB KEY=VALUE... prints the body of a built-in PING or PONG. With a
+# message block for VERB, literal lines are copied and each "KEY: <...>" line is filled
+# by KEY (no value: CHANNEL-CONTROL-BODY error); keys the block does not mention are
+# appended. Without a block the body is the KEY: VALUE lines alone.
+control_body() {
+  cverb_=$1
+  shift
+  awk -F '\t' -v verb="$cverb_" -v kv="$(printf '%s\n' "$@")" -v plan="$PLAN" '
+BEGIN {
+  n = split(kv, a, "\n")
+  for (i = 1; i <= n; i++) {
+    if (a[i] == "") continue
+    eq = index(a[i], "=")
+    k = substr(a[i], 1, eq - 1)
+    val[k] = substr(a[i], eq + 1)
+    order[++no] = k
+    names = names (names == "" ? "" : ", ") k
+  }
+}
+$1 == "M" { on = ($2 == verb); next }
+$1 == "B" && on { t[++nt] = substr($0, 3); next }
+END {
+  for (i = 1; i <= nt; i++) {
+    raw = t[i]
+    open = index(raw, "<")
+    endat = 0
+    for (j = length(raw); j > 0; j--) if (substr(raw, j, 1) == ">") { endat = j; break }
+    if (open > 0 && open < endat) {
+      prefix = substr(raw, 1, open - 1)
+      key = prefix
+      gsub(/^[ \t]+|[ \t]+$/, "", key)
+      sub(/[ \t]*:$/, "", key)
+      if (!(key in val)) {
+        printf "CHANNEL-CONTROL-BODY: the %s message block in %s has the line \"%s\", which the tool cannot fill (it fills %s). Change that line to one of those, or make it literal.\n", verb, plan, raw, names > "/dev/stderr"
+        exit 1
+      }
+      out[++m] = prefix val[key]
+      used[key] = 1
+    } else {
+      out[++m] = raw
+    }
+  }
+  for (i = 1; i <= m; i++) print out[i]
+  for (i = 1; i <= no; i++) if (!(order[i] in used)) print order[i] ": " val[order[i]]
+}' "$PARSE"
+}
+
 # channel-arm answers PING and files PONG for channel-ping; the agent never sees either.
 handle_control() {
   [ -n "${ARM_ME:-}" ] || return 0
@@ -790,10 +839,24 @@ handle_control() {
     cfrom=$(printf '%s' "$head" | cut -f2)
     cnonce=$(printf '%s' "$head" | cut -f3)
     [ -n "$cnonce" ] || continue
+    grep -Fxq -- "$cpath" "$REPLYFAILED" && continue
     case "$cverb" in
       PING)
         if [ -n "$cnonce" ] && has_edge "$ARM_ME" "$cfrom"; then
-          "$bindir/channel-send" "$PLAN" "$ARM_ME" "$cfrom" PONG -m "NONCE: $cnonce" >/dev/null 2>&1 || note "PONG to $cfrom failed"
+          cfail=
+          if cbody=$(control_body PONG "NONCE=$cnonce" 2>&1); then
+            cfail=$("$bindir/channel-send" "$PLAN" "$ARM_ME" "$cfrom" PONG -m "$cbody" 2>&1 >/dev/null) && cfail= || cfail=${cfail:-channel-send failed}
+          else
+            cfail=$cbody
+          fi
+          if [ -n "$cfail" ]; then
+            # Not silent and not fatal: warn, log, and show the PING as an ordinary FILE.
+            cfail=$(printf '%s' "$cfail" | tr '\n' ' ')
+            printf '%s\n' "$cpath" >> "$REPLYFAILED"
+            note "CHANNEL-AUTO-REPLY-FAILED: channel-arm could not answer the PING from $cfrom ($cfail). The watch keeps running and shows that PING as FILE: answer it by hand (see the header), then rm it."
+            log_event auto-reply result fail node "$ARM_ME" from "$cfrom" nonce "$cnonce" why "$cfail" file "$cpath"
+            continue
+          fi
         fi
         cscope=$(body_field "$cpath" SCOPE)
         crun=$(body_field "$cpath" RUN)
@@ -1239,7 +1302,6 @@ cmd_ping() {
   require_me "$me"
   myinbox=$(node_path "$me")
   [ -d "$myinbox" ] || die "no directory $myinbox; run channel-setup $PLAN $me"
-  extra=
   run=$ping_run
   if [ "$ping_all" -eq 1 ]; then
     origin=0
@@ -1248,16 +1310,18 @@ cmd_ping() {
       run=$me-$(date +%Y%m%d-%H%M%S)-$$
     fi
     check_all_allowed "$(dirname "$myinbox")" "$me" "$run" "$origin" || return 0
-    extra="
-SCOPE: all
-RUN: $run"
     say "CHECKALL $me run $run"
     log_event checkall result start node "$me" run "$run"
   fi
   probes=$(mktemp)
   for dest in $(awk -F '\t' -v s="$me" '$1=="E" && $2==s { print $3 }' "$PARSE"); do
     nonce=$me-$dest-$(date +%Y%m%d-%H%M%S)-$$
-    sent=$("$bindir/channel-send" "$PLAN" "$me" "$dest" PING -m "NONCE: $nonce$extra" | awk '/^SENT / { print substr($0, 6) }')
+    if [ "$ping_all" -eq 1 ]; then
+      pbody=$(control_body PING "NONCE=$nonce" "SCOPE=all" "RUN=$run" 2>&1) || { log_event ping result fail from "$me" to "$dest" run "$run" why "$pbody"; die "$pbody"; }
+    else
+      pbody=$(control_body PING "NONCE=$nonce" 2>&1) || { log_event ping result fail from "$me" to "$dest" why "$pbody"; die "$pbody"; }
+    fi
+    sent=$("$bindir/channel-send" "$PLAN" "$me" "$dest" PING -m "$pbody" | awk '/^SENT / { print substr($0, 6) }')
     two=0
     has_edge "$dest" "$me" && two=1
     printf '%s\t%s\t%s\t%s\n' "$dest" "$nonce" "$sent" "$two" >> "$probes"

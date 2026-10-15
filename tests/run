@@ -886,5 +886,110 @@ for impl in go sh py; do
   if [ "$rc" != 0 ] && grep -q 'must be a whole number' "$X/$impl-badenv"; then ok "$impl bad env number fails"; else bad "$impl bad env number fails (rc=$rc)"; fi
 done
 
+# Plans that define PING/PONG message blocks (ACTION lines): built-in replies follow the
+# block; a reply the tool cannot build is reported, shown as FILE, and the watch keeps going.
+Y=$TMP/y
+mkdir -p "$Y"
+cat > "$Y/y.diag" <<EOF
+blockdiag {
+  p <-> q;
+  p -< r;
+  q <-> r;
+  s <-> t;
+}
+/*
+node p $Y/nodes/p/inbox
+node q $Y/nodes/q/inbox
+node r $Y/nodes/r/inbox
+node s $Y/nodes/s/inbox
+node t $Y/nodes/t/inbox
+verb p q NOTE
+verb q p NOTE
+verb p r NOTE
+verb q r NOTE
+verb r q NOTE
+verb s t NOTE
+verb t s NOTE
+message NOTE {
+A note.
+body: {
+NOTE: <text>
+}
+}
+message PING {
+Connectivity test. Reply PONG with the same NONCE.
+body: {
+ACTION: PING
+NONCE: <unique id>
+}
+}
+message PONG {
+Answer to PING.
+body: {
+ACTION: PONG
+NONCE: <same nonce as the PING>
+}
+}
+*/
+EOF
+# z: same nodes, but its PONG block asks for a value the tool cannot fill.
+sed -e 's/^NONCE: <same nonce as the PING>$/NONCE: <same nonce as the PING>\nWHEN: <time of reply>/' "$Y/y.diag" > "$Y/z.diag"
+for n in p q r s t; do "$ROOT/go/channel-setup" "$Y/y.diag" $n >/dev/null; done
+export CHANNEL_LOG_FILE="$Y/log.txt"
+for impl in go sh py; do
+  case $impl in
+    go) A="$ROOT/go/channel-arm"; P="$ROOT/go/channel-ping"; SN="$ROOT/go/channel-send" ;;
+    sh) A="$ROOT/bin/channel-arm"; P="$ROOT/bin/channel-ping"; SN="$ROOT/bin/channel-send" ;;
+    py) A="python3 $PY arm"; P="python3 $PY ping"; SN="python3 $PY send" ;;
+  esac
+  rm -f "$Y"/nodes/*/inbox/*.md "$Y"/nodes/*/arm.pid "$Y"/nodes/*/checkall-runs "$Y"/nodes/*/checkall.stamp
+  : > "$Y/log.txt"
+  $A "$Y/y.diag" q > "$Y/$impl-aq" 2> "$Y/$impl-aq.err" &
+  pq=$!
+  $A "$Y/y.diag" r > "$Y/$impl-ar" 2> "$Y/$impl-ar.err" &
+  pr=$!
+  $A "$Y/y.diag" p > "$Y/$impl-ap" 2> "$Y/$impl-ap.err" &
+  pp=$!
+  wait_for "$Y/$impl-aq" READY || true; wait_for "$Y/$impl-ar" READY || true; wait_for "$Y/$impl-ap" READY || true
+  rc=0; $P --timeout 10 "$Y/y.diag" p > "$Y/$impl-pg" 2>&1 || rc=$?
+  if [ "$rc" = 0 ] && grep -q '^PONG q ' "$Y/$impl-pg" && grep -q '^CONSUMED r ' "$Y/$impl-pg"; then ok "$impl ping with ACTION blocks: auto-PONG validates"; else bad "$impl ping with ACTION blocks: auto-PONG validates (rc=$rc)"; fi
+  if ! grep -q 'event=auto-reply' "$Y/log.txt" && kill -0 "$pq" 2>/dev/null; then ok "$impl ACTION-block watch keeps running, no reply failure"; else bad "$impl ACTION-block watch keeps running, no reply failure"; fi
+  rc=0; $P --all --timeout 10 "$Y/y.diag" p > "$Y/$impl-pga" 2>&1 || rc=$?
+  if [ "$rc" = 0 ] && grep -q '^CHECKALL p run ' "$Y/$impl-pga" && grep -q '^PONG q ' "$Y/$impl-pga"; then ok "$impl check-all with ACTION blocks"; else bad "$impl check-all with ACTION blocks (rc=$rc)"; fi
+  n=0; while [ "$n" -lt 50 ] && ! grep -q 'event=ping result=ok from=q to=r kind=pong' "$Y/log.txt"; do sleep 0.2; n=$((n + 1)); done
+  if grep -q 'event=checkall result=start node=q' "$Y/log.txt" && grep -q 'event=ping result=ok from=q to=r kind=pong' "$Y/log.txt"; then ok "$impl check-all propagates with ACTION blocks"; else bad "$impl check-all propagates with ACTION blocks"; fi
+  if grep -q 'CHANNEL-' "$Y/$impl-aq.err" "$Y/$impl-ar.err" "$Y/$impl-ap.err"; then bad "$impl no control errors with ACTION blocks"; else ok "$impl no control errors with ACTION blocks"; fi
+  for x in $pq $pr $pp; do kill -9 "$x" 2>/dev/null || true; done
+  wait "$pq" "$pr" "$pp" 2>/dev/null || true
+  pkill -9 -f "$Y/y.diag" 2>/dev/null || true
+  sleep 0.3
+  # forced reply failure (z.diag): warning, PING shown as FILE, watch keeps running
+  $A "$Y/z.diag" t > "$Y/$impl-at" 2> "$Y/$impl-at.err" &
+  pt=$!
+  wait_for "$Y/$impl-at" READY || true
+  $SN "$Y/z.diag" s t PING -m 'ACTION: PING' -m "NONCE: $impl-forced" > "$Y/$impl-zs" 2>&1
+  zf=$(sed -n 's/^SENT //p' "$Y/$impl-zs")
+  if [ -n "$zf" ] && wait_for "$Y/$impl-at" "FILE $zf"; then ok "$impl failed auto-reply shows the PING as FILE"; else bad "$impl failed auto-reply shows the PING as FILE"; fi
+  if grep -q 'CHANNEL-AUTO-REPLY-FAILED' "$Y/$impl-at.err" && grep -q 'CHANNEL-CONTROL-BODY' "$Y/$impl-at.err" && grep -q 'event=auto-reply result=fail node=t from=s' "$Y/log.txt"; then ok "$impl failed auto-reply warns on stderr and in the log"; else bad "$impl failed auto-reply warns on stderr and in the log"; fi
+  sleep 0.6
+  if [ -f "$zf" ] && kill -0 "$pt" 2>/dev/null; then ok "$impl watch survives a failed auto-reply"; else bad "$impl watch survives a failed auto-reply"; fi
+  if [ "$(grep -c "^FILE $zf" "$Y/$impl-at")" = 1 ] && [ "$(grep -c CHANNEL-AUTO-REPLY-FAILED "$Y/$impl-at.err")" = 1 ]; then ok "$impl failed PING reported and announced once"; else bad "$impl failed PING reported and announced once"; fi
+  rm -f "$zf"
+  $SN "$Y/z.diag" s t NOTE -m 'NOTE: after' > "$Y/$impl-zn" 2>&1
+  zn=$(sed -n 's/^SENT //p' "$Y/$impl-zn")
+  if [ -n "$zn" ] && wait_for "$Y/$impl-at" "FILE $zn"; then ok "$impl watch goes on after the hand-handled PING"; else bad "$impl watch goes on after the hand-handled PING"; fi
+  apid=; read -r apid _ < "$Y/nodes/t/arm.pid" || true
+  if [ "$apid" = "$pt" ]; then ok "$impl arm.pid still names the running watch"; else bad "$impl arm.pid still names the running watch ($apid vs $pt)"; fi
+  kill -9 "$pt" 2>/dev/null || true
+  wait "$pt" 2>/dev/null || true
+  pkill -9 -f "$Y/z.diag" 2>/dev/null || true
+  rm -f "$Y"/nodes/*/inbox/*.md
+  sed -e 's/^ACTION: PING$/ACTION: PING\nWHO: <sender name>/' "$Y/y.diag" > "$Y/w.diag"
+  rc=0; $P --timeout 2 "$Y/w.diag" p > "$Y/$impl-wpg" 2>&1 || rc=$?
+  if [ "$rc" != 0 ] && grep -q 'CHANNEL-CONTROL-BODY: the PING message block' "$Y/$impl-wpg" && ! ls "$Y"/nodes/q/inbox/*.md >/dev/null 2>&1; then ok "$impl unfillable PING block fails loudly, nothing sent"; else bad "$impl unfillable PING block fails loudly, nothing sent (rc=$rc)"; fi
+  rm -f "$Y"/nodes/*/inbox/*.md
+done
+unset CHANNEL_LOG_FILE
+
 printf '%s\n' "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

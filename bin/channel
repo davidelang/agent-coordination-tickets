@@ -59,7 +59,9 @@ rename too, so exactly one wins): RETRACTED (exit 0) or DELIVERED (exit 5).
 CHANNEL_SEND_WAIT=0 ends right after SENT with QUEUED PATH (outcome unknown).
 
 PING and PONG (body NONCE: <value>) are built in on every arrow; a PING wakes
-the agent as FILE and the agent answers it. channel-ping always sends; with --all it starts a
+the agent as FILE and the agent answers it. channel-send FILE NODE DEST PING
+[-m 'NONCE: V'] is channel-ping to DEST only (waits for the PONG, prints PONG or TIMEOUT);
+a PONG is sent only to answer a PING from DEST still in NODE's inbox or claimed/. channel-ping always sends; with --all it starts a
 check-all: every node reached also checks its own arrows (once per run id,
 and at most once per --every minutes, default 30, env CHANNEL_CHECKALL_EVERY). Events go to syslog, tag agent-channel, as key=value
 (CHANNEL_SYSLOG=0 disables; CHANNEL_LOG_FILE=PATH also appends to a file).
@@ -90,6 +92,10 @@ what=0
 wh_job=0
 flag_mode=
 MSGS=$(mktemp)
+# Set only by cmd_ping for its own PING (in a subshell); never taken from the environment.
+INTERNAL_PING=0
+PING_ONLY=
+PING_NONCE=
 nmsg=0
 ping_all=0
 ping_run=
@@ -661,7 +667,7 @@ ACTEOF
 ping: a PING is an ordinary message. It wakes you as FILE and nothing answers it for you, so your PONG is the proof that you were woken. Answer it at once, before other work:
   $bindir/channel-send $plan $me <FROM> PONG -m 'NONCE: <the PING's NONCE value>'   (plus the lines of the plan's PONG message block, if it has one), then rm the PING. With no arrow back to <FROM>, just rm it.
   If the PING has SCOPE: all and RUN: <id>, then also start $bindir/channel-ping --run <id> $plan $me in the background (see step 3) and report any TIMEOUT line it prints; it does nothing if this node already handled that run or ran a check-all in the last 30 minutes.
-  A PONG for your own channel-ping is taken by the watch and never shown.
+  A PONG for your own channel-ping is taken by the watch and never shown. To check a link yourself, run channel-ping (see tools); channel-send ... DEST PING is the same check for that one DEST (it sends the PING, waits for the PONG and prints PONG or TIMEOUT), so start either in the background (see step 3). channel-send refuses a PONG that does not answer a PING from DEST still in your inbox, so send the PONG before you rm the PING.
 start: before new messages, look in $inbox/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.
 read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.
   Handle the oldest FILE first, one file at a time. You may move it into $inbox/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.
@@ -855,6 +861,38 @@ read_head() {
     !body && /^FROM: / { f = substr($0, 7) }
     body && /^[ \t]*NONCE:/ && n == "" { n = $0; sub(/^[ \t]*NONCE:[ \t]*/, "", n); sub(/[ \t]+$/, "", n) }
     END { printf "%s\t%s\t%s\n", v, f, n }' "$1" 2>/dev/null
+}
+
+# control_gate ME DEST VERB BODYFILE: channel-send ME DEST PING is channel-ping limited to DEST
+# (same code; it does not return), and a PONG is sent only as the answer to a PING from DEST
+# with that NONCE still in ME's inbox or claimed/.
+control_gate() {
+  gping="$bindir/channel-ping $PLAN $1"
+  case "$3" in
+    PING)
+      [ "$INTERNAL_PING" = 1 ] && return 0
+      gnonce=$(awk '/^[ \t]*NONCE:[ \t]*[^ \t]/ { n = $0; sub(/^[ \t]*NONCE:[ \t]*/, "", n); sub(/[ \t]+$/, "", n); print n; exit }' "$4")
+      gwant=$(control_body PING "NONCE=${gnonce:-x}" 2>&1) || die "$gwant"
+      gbad=$(printf '%s\n' "$gwant" | awk 'NR==FNR { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); ok[$0]=1; next }
+        { l=$0; sub(/^[ \t]+/, "", l); sub(/[ \t]+$/, "", l) } l != "" && !(l in ok) && l !~ /^NONCE:/ { print l; exit }' - "$4")
+      [ -z "$gbad" ] || die "CHANNEL-SEND-PING: a PING body may only hold NONCE: <value> and lines of the plan's PING block (channel-send PING runs channel-ping to $2); not: $gbad"
+      PING_ONLY=$2 PING_NONCE=$gnonce
+      gplan=$PLAN
+      cmd_ping "$gplan" "$1"
+      exit 0 ;;
+    PONG) ;;
+    *) return 0 ;;
+  esac
+  gnonce=$(awk '/^[ \t]*NONCE:[ \t]*[^ \t]/ { n = $0; sub(/^[ \t]*NONCE:[ \t]*/, "", n); sub(/[ \t]+$/, "", n); print n; exit }' "$4")
+  [ -n "$gnonce" ] || die "CHANNEL-SEND-PONG: a PONG body needs NONCE: <the NONCE of the PING you answer>"
+  ginbox=$(node_path "$1")
+  for gp in "$ginbox"/*.md "$ginbox"/claimed/*.md; do
+    [ -f "$gp" ] || continue
+    printf '%s\n' "$(basename "$gp")" | grep -Eq '^[0-9]{8}-[0-9]{6}\.[0-9]{3}__.+__[0-9]+\.md$' || continue
+    gh=$(read_head "$gp") || continue
+    [ "$(printf '%s' "$gh" | cut -f1)" = PING ] && [ "$(printf '%s' "$gh" | cut -f2)" = "$2" ] && [ "$(printf '%s' "$gh" | cut -f3)" = "$gnonce" ] && return 0
+  done
+  die "CHANNEL-SEND-PONG: no PING from $2 with NONCE $gnonce in $ginbox (or claimed/). A PONG only answers a PING you were shown (send it before you rm the PING). To check the link yourself run $gping."
 }
 
 has_edge() {
@@ -1220,6 +1258,7 @@ cmd_send() {
   done
   [ "$ok" -eq 1 ] || die "verb $verb is not allowed on $me -> $recipient"
   [ -f "$body" ] || die "no body file $body"
+  control_gate "$me" "$recipient" "$verb" "$body"
   if [ "$control" -eq 1 ] && ! awk '{ sub(/^[ \t]+/, "") } /^NONCE:[ \t]*[^ \t]/ { f=1 } END { exit !f }' "$body"; then
     control_wait=1
   else
@@ -1498,13 +1537,14 @@ cmd_ping() {
   fi
   probes=$(mktemp)
   for dest in $(awk -F '\t' -v s="$me" '$1=="E" && $2==s { print $3 }' "$PARSE"); do
-    nonce=$me-$dest-$(date +%Y%m%d-%H%M%S)-$$
+    [ -z "$PING_ONLY" ] || [ "$dest" = "$PING_ONLY" ] || continue
+    nonce=${PING_NONCE:-$me-$dest-$(date +%Y%m%d-%H%M%S)-$$}
     if [ "$ping_all" -eq 1 ]; then
       pbody=$(control_body PING "NONCE=$nonce" "SCOPE=all" "RUN=$run" 2>&1) || { log_event ping result fail from "$me" to "$dest" run "$run" why "$pbody"; die "$pbody"; }
     else
       pbody=$(control_body PING "NONCE=$nonce" 2>&1) || { log_event ping result fail from "$me" to "$dest" why "$pbody"; die "$pbody"; }
     fi
-    sent=$("$bindir/channel-send" "$PLAN" "$me" "$dest" PING -m "$pbody" | awk '/^SENT / { print substr($0, 6) }')
+    sent=$( (INTERNAL_PING=1 nmsg=1; printf '%s\n' "$pbody" > "$MSGS" && cmd_send "$PLAN" "$me" "$dest" PING) | awk '/^SENT / { print substr($0, 6) }')
     two=0
     has_edge "$dest" "$me" && two=1
     printf '%s\t%s\t%s\t%s\n' "$dest" "$nonce" "$sent" "$two" >> "$probes"

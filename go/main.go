@@ -181,7 +181,9 @@ rename too, so exactly one wins): RETRACTED (exit 0) or DELIVERED (exit 5).
 CHANNEL_SEND_WAIT=0 ends right after SENT with QUEUED PATH (outcome unknown).
 
 PING and PONG (body NONCE: <value>) are built in on every arrow; a PING wakes
-the agent as FILE and the agent answers it. channel-ping always sends; with --all it starts a
+the agent as FILE and the agent answers it. channel-send FILE NODE DEST PING
+[-m 'NONCE: V'] is channel-ping to DEST only (waits for the PONG, prints PONG or TIMEOUT);
+a PONG is sent only to answer a PING from DEST still in NODE's inbox or claimed/. channel-ping always sends; with --all it starts a
 check-all: every node reached also checks its own arrows (once per run id,
 and at most once per --every minutes, default 30, env CHANNEL_CHECKALL_EVERY). Events go to syslog, tag agent-channel, as key=value
 (CHANNEL_SYSLOG=0 disables; CHANNEL_LOG_FILE=PATH also appends to a file).
@@ -965,7 +967,7 @@ var actTail = []string{
 	"ping: a PING is an ordinary message. It wakes you as FILE and nothing answers it for you, so your PONG is the proof that you were woken. Answer it at once, before other work:",
 	"  {BIN}/channel-send {PLAN} {NODE} <FROM> PONG -m 'NONCE: <the PING's NONCE value>'   (plus the lines of the plan's PONG message block, if it has one), then rm the PING. With no arrow back to <FROM>, just rm it.",
 	"  If the PING has SCOPE: all and RUN: <id>, then also start {BIN}/channel-ping --run <id> {PLAN} {NODE} in the background (see step 3) and report any TIMEOUT line it prints; it does nothing if this node already handled that run or ran a check-all in the last 30 minutes.",
-	"  A PONG for your own channel-ping is taken by the watch and never shown.",
+	"  A PONG for your own channel-ping is taken by the watch and never shown. To check a link yourself, run channel-ping (see tools); channel-send ... DEST PING is the same check for that one DEST (it sends the PING, waits for the PONG and prints PONG or TIMEOUT), so start either in the background (see step 3). channel-send refuses a PONG that does not answer a PING from DEST still in your inbox, so send the PONG before you rm the PING.",
 	"start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.",
 	"read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.",
 	"  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.",
@@ -1411,6 +1413,11 @@ func senderOf(name string) string {
 func cmdSend(path, me, recipient, verb string, bodyText []byte, refs []string) {
 	p := loadPlan(path)
 	requireMe(me, p)
+	if verb == "PING" {
+		sendPing(p, path, me, recipient, string(bodyText))
+		return
+	}
+	controlGate(p, me, recipient, verb, string(bodyText))
 	control := isControl(verb) && hasNonce(string(bodyText))
 	wait := os.Getenv("CHANNEL_SEND_WAIT")
 	if wait != "" && wait != "0" && wait != "1" {
@@ -1592,6 +1599,34 @@ func cmdRetract(path, me, msg string) {
 }
 
 func isControl(verb string) bool { return verb == "PING" || verb == "PONG" }
+
+var bodyNonceRE = regexp.MustCompile(`(?m)^[ \t]*NONCE:[ \t]*(\S.*?)[ \t]*$`)
+
+// controlGate: channel-send sends a PONG only as the answer to a PING from DEST with that NONCE
+// that is still in this node's inbox or claimed/ (the agent replies, then removes the PING).
+func controlGate(p plan, me, recipient, verb, body string) {
+	bin := filepath.Dir(os.Args[0])
+	if abs, err := filepath.Abs(bin); err == nil {
+		bin = abs
+	}
+	ping := filepath.Join(bin, "channel-ping") + " " + p.path + " " + me
+	switch verb {
+	case "PONG":
+		m := bodyNonceRE.FindStringSubmatch(body)
+		if m == nil {
+			die("CHANNEL-SEND-PONG: a PONG body needs NONCE: <the NONCE of the PING you answer>")
+		}
+		inbox := p.nodes[me]
+		for _, dir := range []string{inbox, filepath.Join(inbox, "claimed")} {
+			for _, name := range messageNames(dir) {
+				if v, from, n := readHead(filepath.Join(dir, name)); v == "PING" && from == recipient && n == m[1] {
+					return
+				}
+			}
+		}
+		die("CHANNEL-SEND-PONG: no PING from " + recipient + " with NONCE " + m[1] + " in " + inbox + " (or claimed/). A PONG only answers a PING you were shown (send it before you rm the PING). To check the link yourself run " + ping + ".")
+	}
+}
 
 // A PING or PONG is a control message (never waits, handled by channel-arm) only when its body has a NONCE line.
 func hasNonce(body string) bool {
@@ -1931,6 +1966,8 @@ var (
 	armActive   bool
 	pingAll     bool
 	pingRun     string
+	pingOnly    string // channel-send ... DEST PING: probe only DEST
+	pingNonce   string // and with this NONCE, when the body gave one
 	checkEvery  = envInt("CHANNEL_CHECKALL_EVERY", 30)
 	safeRun     = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 	pingTimeout = envInt("CHANNEL_PING_TIMEOUT", 300)
@@ -2062,6 +2099,40 @@ func hasEdge(p plan, src, dst string) bool {
 	return false
 }
 
+// sendPing: channel-send FILE ME DEST PING is channel-ping limited to DEST (same code): the body
+// may be empty or give NONCE: <value> and lines of the plan's PING block; it sends the PING,
+// waits for the PONG (CHANNEL_PING_TIMEOUT / --timeout, default 300s) and prints PONG, CONSUMED
+// or TIMEOUT (exit 1).
+func sendPing(p plan, path, me, recipient, body string) {
+	if !hasEdge(p, me, recipient) {
+		die(me + " is not allowed to send to " + recipient)
+	}
+	nonce := ""
+	if m := bodyNonceRE.FindStringSubmatch(body); m != nil {
+		nonce = m[1]
+	}
+	probe := nonce
+	if probe == "" {
+		probe = "x"
+	}
+	var want string
+	if failure := tryDo(func() { want = controlBody(p, "PING", []string{"NONCE"}, map[string]string{"NONCE": probe}) }); failure != "" {
+		die(failure)
+	}
+	allowed := map[string]bool{}
+	for _, l := range strings.Split(want, "\n") {
+		allowed[strings.TrimSpace(l)] = true
+	}
+	for _, l := range strings.Split(body, "\n") {
+		l = strings.TrimSpace(l)
+		if l != "" && !allowed[l] && !strings.HasPrefix(l, "NONCE:") {
+			die("CHANNEL-SEND-PING: a PING body may only hold NONCE: <value> and lines of the plan's PING block (channel-send PING runs channel-ping to " + recipient + "); not: " + l)
+		}
+	}
+	pingOnly, pingNonce = recipient, nonce
+	cmdPing(path, me)
+}
+
 func cmdPing(path, me string) {
 	p := loadPlan(path)
 	requireMe(me, p)
@@ -2086,10 +2157,13 @@ func cmdPing(path, me string) {
 	var probes []*probe
 	start := time.Now()
 	for _, e := range p.edges {
-		if e.src != me {
+		if e.src != me || (pingOnly != "" && e.dst != pingOnly) {
 			continue
 		}
 		nonce := fmt.Sprintf("%s-%s-%s-%d", me, e.dst, start.Format("20060102-150405"), os.Getpid())
+		if pingNonce != "" {
+			nonce = pingNonce
+		}
 		pr := &probe{dest: e.dst, nonce: nonce, twoWay: hasEdge(p, e.dst, me)}
 		keys, fields := []string{"NONCE"}, map[string]string{"NONCE": nonce}
 		if pingAll {

@@ -576,7 +576,7 @@ ACT_TAIL = [
     'ping: a PING is an ordinary message. It wakes you as FILE and nothing answers it for you, so your PONG is the proof that you were woken. Answer it at once, before other work:',
     "  {BIN}/channel-send {PLAN} {NODE} <FROM> PONG -m 'NONCE: <the PING's NONCE value>'   (plus the lines of the plan's PONG message block, if it has one), then rm the PING. With no arrow back to <FROM>, just rm it.",
     '  If the PING has SCOPE: all and RUN: <id>, then also start {BIN}/channel-ping --run <id> {PLAN} {NODE} in the background (see step 3) and report any TIMEOUT line it prints; it does nothing if this node already handled that run or ran a check-all in the last 30 minutes.',
-    '  A PONG for your own channel-ping is taken by the watch and never shown.',
+    '  A PONG for your own channel-ping is taken by the watch and never shown. To check a link yourself, run channel-ping (see tools); channel-send ... DEST PING is the same check for that one DEST (it sends the PING, waits for the PONG and prints PONG or TIMEOUT), so start either in the background (see step 3). channel-send refuses a PONG that does not answer a PING from DEST still in your inbox, so send the PONG before you rm the PING.',
     'start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.',
     'read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.',
     '  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.',
@@ -923,6 +923,26 @@ def check_body(verb, template, text):
 CONTROL = ("PING", "PONG")
 
 
+def control_gate(loaded, me, recipient, verb, body_text):
+    """channel-send sends a PONG only as the answer to a PING from DEST with that NONCE still in
+    ME's inbox or claimed/ (the agent replies, then removes the PING)."""
+    ping = f"{os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'channel-ping')} {loaded[0]} {me}"
+    if verb != "PONG":
+        return
+    m = re.search(r"^[ \t]*NONCE:[ \t]*(\S.*?)[ \t]*$", body_text, re.M)
+    if not m:
+        die("CHANNEL-SEND-PONG: a PONG body needs NONCE: <the NONCE of the PING you answer>")
+    inbox = Path(loaded[1][me])
+    for d in (inbox, inbox / "claimed"):
+        for entry in message_names(d):
+            v, sender, nonce = read_head(entry)
+            if v == "PING" and sender == recipient and nonce == m.group(1):
+                return
+    die(f"CHANNEL-SEND-PONG: no PING from {recipient} with NONCE {m.group(1)} in {inbox} (or claimed/). "
+        f"A PONG only answers a PING you were shown (send it before you rm the PING). "
+        f"To check the link yourself run {ping}.")
+
+
 SIGNAL_NAMES = {signal.SIGINT: "interrupt", signal.SIGTERM: "terminated", signal.SIGHUP: "hangup"}
 
 
@@ -932,6 +952,10 @@ def cmd_send(plan_path, me, recipient, verb, body_text, refs):
     CHANNEL_SEND_WAIT=0 skips the wait and ends with QUEUED (the outcome is then unknown)."""
     loaded = load_plan(plan_path)
     require_me(me, loaded[1], loaded[0])
+    if verb == "PING":
+        send_ping(loaded, plan_path, me, recipient, body_text)
+        return None
+    control_gate(loaded, me, recipient, verb, body_text)
     control = verb in CONTROL and re.search(r"^[ \t]*NONCE:[ \t]*\S", body_text, re.M)
     wait = os.environ.get("CHANNEL_SEND_WAIT", "")
     if wait not in ("", "0", "1"):
@@ -1290,6 +1314,31 @@ def body_field(path, key):
     return ""
 
 
+PING_ONLY = {"dest": "", "nonce": ""}
+
+
+def send_ping(loaded, plan_path, me, recipient, body_text):
+    """channel-send FILE ME DEST PING is channel-ping limited to DEST (same code): the body may be
+    empty or give NONCE: <value> and lines of the plan's PING block; it sends the PING, waits for
+    the PONG and prints PONG, CONSUMED or TIMEOUT (exit 1)."""
+    if edge_between(loaded[4], me, recipient) is None:
+        die(f"{me} is not allowed to send to {recipient}")
+    m = re.search(r"^[ \t]*NONCE:[ \t]*(\S.*?)[ \t]*$", body_text, re.M)
+    nonce = m.group(1) if m else ""
+    want = []
+    failure = try_do(lambda: want.append(control_body(loaded, "PING", ["NONCE"], {"NONCE": nonce or "x"})))
+    if failure:
+        die(failure)
+    allowed = {line.strip() for line in want[0].splitlines()}
+    for line in body_text.splitlines():
+        line = line.strip()
+        if line and line not in allowed and not line.startswith("NONCE:"):
+            die(f"CHANNEL-SEND-PING: a PING body may only hold NONCE: <value> and lines of the plan's PING block "
+                f"(channel-send PING runs channel-ping to {recipient}); not: {line}")
+    PING_ONLY.update(dest=recipient, nonce=nonce)
+    cmd_ping(plan_path, me)
+
+
 def cmd_ping(plan_path, me):
     loaded = load_plan(plan_path)
     plan_file, nodes, _verbs, _messages, edges = loaded
@@ -1307,9 +1356,9 @@ def cmd_ping(plan_path, me):
     start = time.time()
     probes = []
     for src, dst, _mode, _label in edges:
-        if src != me:
+        if src != me or (PING_ONLY["dest"] and dst != PING_ONLY["dest"]):
             continue
-        nonce = f"{me}-{dst}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+        nonce = PING_ONLY["nonce"] or f"{me}-{dst}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
         keys, fields = ["NONCE"], {"NONCE": nonce}
         if OPTS["all"]:
             keys += ["SCOPE", "RUN"]

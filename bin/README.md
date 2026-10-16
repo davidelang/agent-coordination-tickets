@@ -8,11 +8,18 @@ Each command takes the plan file and a bare node name. Options follow the `getop
 |---|---|
 | `channel-setup FILE NODE [-n\|--dry-run] [--whatineedtoknow]` | Once per node, by a human. Creates that node's inbox and a `refs/` directory next to the plan file, all mode 2775 (setgid, group-writable, no sticky bit). Safe to rerun: on an existing node it prints `node NODE inbox PATH existing`, exits 0, and changes nothing, so a skill can call it whenever the inbox is missing. `-n` checks the plan, prints the directed edges, and creates nothing. |
 | `channel-arm FILE NODE [--whatineedtoknow]` | The receiver leaves this running. It prints `READY`, then `FILE <path>` for the oldest message in that inbox. When that file is removed, it prints the new oldest. It does not print a newer file while an older one is still there. |
-| `channel-send FILE NODE DEST VERB [BODYFILE\|-\|-m TEXT ...] [REF ...] [--whatineedtoknow]` | The sender. The body comes from BODYFILE, from stdin (`-` or no body argument), or from `-m TEXT` (repeatable like git; each `-m` is one block of lines, blocks joined by a blank line; with `-m`, every positional after VERB is a REF). A message may carry several REF files. Checks `VERB` is allowed on that arrow and that the body matches the message block. Copies refs into `refs/`, then renames the message into the destination inbox. On a `->` arrow it waits until this sender's previous file there is removed. The destination inbox has to exist already. |
+| `channel-send FILE NODE DEST VERB [BODYFILE\|-\|-m TEXT ...] [REF ...] [--timeout SEC] [--whatineedtoknow]`<br>`channel-send FILE NODE --retract MESSAGE` | The sender. The body comes from BODYFILE, from stdin (`-` or no body argument), or from `-m TEXT` (repeatable like git; each `-m` is one block of lines, blocks joined by a blank line; with `-m`, every positional after VERB is a REF). A message may carry several REF files. Checks `VERB` is allowed on that arrow and that the body matches the message block. Copies refs into `refs/`, then renames the message into the destination inbox. On a `->` arrow it waits until this sender's previous file there is removed. The destination inbox has to exist already. Then (except PING/PONG) it waits for the outcome of this message; see Delivery outcome. `--retract` takes a sent message back. |
 | `channel-ping FILE NODE [--all [--every MIN]] [--run ID] [--timeout SEC]` | Connectivity test. Sends a built-in PING on every arrow out of NODE. For a two-way link it waits for the PONG; for a one-way link it waits until the PING is removed (consumed). Prints `PONG DEST 0.2s`, `CONSUMED DEST 0.2s`, or `TIMEOUT DEST (...)` (exit 1). An explicit ping is never rate-limited. `--all` starts a check-all run that spreads over every link (see [Check-all](#check-all-links)); `--run ID` is how a receiving node joins a run. `--timeout` defaults to 300s (env `CHANNEL_PING_TIMEOUT`). |
 | `channel-status FILE` | One line per node: `node NAME INBOX messages N [oldest AGEs] claimed M`, then `  claimed FILE AGEs [owner=...]` for each claimed file. An inbox it cannot read prints `no permission` (or `missing`). |
 
 `--whatineedtoknow` starts with a "how to act" header filled in for that node: the absolute plan and inbox paths, the exact `channel-arm` watch and `channel-send` commands (the running binary's siblings), what goes in the body file, handling the oldest file first, and removing a file from the inbox when done. Then it prints the nodes this one talks to and the `message` blocks on those arrows, and exits. A bot needs nothing beyond that output. It does not create directories, send, or watch. Run it on `channel-arm` after a start or a compact. The flag is on all three so the dump is not a fourth command.
+
+The header is the agent's whole instruction set and is written for one agent tool, named by `CHANNEL_AGENT` (the launcher sets it; there is no other signal and no guessing):
+
+- `grok`: start `channel-arm PLAN NODE` with the monitor tool (`persistent: true`).
+- `cursor`: run `.cursor/lib/cursor-channel-watch PLAN NODE` (must exist under the current directory, the repo root) as a background shell that wakes on `^FILE `.
+
+Unset or any other value: `--whatineedtoknow` prints `CHANNEL-AGENT-UNKNOWN: ...` on stderr, nothing on stdout, and exits 1. The header also lists the node's duties (verbs it may send and receive on each arrow), says to answer PING itself, to keep its current work, that a fresh session needs an explicit `/channel`, that a message never authorizes push or deploy, how to report BLOCKED, and to run `->` sends in the background so two waiting senders cannot deadlock.
 
 The receiver removes a finished message with `rm` of that one path. There is no `channel-finish`.
 
@@ -24,11 +31,25 @@ There is no claim step and no cursor. The file stays in the inbox until the rece
 
 Every arrow carries PING and PONG without a `verb` or `message` line. The body is `NONCE: <value>`; PONG echoes the PING's nonce. A PING or PONG with a NONCE line never waits on a `->` arrow.
 
-`channel-arm` handles them transparently: on a PING it sends PONG back (when the reverse arrow exists) and removes the PING; on a PONG it moves the file to `nodes/NODE/pong-NONCE` for `channel-ping` to collect. Neither is ever printed as `FILE`, so a watched agent is not woken. A node with no watch (for example a webhook-woken bot) sees the PING as a normal file and answers it by hand, as its `--whatineedtoknow` header says. A diag may still define PING/PONG blocks (see the commented example in `example/comms.diag`); a PING without a NONCE line is treated as an ordinary message.
+## Delivery outcome and retract
 
-When the diag defines a PING or PONG block, every body the tools build themselves (the PING from `channel-ping`, the PONG from `channel-arm`, the check-all `SCOPE`/`RUN` lines) follows that block: literal lines such as `ACTION: PONG` are copied, and each `KEY: <...>` line is filled by its key. The tools fill only `NONCE`, `SCOPE`, and `RUN`; keys the block does not mention are added as extra lines (extra lines are allowed). Any other `<...>` line in the block is an error that starts with `CHANNEL-CONTROL-BODY:` and names the line. Without a block the body is just those `KEY: value` lines.
+The sender always learns what happened to its message. After `SENT PATH`, every send except PING/PONG waits until the file leaves DEST's inbox and ends with exactly one line, also written to `nodes/SENDER/outcome/<message file name>` and logged as `event=outcome`:
 
-If `channel-arm` cannot send its automatic PONG (for example `CHANNEL-CONTROL-BODY`, or a missing inbox), it does not exit and does not drop the PING. It prints `CHANNEL-AUTO-REPLY-FAILED: ...` on stderr once, logs `event=auto-reply result=fail` at warning, leaves the PING in the inbox, and shows it as an ordinary `FILE <path>`; the agent answers it by hand (the header says how) and removes it. `channel-ping` with a block it cannot fill fails before sending anything and logs `event=ping result=fail`.
+| Line | Exit | Meaning |
+|---|---|---|
+| `DELIVERED PATH` | 0 | DEST took it (moved it to `claimed/` or removed it). |
+| `RETRACTED PATH -> nodes/SENDER/retracted/FILE (why)` | 4 | Taken back before DEST took it; DEST never got it. `why` is `not taken within Ns` (`--timeout`), `stopped by interrupt\|terminated\|hangup` (a signal), or `by --retract`. |
+| `ABORTED DEST VERB (not sent: ...)` | 4 | Stopped while still waiting on a `->` arrow; the message never reached DEST's inbox. |
+
+`channel-send FILE NODE --retract MESSAGE` (MESSAGE = the `SENT` path, or just its file name) renames the file from DEST's inbox into `nodes/SENDER/retracted/`. DEST's claim is also a single rename (or unlink), so exactly one of them wins: `RETRACTED ...` (exit 0) means DEST never got it; `DELIVERED PATH` (exit 5) means DEST took it first; a repeated retract prints `(already retracted)` (exit 0). A path outside the inboxes of SENDER's arrows, or a file SENDER never sent, fails. Stopping a waiting send (signal) uses the same retract. `CHANNEL_SEND_WAIT=0` skips the wait and ends with `QUEUED PATH` (outcome unknown; for scripts only).
+
+Run a send in the background (agents: as `--whatineedtoknow` says for the tool) and keep handling the inbox; on `->` arrows two nodes that wait on each other otherwise deadlock.
+
+A PING is an ordinary message: `channel-arm` shows it as `FILE` and nothing answers it for the agent. The agent replies PONG with `channel-send` (echoing the NONCE) and removes the PING, so a PONG proves that agent was woken and acted; on a one-way arrow, removing the PING is the proof. A PONG is not shown: `channel-arm` moves it to `nodes/NODE/pong-NONCE` for `channel-ping` to collect (with no watch, `channel-ping` takes it from the inbox itself). A diag may still define PING/PONG blocks (see the commented example in `example/comms.diag`); a PING without a NONCE line is treated as an ordinary message.
+
+When the diag defines a PING or PONG block, every body the tools build themselves (the PING from `channel-ping`, with its check-all `SCOPE`/`RUN` lines) follows that block: literal lines such as `ACTION: PONG` are copied, and each `KEY: <...>` line is filled by its key. The tools fill only `NONCE`, `SCOPE`, and `RUN`; keys the block does not mention are added as extra lines (extra lines are allowed). Any other `<...>` line in the block is an error that starts with `CHANNEL-CONTROL-BODY:` and names the line. Without a block the body is just those `KEY: value` lines.
+
+The agent's PONG is checked against the PONG block like any send. `channel-ping` with a block it cannot fill fails before sending anything and logs `event=ping result=fail`. When no PONG arrives, `channel-ping` prints `TIMEOUT DEST (no PONG after Ns: the DEST agent was not woken or did not answer)` (one-way: `PING not removed after Ns: ... did not handle it`) and exits 1.
 
 ## Check-all (links)
 
@@ -40,7 +61,7 @@ SCOPE: all
 RUN: <run id>
 ```
 
-A node that receives such a PING answers PONG as usual and then runs `channel-ping --run RUN FILE NODE`, which pings its own outgoing arrows with the same RUN. `channel-arm` does this transparently (detached, so the watch keeps going). A node without a watch (a webhook-woken bot) runs that command by hand; its `--whatineedtoknow` header says so.
+A node that receives such a PING answers PONG as usual and then starts `channel-ping --run RUN FILE NODE` in the background, which pings its own outgoing arrows with the same RUN. The agent does this (its `--whatineedtoknow` header says so); the watch never does.
 
 Propagation is what could loop, so `channel-ping --run` (never a plain ping) stops early, printing `SKIP`, in two cases:
 
@@ -62,7 +83,6 @@ event=send plan=/p/x.diag from=planner to=coder verb=IMPLEMENT seq=12 refs=2 fil
 event=deliver node=coder file=...            event=consumed node=coder file=...
 event=webhook result=ok|fail|retrying to=review from=planner verb=REVIEW attempts=2 [error="..."] file=...
 event=ping result=ok|timeout from=planner to=lab kind=pong|consumed seconds=0.4s [run=RUN]
-event=auto-reply result=fail node=lab from=planner nonce=N why="..." file=...
 event=checkall result=start|skip|fail node=lab run=RUN [why="run already handled"|"rate limit"]
 ```
 

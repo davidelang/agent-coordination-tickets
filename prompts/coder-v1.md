@@ -1,5 +1,7 @@
 # Coder role v1
 
+Replaced by v2 (2026-10-15): the `--whatineedtoknow` header is the whole instruction set for Grok Build and Cursor agents (see [README.md](README.md)); kept so a running agent can be pointed at v1.
+
 Version: v1
 Date: 2026-10-06
 

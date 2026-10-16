@@ -24,7 +24,7 @@ Give only the key; the tool sends `Authorization: Bearer <key>` (a leading `Bear
 
 ## Built-in PING and PONG
 
-PING and PONG are allowed on every arrow without a verb line or message block (body `NONCE: <value>`). `channel-ping` uses them and `channel-arm` answers them; a PING with `SCOPE: all` and `RUN: <id>` lines is a check-all (`channel-ping --all`) and the receiver passes it on. If the plan defines PING or PONG blocks, the bodies the tools build follow them (literal lines copied; only `NONCE`, `SCOPE`, `RUN` placeholders can be filled, anything else is a `CHANNEL-CONTROL-BODY` error). A PONG that `channel-arm` cannot send is reported as `CHANNEL-AUTO-REPLY-FAILED` and the PING is shown as an ordinary `FILE`. A plan may still spell them out; the commented block in `example/comms.diag` shows the shape.
+PING and PONG are allowed on every arrow without a verb line or message block (body `NONCE: <value>`). `channel-ping` sends PING and the receiving agent answers PONG itself (the watch only shows the PING as FILE); a PING with `SCOPE: all` and `RUN: <id>` lines is a check-all (`channel-ping --all`) and the receiver passes it on. If the plan defines PING or PONG blocks, the bodies the tools build follow them (literal lines copied; only `NONCE`, `SCOPE`, `RUN` placeholders can be filled, anything else is a `CHANNEL-CONTROL-BODY` error). A PONG that `channel-arm` cannot send is reported as `CHANNEL-AUTO-REPLY-FAILED` and the PING is shown as an ordinary `FILE`. A plan may still spell them out; the commented block in `example/comms.diag` shows the shape.
 
 ## verb
 

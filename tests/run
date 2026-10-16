@@ -4,6 +4,9 @@
 # Run from anywhere: tests/run
 set -eu
 export LC_ALL=C
+export CHANNEL_AGENT=grok
+# Sends end with QUEUED unless a test asks for the delivery outcome (CHANNEL_SEND_WAIT=1).
+export CHANNEL_SEND_WAIT=0
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 SH=$ROOT/bin/channel
@@ -35,7 +38,7 @@ bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1" >&2; }
 
 # The how-to-act header names the running binary's directory, which differs
 # between the shell, Python, and Go builds; compare it as a bare command name.
-norm_bin() { sed -E 's#[^ ]*/(channel-(arm|send|ping|status)) #\1 #g' "$1"; }
+norm_bin() { sed -E 's#[^ ]*/(channel-(setup|arm|send|ping|status)) #\1 #g' "$1"; }
 
 same() {
   norm_bin "$2" > "$2.norm"
@@ -229,6 +232,25 @@ expect_rc "what exits" 0 "$TMP/sh-w.rc"
 capture "$TMP/sh-same" "$TMP/sh-same.err" "$TMP/sh-same.rc" "$ROOT/bin/channel-arm" --arm "$EX" coder --whatineedtoknow
 same "named command plus its own flag" "$TMP/py-w" "$TMP/sh-same"
 
+# The agent tool comes only from CHANNEL_AGENT (set by the run-* launchers); no guessing.
+if grep -qx 'you are node coder (agent: grok)' "$TMP/sh-w" && grep -q 'with the monitor tool, persistent: true' "$TMP/sh-w" && ! grep -q 'cursor-channel-watch' "$TMP/sh-w"; then ok "grok header names the monitor watch"; else bad "grok header names the monitor watch"; fi
+if grep -q '^  receive from planner (wait): ' "$TMP/sh-w" && grep -q '^  send to planner ' "$TMP/sh-w"; then ok "header lists duties per direction"; else bad "header lists duties per direction: $(grep -A4 '^duties' "$TMP/sh-w")"; fi
+for impl in sh go py; do
+  case $impl in sh) W="$SH --arm" ;; go) W="$GO --arm" ;; py) W="python3 $PY arm" ;; esac
+  capture "$TMP/$impl-nag" "$TMP/$impl-nag.err" "$TMP/$impl-nag.rc" env -u CHANNEL_AGENT $W "$EX" coder --whatineedtoknow
+  if [ "$(cat "$TMP/$impl-nag.rc")" = 1 ] && [ ! -s "$TMP/$impl-nag" ] && grep -q 'CHANNEL-AGENT-UNKNOWN: CHANNEL_AGENT is unset' "$TMP/$impl-nag.err"; then ok "$impl no CHANNEL_AGENT fails loudly"; else bad "$impl no CHANNEL_AGENT fails loudly"; fi
+  capture "$TMP/$impl-bag" "$TMP/$impl-bag.err" "$TMP/$impl-bag.rc" env CHANNEL_AGENT=claude $W "$EX" coder --whatineedtoknow
+  if [ "$(cat "$TMP/$impl-bag.rc")" = 1 ] && [ ! -s "$TMP/$impl-bag" ] && grep -q 'CHANNEL-AGENT-UNKNOWN: CHANNEL_AGENT is "claude"' "$TMP/$impl-bag.err"; then ok "$impl unknown CHANNEL_AGENT fails loudly"; else bad "$impl unknown CHANNEL_AGENT fails loudly"; fi
+  mkdir -p "$TMP/cur-none"
+  capture "$TMP/$impl-cnw" "$TMP/$impl-cnw.err" "$TMP/$impl-cnw.rc" sh -c 'cd "$1" && shift && CHANNEL_AGENT=cursor exec "$@"' sh "$TMP/cur-none" $W "$EX" coder --whatineedtoknow
+  if [ "$(cat "$TMP/$impl-cnw.rc")" = 1 ] && [ ! -s "$TMP/$impl-cnw" ] && grep -q 'CHANNEL-AGENT: CHANNEL_AGENT=cursor needs the watch wrapper' "$TMP/$impl-cnw.err"; then ok "$impl cursor without its watch wrapper fails loudly"; else bad "$impl cursor without its watch wrapper fails loudly"; fi
+  mkdir -p "$TMP/cur/.cursor/lib" && printf '#!/bin/sh\n' > "$TMP/cur/.cursor/lib/cursor-channel-watch" && chmod +x "$TMP/cur/.cursor/lib/cursor-channel-watch"
+  capture "$TMP/$impl-cur" "$TMP/$impl-cur.err" "$TMP/$impl-cur.rc" sh -c 'cd "$1" && shift && CHANNEL_AGENT=cursor exec "$@"' sh "$TMP/cur" $W "$EX" coder --whatineedtoknow
+done
+if grep -qx 'you are node coder (agent: cursor)' "$TMP/sh-cur" && grep -qF "Run exactly $TMP/cur/.cursor/lib/cursor-channel-watch " "$TMP/sh-cur" && grep -q 'block_until_ms: 0' "$TMP/sh-cur" && ! grep -q 'monitor tool' "$TMP/sh-cur"; then ok "cursor header names the wrapper watch"; else bad "cursor header names the wrapper watch"; fi
+same "cursor header shell/go" "$TMP/sh-cur" "$TMP/go-cur"
+same "cursor header shell/py" "$TMP/sh-cur" "$TMP/py-cur"
+
 # options after positionals, including when POSIXLY_CORRECT is set in the environment
 capture "$TMP/sh-pos" "$TMP/sh-pos.err" "$TMP/sh-pos.rc" env POSIXLY_CORRECT=1 "$ROOT/bin/channel-setup" "$EX" planner --dry-run
 same "option after positionals" "$TMP/py-n" "$TMP/sh-pos"
@@ -321,7 +343,7 @@ if [ ! -d "$PIN" ]; then ok "what creates nothing"; else bad "what creates nothi
 
 capture "$TMP/sh-pl" "$TMP/sh-pl.err" "$TMP/sh-pl.rc" "$SH" --arm "$PLAN" planner --whatineedtoknow
 capture "$TMP/go-pl" "$TMP/go-pl.err" "$TMP/go-pl.rc" "$GO" --setup "$PLAN" planner --whatineedtoknow
-if grep -F -q auditor "$TMP/sh-pl" || grep -F -q scribe "$TMP/sh-pl"; then
+if grep -Fqw auditor "$TMP/sh-pl" || grep -Fqw scribe "$TMP/sh-pl"; then
   bad "planner what omits unrelated nodes"
 else
   ok "planner what omits unrelated nodes"
@@ -765,6 +787,27 @@ DIAG
   if run --send "$WH/bad.diag" a b GO "$WH/body" 2>&1 | grep -q 'unknown node option bogus'; then ok "$impl unknown option rejected"; else bad "$impl unknown option rejected"; fi
 done
 
+# fake_agent LOG PLAN NODE: what an agent does with its watch. Each FILE wakes it; a PING is
+# answered with PONG through channel-send (nothing answers for it), a check-all PING also
+# starts channel-ping --run in the background, and every file is removed when handled.
+# Uses $ARM, $SEND and $PINGC (command strings of one implementation).
+fake_agent() {
+  $ARM "$2" "$3" 2>"$1.err" | while read -r tag fpath; do
+    [ "$tag" = FILE ] || continue
+    fv=$(sed -n 's/^VERB: //p' "$fpath" | head -1)
+    ff=$(sed -n 's/^FROM: //p' "$fpath" | head -1)
+    fn=$(sed -n '/^---$/,$ s/^NONCE: //p' "$fpath" | head -1)
+    if [ "$fv" = PING ]; then
+      $SEND "$2" "$3" "$ff" PONG -m 'ACTION: PONG' -m "NONCE: $fn" >/dev/null 2>>"$1.err" || true
+      fs=$(sed -n '/^---$/,$ s/^SCOPE: //p' "$fpath" | head -1)
+      fr=$(sed -n '/^---$/,$ s/^RUN: //p' "$fpath" | head -1)
+      if [ "$fs" = all ]; then $PINGC --run "$fr" "$2" "$3" >/dev/null 2>&1 & fi
+    fi
+    echo "HANDLED $fv $ff" >> "$1"
+    rm -f -- "$fpath"
+  done
+}
+
 # --- body sources, built-in PING/PONG, channel-ping, channel-status, lock-free seq, logging ---
 X=$TMP/x
 mkdir -p "$X"
@@ -816,16 +859,29 @@ for impl in go sh py; do
   if kill -0 "$pw" 2>/dev/null; then kill "$pw" 2>/dev/null || true; bad "$impl PING never waits"; else ok "$impl PING never waits"; fi
   wait "$pw" 2>/dev/null || true
   rm -f "$X"/nodes/*/inbox/*.md "$X"/nodes/*/checkall.stamp
+  # a watch alone never answers a PING: it shows it as FILE and leaves it there
+  rm -f "$X"/nodes/*/arm.pid
   timeout 15 $ARM "$X/x.diag" b > "$X/$impl-armb" 2>&1 &
   pb=$!
-  timeout 15 $ARM "$X/x.diag" c > "$X/$impl-armc" 2>&1 &
+  sleep 1
+  rc=0; PG "$X/x.diag" a --timeout 2 > "$X/$impl-noag" 2>&1 || rc=$?
+  if [ "$rc" = 1 ] && grep -q '^TIMEOUT b (no PONG after 2s: the b agent was not woken or did not answer)$' "$X/$impl-noag"; then ok "$impl watch does not answer PING; ping fails loudly"; else bad "$impl watch does not answer PING: $(cat "$X/$impl-noag")"; fi
+  if grep -q '^FILE .*__a__' "$X/$impl-armb" && ls "$X"/nodes/b/inbox/*__a__*.md >/dev/null 2>&1; then ok "$impl PING is delivered as FILE"; else bad "$impl PING is delivered as FILE: $(cat "$X/$impl-armb")"; fi
+  pkill -9 -f "arm $X/x.diag" 2>/dev/null || true
+  kill -9 "$pb" 2>/dev/null || true; wait "$pb" 2>/dev/null || true
+  rm -f "$X"/nodes/*/inbox/*.md "$X"/nodes/*/arm.pid
+  ARM=$ARM; case $impl in go) SEND="$ROOT/go/channel-send"; PINGC="$ROOT/go/channel-ping" ;; sh) SEND="$ROOT/bin/channel-send"; PINGC="$ROOT/bin/channel-ping" ;; py) SEND="python3 $PY send"; PINGC="python3 $PY ping" ;; esac
+  : > "$X/$impl-agb"; : > "$X/$impl-agc"; : > "$X/$impl-aga"
+  fake_agent "$X/$impl-agb" "$X/x.diag" b &
+  pb=$!
+  fake_agent "$X/$impl-agc" "$X/x.diag" c &
   pc=$!
-  timeout 15 $ARM "$X/x.diag" a > "$X/$impl-arma" 2>&1 &
+  fake_agent "$X/$impl-aga" "$X/x.diag" a &
   pa=$!
   sleep 1
   rc=0; PG "$X/x.diag" a --timeout 10 > "$X/$impl-ping" 2>&1 || rc=$?
-  if [ "$rc" = 0 ] && grep -q '^PONG b ' "$X/$impl-ping" && grep -q '^CONSUMED c ' "$X/$impl-ping"; then ok "$impl channel-ping two-way and one-way"; else bad "$impl channel-ping: $(cat "$X/$impl-ping")"; fi
-  if [ "$(cat "$X/$impl-armb")" = READY ] && [ "$(cat "$X/$impl-armc")" = READY ]; then ok "$impl arm hides PING/PONG"; else bad "$impl arm hides PING/PONG: $(cat "$X/$impl-armb" "$X/$impl-armc")"; fi
+  if [ "$rc" = 0 ] && grep -q '^PONG b ' "$X/$impl-ping" && grep -q '^CONSUMED c ' "$X/$impl-ping"; then ok "$impl channel-ping two-way and one-way (agent answers)"; else bad "$impl channel-ping: $(cat "$X/$impl-ping")"; fi
+  if grep -q '^HANDLED PING a$' "$X/$impl-agb" && grep -q '^HANDLED PING a$' "$X/$impl-agc" && ! grep -q PONG "$X/$impl-aga"; then ok "$impl agent is woken by PING; PONG is not shown"; else bad "$impl agent woken by PING: $(cat "$X/$impl-agb" "$X/$impl-agc" "$X/$impl-aga")"; fi
   rc=0; PG "$X/x.diag" a --timeout 10 > "$X/$impl-again" 2>&1 || rc=$?
   if [ "$rc" = 0 ] && grep -q '^PONG b ' "$X/$impl-again"; then ok "$impl explicit ping is never rate-limited"; else bad "$impl explicit ping again: $(cat "$X/$impl-again")"; fi
   rm -f "$X"/nodes/*/checkall-runs "$X"/nodes/*/checkall.stamp
@@ -848,7 +904,7 @@ for impl in go sh py; do
   sleep 0.5
   rm -f "$X"/nodes/*/inbox/*.md
   rc=0; PG "$X/x.diag" a --timeout 1 > "$X/$impl-to" 2>&1 || rc=$?
-  if [ "$rc" = 1 ] && grep -q '^TIMEOUT b (no PONG' "$X/$impl-to" && grep -q '^TIMEOUT c (PING not consumed' "$X/$impl-to"; then ok "$impl ping timeout"; else bad "$impl ping timeout"; fi
+  if [ "$rc" = 1 ] && grep -q '^TIMEOUT b (no PONG after 1s: the b agent was not woken or did not answer)$' "$X/$impl-to" && grep -q '^TIMEOUT c (PING not removed after 1s: the c agent was not woken or did not handle it)$' "$X/$impl-to"; then ok "$impl ping timeout"; else bad "$impl ping timeout: $(cat "$X/$impl-to")"; fi
   rm -f "$X"/nodes/*/inbox/*.md
   mkdir -p "$X/nodes/b/inbox/claimed"
   : > "$X/nodes/b/inbox/claimed/m.md"
@@ -871,7 +927,7 @@ sleep 0.5
 kill "$pd" 2>/dev/null || true
 wait "$pd" 2>/dev/null || true
 if grep -q '^FILE ' "$X/arm-deliver"; then ok "arm shows a real message"; else bad "arm shows a real message"; fi
-for e in send ping ping-answered deliver consumed; do
+for e in send ping pong-received deliver consumed; do
   if grep -q " agent-channel event=$e " "$X/log.txt"; then ok "log has event=$e"; else bad "log has event=$e"; fi
 done
 unset CHANNEL_LOG_FILE
@@ -969,16 +1025,18 @@ for impl in go sh py; do
   esac
   rm -f "$Y"/nodes/*/inbox/*.md "$Y"/nodes/*/arm.pid "$Y"/nodes/*/checkall-runs "$Y"/nodes/*/checkall.stamp
   : > "$Y/log.txt"
-  $A "$Y/y.diag" q > "$Y/$impl-aq" 2> "$Y/$impl-aq.err" &
+  ARM=$A SEND=$SN PINGC=$P
+  : > "$Y/$impl-aq"; : > "$Y/$impl-ar"; : > "$Y/$impl-ap"
+  fake_agent "$Y/$impl-aq" "$Y/y.diag" q &
   pq=$!
-  $A "$Y/y.diag" r > "$Y/$impl-ar" 2> "$Y/$impl-ar.err" &
+  fake_agent "$Y/$impl-ar" "$Y/y.diag" r &
   pr=$!
-  $A "$Y/y.diag" p > "$Y/$impl-ap" 2> "$Y/$impl-ap.err" &
+  fake_agent "$Y/$impl-ap" "$Y/y.diag" p &
   pp=$!
-  wait_for "$Y/$impl-aq" READY || true; wait_for "$Y/$impl-ar" READY || true; wait_for "$Y/$impl-ap" READY || true
+  sleep 1
   rc=0; $P --timeout 10 "$Y/y.diag" p > "$Y/$impl-pg" 2>&1 || rc=$?
-  if [ "$rc" = 0 ] && grep -q '^PONG q ' "$Y/$impl-pg" && grep -q '^CONSUMED r ' "$Y/$impl-pg"; then ok "$impl ping with ACTION blocks: auto-PONG validates"; else bad "$impl ping with ACTION blocks: auto-PONG validates (rc=$rc)"; fi
-  if ! grep -q 'event=auto-reply' "$Y/log.txt" && kill -0 "$pq" 2>/dev/null; then ok "$impl ACTION-block watch keeps running, no reply failure"; else bad "$impl ACTION-block watch keeps running, no reply failure"; fi
+  if [ "$rc" = 0 ] && grep -q '^PONG q ' "$Y/$impl-pg" && grep -q '^CONSUMED r ' "$Y/$impl-pg"; then ok "$impl ping with ACTION blocks: agent PONG validates"; else bad "$impl ping with ACTION blocks: agent PONG validates (rc=$rc)"; fi
+  if [ ! -s "$Y/$impl-aq.err" ] && kill -0 "$pq" 2>/dev/null; then ok "$impl ACTION-block agent PONG accepted, watch keeps running"; else bad "$impl ACTION-block agent PONG accepted: $(cat "$Y/$impl-aq.err")"; fi
   rc=0; $P --all --timeout 10 "$Y/y.diag" p > "$Y/$impl-pga" 2>&1 || rc=$?
   if [ "$rc" = 0 ] && grep -q '^CHECKALL p run ' "$Y/$impl-pga" && grep -q '^PONG q ' "$Y/$impl-pga"; then ok "$impl check-all with ACTION blocks"; else bad "$impl check-all with ACTION blocks (rc=$rc)"; fi
   n=0; while [ "$n" -lt 50 ] && ! grep -q 'event=ping result=ok from=q to=r kind=pong' "$Y/log.txt"; do sleep 0.2; n=$((n + 1)); done
@@ -988,17 +1046,17 @@ for impl in go sh py; do
   wait "$pq" "$pr" "$pp" 2>/dev/null || true
   pkill -9 -f "$Y/y.diag" 2>/dev/null || true
   sleep 0.3
-  # forced reply failure (z.diag): warning, PING shown as FILE, watch keeps running
+  # a watch alone (z.diag, whose PONG block a tool could not fill anyway): the PING is shown
+  # once as FILE, left in the inbox, and nothing answers it
   $A "$Y/z.diag" t > "$Y/$impl-at" 2> "$Y/$impl-at.err" &
   pt=$!
   wait_for "$Y/$impl-at" READY || true
   $SN "$Y/z.diag" s t PING -m 'ACTION: PING' -m "NONCE: $impl-forced" > "$Y/$impl-zs" 2>&1
   zf=$(sed -n 's/^SENT //p' "$Y/$impl-zs")
-  if [ -n "$zf" ] && wait_for "$Y/$impl-at" "FILE $zf"; then ok "$impl failed auto-reply shows the PING as FILE"; else bad "$impl failed auto-reply shows the PING as FILE"; fi
-  if grep -q 'CHANNEL-AUTO-REPLY-FAILED' "$Y/$impl-at.err" && grep -q 'CHANNEL-CONTROL-BODY' "$Y/$impl-at.err" && grep -q 'event=auto-reply result=fail node=t from=s' "$Y/log.txt"; then ok "$impl failed auto-reply warns on stderr and in the log"; else bad "$impl failed auto-reply warns on stderr and in the log"; fi
+  if [ -n "$zf" ] && wait_for "$Y/$impl-at" "FILE $zf"; then ok "$impl PING shown as FILE"; else bad "$impl PING shown as FILE"; fi
   sleep 0.6
-  if [ -f "$zf" ] && kill -0 "$pt" 2>/dev/null; then ok "$impl watch survives a failed auto-reply"; else bad "$impl watch survives a failed auto-reply"; fi
-  if [ "$(grep -c "^FILE $zf" "$Y/$impl-at")" = 1 ] && [ "$(grep -c CHANNEL-AUTO-REPLY-FAILED "$Y/$impl-at.err")" = 1 ]; then ok "$impl failed PING reported and announced once"; else bad "$impl failed PING reported and announced once"; fi
+  if [ -f "$zf" ] && kill -0 "$pt" 2>/dev/null && ! ls "$Y"/nodes/s/inbox/*.md "$Y"/nodes/s/pong-* >/dev/null 2>&1 && [ ! -s "$Y/$impl-at.err" ]; then ok "$impl watch leaves the PING to the agent, sends no PONG"; else bad "$impl watch leaves the PING to the agent"; fi
+  if [ "$(grep -c "^FILE $zf" "$Y/$impl-at")" = 1 ]; then ok "$impl PING announced once"; else bad "$impl PING announced once"; fi
   rm -f "$zf"
   $SN "$Y/z.diag" s t NOTE -m 'NOTE: after' > "$Y/$impl-zn" 2>&1
   zn=$(sed -n 's/^SENT //p' "$Y/$impl-zn")
@@ -1015,6 +1073,122 @@ for impl in go sh py; do
   rm -f "$Y"/nodes/*/inbox/*.md
 done
 unset CHANNEL_LOG_FILE
+
+# Delivery outcome and retract: a send ends with DELIVERED / RETRACTED / ABORTED; --retract
+# and the receiver's claim are both one rename, so exactly one of them wins.
+Z=$TMP/z
+mkdir -p "$Z"
+cat > "$Z/z.diag" <<EOF
+blockdiag {
+  s -> r;
+  s -< q;
+}
+/*
+node s $Z/nodes/s/inbox
+node r $Z/nodes/r/inbox
+node q $Z/nodes/q/inbox
+verb s r NOTE
+verb s q NOTE
+message NOTE {
+A note.
+body: {
+NOTE: <text>
+}
+}
+*/
+EOF
+for n in s r q; do "$ROOT/go/channel-setup" "$Z/z.diag" $n >/dev/null; done
+last_line() { tail -n 1 "$1"; }
+# sets rc to the exit code of background job $1 (killed after 10 s)
+wait_exit() { n=0; while kill -0 "$1" 2>/dev/null && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done; kill -9 "$1" 2>/dev/null || true; rc=0; wait "$1" 2>/dev/null || rc=$?; }
+for impl in go sh py; do
+  case $impl in
+    go) S="$ROOT/go/channel-send" ;;
+    sh) S="$ROOT/bin/channel-send" ;;
+    py) S="python3 $PY send" ;;
+  esac
+  rm -rf "$Z"/nodes/*/inbox/*.md "$Z"/nodes/*/inbox/claimed "$Z"/nodes/s/retracted "$Z"/nodes/s/outcome
+  # delivered: the receiver claims it (mv into claimed/)
+  CHANNEL_SEND_WAIT=1 $S "$Z/z.diag" s q NOTE -m 'NOTE: one' > "$Z/$impl-d" 2>&1 &
+  pid=$!
+  wait_for "$Z/$impl-d" SENT || true
+  f=$(sed -n 's/^SENT //p' "$Z/$impl-d")
+  mkdir -p "$Z/nodes/q/inbox/claimed"; mv "$f" "$Z/nodes/q/inbox/claimed/"
+  wait_exit "$pid"
+  if [ "$rc" = 0 ] && [ "$(last_line "$Z/$impl-d")" = "DELIVERED $f" ] && [ "$(cat "$Z/nodes/s/outcome/$(basename "$f")")" = "DELIVERED $f" ]; then ok "$impl send ends DELIVERED when claimed, outcome recorded"; else bad "$impl send DELIVERED (rc=$rc): $(cat "$Z/$impl-d")"; fi
+  # timeout: nobody takes it, so it is retracted
+  rc=0; CHANNEL_SEND_WAIT=1 $S --timeout 1 "$Z/z.diag" s q NOTE -m 'NOTE: two' > "$Z/$impl-t" 2>&1 || rc=$?
+  f=$(sed -n 's/^SENT //p' "$Z/$impl-t")
+  if [ "$rc" = 4 ] && [ "$(last_line "$Z/$impl-t")" = "RETRACTED $f -> $Z/nodes/s/retracted/$(basename "$f") (not taken within 1s)" ] && [ ! -e "$f" ] && [ -f "$Z/nodes/s/retracted/$(basename "$f")" ]; then ok "$impl send --timeout retracts"; else bad "$impl send --timeout (rc=$rc): $(cat "$Z/$impl-t")"; fi
+  # a signal while waiting for the outcome retracts
+  CHANNEL_SEND_WAIT=1 $S "$Z/z.diag" s q NOTE -m 'NOTE: three' > "$Z/$impl-k" 2>&1 &
+  pid=$!
+  wait_for "$Z/$impl-k" SENT || true
+  f=$(sed -n 's/^SENT //p' "$Z/$impl-k")
+  kill -TERM "$pid"
+  wait_exit "$pid"
+  if [ "$rc" = 4 ] && [ "$(last_line "$Z/$impl-k")" = "RETRACTED $f -> $Z/nodes/s/retracted/$(basename "$f") (stopped by terminated)" ] && [ ! -e "$f" ]; then ok "$impl stopped send retracts"; else bad "$impl stopped send (rc=$rc): $(cat "$Z/$impl-k")"; fi
+  # a signal before the message reached DEST's inbox (waiting on a -> arrow) aborts
+  $S "$Z/z.diag" s r NOTE -m 'NOTE: first' > "$Z/$impl-a1" 2>&1
+  CHANNEL_SEND_WAIT=1 $S "$Z/z.diag" s r NOTE -m 'NOTE: second' > "$Z/$impl-a" 2>&1 &
+  pid=$!
+  wait_for "$Z/$impl-a" PENDING || true
+  kill -TERM "$pid"
+  wait_exit "$pid"
+  if [ "$rc" = 4 ] && [ "$(last_line "$Z/$impl-a")" = "ABORTED r NOTE (not sent: terminated before it reached r's inbox)" ] && [ "$(file_count '*.md' "$Z/nodes/r/inbox")" = 1 ]; then ok "$impl send stopped while pending is ABORTED, nothing sent"; else bad "$impl pending abort (rc=$rc): $(cat "$Z/$impl-a")"; fi
+  rm -f "$Z"/nodes/r/inbox/*.md
+  # --retract: RETRACTED (0), again: already retracted (0), after a claim: DELIVERED (5)
+  $S "$Z/z.diag" s q NOTE -m 'NOTE: four' > "$Z/$impl-q" 2>&1
+  f=$(sed -n 's/^SENT //p' "$Z/$impl-q")
+  rc=0; $S "$Z/z.diag" s --retract "$f" > "$Z/$impl-r1" 2>&1 || rc=$?
+  rc2=0; $S "$Z/z.diag" s --retract "$(basename "$f")" > "$Z/$impl-r2" 2>&1 || rc2=$?
+  if [ "$rc" = 0 ] && [ "$(cat "$Z/$impl-r1")" = "RETRACTED $f -> $Z/nodes/s/retracted/$(basename "$f") (--retract)" ] && [ "$rc2" = 0 ] && grep -q '(already retracted)$' "$Z/$impl-r2"; then ok "$impl --retract and a repeated --retract"; else bad "$impl --retract: $rc $(cat "$Z/$impl-r1") / $rc2 $(cat "$Z/$impl-r2")"; fi
+  $S "$Z/z.diag" s q NOTE -m 'NOTE: five' > "$Z/$impl-q2" 2>&1
+  f=$(sed -n 's/^SENT //p' "$Z/$impl-q2")
+  mv "$f" "$Z/nodes/q/inbox/claimed/"
+  rc=0; $S "$Z/z.diag" s --retract "$f" > "$Z/$impl-r3" 2>&1 || rc=$?
+  if [ "$rc" = 5 ] && [ "$(cat "$Z/$impl-r3")" = "DELIVERED $f" ]; then ok "$impl --retract after the claim says DELIVERED (exit 5)"; else bad "$impl --retract after claim: $rc $(cat "$Z/$impl-r3")"; fi
+  rc=0; $S "$Z/z.diag" s --retract "$Z/nodes/s/inbox/20260101-000000.000__s__9999.md" > "$Z/$impl-r4" 2>&1 || rc=$?
+  if [ "$rc" = 1 ] && grep -q 'is not in the inbox of a node s sends to' "$Z/$impl-r4"; then ok "$impl --retract of a path outside DEST inboxes fails"; else bad "$impl --retract wrong path: $rc $(cat "$Z/$impl-r4")"; fi
+  # a running send learns about a separate --retract
+  CHANNEL_SEND_WAIT=1 $S "$Z/z.diag" s q NOTE -m 'NOTE: six' > "$Z/$impl-w" 2>&1 &
+  pid=$!
+  wait_for "$Z/$impl-w" SENT || true
+  f=$(sed -n 's/^SENT //p' "$Z/$impl-w")
+  $S "$Z/z.diag" s --retract "$f" > /dev/null 2>&1 || true
+  wait_exit "$pid"
+  if [ "$rc" = 4 ] && [ "$(last_line "$Z/$impl-w")" = "RETRACTED $f -> $Z/nodes/s/retracted/$(basename "$f") (by --retract)" ]; then ok "$impl running send reports a separate --retract"; else bad "$impl running send + --retract (rc=$rc): $(cat "$Z/$impl-w")"; fi
+  # race: the receiver's claim and the sender's --retract at the same moment; exactly one wins
+  bad_race=0; nret=0; ndel=0; i=0
+  while [ "$i" -lt 40 ]; do
+    i=$((i + 1))
+    $S "$Z/z.diag" s q NOTE -m "NOTE: race $i" > "$Z/$impl-rq" 2>&1
+    f=$(sed -n 's/^SENT //p' "$Z/$impl-rq"); b=$(basename "$f")
+    # even rounds delay the claim, odd rounds the retract (0-99 ms), so both sides win some rounds
+    # whatever each impl's start-up time is
+    d="0.$(printf %03d $(( (i * 37) % 100 )))"; dc=0; dr=0
+    if [ $((i % 2)) = 0 ]; then dc=$d; else dr=$d; fi
+    (sleep "$dc"; mv "$f" "$Z/nodes/q/inbox/claimed/" 2>/dev/null) &
+    mp=$!
+    sleep "$dr"
+    rrc=0; $S "$Z/z.diag" s --retract "$f" > "$Z/$impl-rr" 2>&1 || rrc=$?
+    wait "$mp" 2>/dev/null || true
+    inr=0; inc=0
+    [ -f "$Z/nodes/s/retracted/$b" ] && inr=1
+    [ -f "$Z/nodes/q/inbox/claimed/$b" ] && inc=1
+    case "$rrc $(cut -d' ' -f1 "$Z/$impl-rr") $inr $inc" in
+      "0 RETRACTED 1 0") nret=$((nret + 1)) ;;
+      "5 DELIVERED 0 1") ndel=$((ndel + 1)) ;;
+      *) bad_race=$((bad_race + 1)); echo "race $i: rc=$rrc $(cat "$Z/$impl-rr") retracted=$inr claimed=$inc" >&2 ;;
+    esac
+  done
+  if [ "$bad_race" = 0 ] && [ "$nret" -gt 0 ] && [ "$ndel" -gt 0 ]; then ok "$impl claim vs retract race: exactly one wins (retracted $nret, delivered $ndel)"; else bad "$impl claim vs retract race: $bad_race inconsistent (retracted $nret, delivered $ndel; both must win some)"; fi
+  rc=0; CHANNEL_SEND_WAIT=x $S "$Z/z.diag" s q NOTE -m 'NOTE: x' > "$Z/$impl-bw" 2>&1 || rc=$?
+  if [ "$rc" = 1 ] && grep -q 'CHANNEL_SEND_WAIT must be 0 or 1' "$Z/$impl-bw"; then ok "$impl bad CHANNEL_SEND_WAIT fails"; else bad "$impl bad CHANNEL_SEND_WAIT (rc=$rc)"; fi
+  rc=0; $S "$Z/z.diag" s r NOTE -m 'NOTE: x' --retract x > "$Z/$impl-bu" 2>&1 || rc=$?
+  if [ "$rc" = 1 ] && grep -q 'usage: channel-send FILE NODE --retract MESSAGE' "$Z/$impl-bu"; then ok "$impl --retract with send args is refused"; else bad "$impl --retract usage (rc=$rc): $(cat "$Z/$impl-bu")"; fi
+  rm -rf "$Z"/nodes/*/inbox/*.md "$Z"/nodes/q/inbox/claimed
+done
 
 printf '%s\n' "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

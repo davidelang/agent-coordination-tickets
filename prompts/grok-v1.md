@@ -1,5 +1,7 @@
 # Grok product prompt v1
 
+Replaced by v2 (2026-10-15): the `--whatineedtoknow` header is the whole instruction set for Grok Build and Cursor agents (see [README.md](README.md)); kept so a running agent can be pointed at v1.
+
 Version: v1
 Date: 2026-10-06
 This paragraph is for Grok Build sessions that have the monitor tool. Grok 4.5 and Grok 4.6 use this same paragraph. A Grok session with no monitor tool uses the shell-agent paragraph instead.

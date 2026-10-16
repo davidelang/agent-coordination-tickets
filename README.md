@@ -46,6 +46,8 @@ channel-send /path/to/comms.diag planner coder IMPLEMENT body.md
 
 When the work is done, the coder removes that one inbox file with `rm`.
 
+The send then waits and ends with one outcome line: `DELIVERED` once the coder took the file (moved it to `claimed/` or removed it), or `RETRACTED` / `ABORTED` if the planner took it back (`channel-send ... --retract PATH`, `--timeout SEC`, or a signal) before the coder did. See [bin/README.md](bin/README.md#delivery-outcome-and-retract).
+
 `body.md` has to match the `IMPLEMENT` message block. Lines with `<...>` are filled in. The other lines are copied as written. After a restart, `channel-arm /path/to/comms.diag coder --whatineedtoknow` prints the nodes and messages this coder uses, then exits. The same flag works on `channel-setup` and `channel-send`.
 
 ## More

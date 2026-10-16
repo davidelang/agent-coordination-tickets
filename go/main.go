@@ -955,7 +955,7 @@ var actWatch = map[string][]string{
 	},
 	"cursor": {
 		"  Run exactly {WRAPPER} {PLAN} {NODE} as a background shell (block_until_ms: 0). Never run channel-arm yourself; the wrapper starts it once and it keeps running.",
-		"  Cursor wakes you only when a background shell finishes, so the wrapper ends as soon as a message is waiting: its last line is FILE <path> (the oldest message in your inbox). Handle that one file, rm it, then start the same wrapper command again before you end the turn; it waits for the next message, or ends at once if one is already waiting.",
+		"  Cursor wakes you only when a background shell finishes, so the wrapper ends as soon as a message is waiting: its last line is FILE <path> (the oldest message in your inbox). Handle that one file, rm it, then start the same wrapper command again before you end the turn; it waits for the next message, or ends at once if one is already waiting. If the file is already gone when you open it (the sender retracted it, or it was handled), skip it and start the wrapper again.",
 		"  If it ends with WATCH-ENDED, that is blocked (above), with the line before it (ALREADY-WATCHING there means another session watches this node). If it ends with neither FILE nor WATCH-ENDED (cursor killed it), start it again.",
 		"  After a compaction, start it again unless it is still running. The stop hook also reminds you of a waiting FILE.",
 		"  Long commands (sends, channel-ping): run each as a background shell (block_until_ms: 0) and read its last line (the outcome) before you report or resend, or read {OUTCOME}/<message file name>.",

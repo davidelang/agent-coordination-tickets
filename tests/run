@@ -247,7 +247,7 @@ for impl in sh go py; do
   mkdir -p "$TMP/cur/.cursor/lib" && printf '#!/bin/sh\n' > "$TMP/cur/.cursor/lib/cursor-channel-watch" && chmod +x "$TMP/cur/.cursor/lib/cursor-channel-watch"
   capture "$TMP/$impl-cur" "$TMP/$impl-cur.err" "$TMP/$impl-cur.rc" sh -c 'cd "$1" && shift && CHANNEL_AGENT=cursor exec "$@"' sh "$TMP/cur" $W "$EX" coder --whatineedtoknow
 done
-if grep -qx 'you are node coder (agent: cursor)' "$TMP/sh-cur" && grep -qF "Run exactly $TMP/cur/.cursor/lib/cursor-channel-watch " "$TMP/sh-cur" && grep -q 'block_until_ms: 0' "$TMP/sh-cur" && ! grep -q 'monitor tool' "$TMP/sh-cur"; then ok "cursor header names the wrapper watch"; else bad "cursor header names the wrapper watch"; fi
+if grep -qx 'you are node coder (agent: cursor)' "$TMP/sh-cur" && grep -qF "Run exactly $TMP/cur/.cursor/lib/cursor-channel-watch " "$TMP/sh-cur" && grep -q 'block_until_ms: 0' "$TMP/sh-cur" && grep -q 'Cursor wakes you only when a background shell finishes' "$TMP/sh-cur" && grep -q 'then start the same wrapper command again before you end the turn' "$TMP/sh-cur" && ! grep -q 'monitor tool' "$TMP/sh-cur"; then ok "cursor header names the wrapper watch"; else bad "cursor header names the wrapper watch"; fi
 same "cursor header shell/go" "$TMP/sh-cur" "$TMP/go-cur"
 same "cursor header shell/py" "$TMP/sh-cur" "$TMP/py-cur"
 

@@ -18,7 +18,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-OPS = ("<->", ">-<", "<-", "->", "--", "-<", ">-")
+OPS = ("<->", "<-<", ">->", ">-<", "->", "-<", "<-", ">-", "--")
+ARROW_HINT = "Use -> (one message in flight) or -< (many queue) at either end, e.g. ->, -<, <->, >-<, >->; see docs/diagram-marks.md."
 NAME_RE = re.compile(
     r"^(?P<time>\d{8}-\d{6}\.\d{3})__(?P<sender>.+)__(?P<seq>\d+)\.md$"
 )
@@ -102,10 +103,10 @@ def parse_diag(text):
         ops = op_re.findall(stmt)
         if not ops:
             if re.search(r"[<>]", stmt):
-                die(f"unrecognized arrow in: {stmt.strip()}. Use ->, <->, or -<.")
+                die(f"unrecognized arrow in: {stmt.strip()}. {ARROW_HINT}")
             continue
         if re.search(r"[<>]", op_re.sub(" ", stmt)):
-            die(f"unrecognized arrow in: {stmt.strip()}. Use ->, <->, or -<.")
+            die(f"unrecognized arrow in: {stmt.strip()}. {ARROW_HINT}")
         nodes = []
         for index, part in enumerate(op_re.split(stmt)):
             names = re.findall(r"[A-Za-z_][A-Za-z0-9_.-]*", part)
@@ -120,21 +121,33 @@ def parse_diag(text):
     return edges
 
 
+# The mark at the end a message arrives at sets that direction: a head pointing at the node is
+# one message in flight (wait), a crow's foot opening toward it is many (queue), no mark is none.
+RIGHT_END = {">": "wait", "<": "queue", "": None}
+LEFT_END = {"<": "wait", ">": "queue", "": None}
+
+
 def expand(edges):
-    """Directed (src, dst, mode, label). mode is wait or queue."""
+    """Directed (src, dst, mode, label). mode is wait or queue. Each end of an arrow is read on
+    its own, so <-> >-< >-> <-< are two directions on one line. The same directed pair given two
+    different modes is an error (the same mode twice is a duplicate edge, checked later)."""
     out = []
+    seen = {}
     for src, op, dst, label in edges:
-        if op == "<->":
-            out.append((src, dst, "wait", label))
-            out.append((dst, src, "wait", label))
-        elif op == "->":
-            out.append((src, dst, "wait", label))
-        elif op == "-<":
-            out.append((src, dst, "queue", label))
-        elif op in {"<-", "--", ">-", ">-<"}:
-            die(f"{op} is drawn by blockdiag and is not a channel. Use ->, <->, or -<. See docs/diagram-marks.md.")
-        else:
+        if op not in OPS:
             die(f"unknown operator {op}")
+        left = op[0] if op[0] in "<>" else ""
+        right = op[-1] if op[-1] in "<>" else ""
+        pairs = [(src, dst, RIGHT_END[right]), (dst, src, LEFT_END[left])]
+        if all(mode is None for _a, _b, mode in pairs):
+            die(f"{src} {op} {dst}: {op} has no mark at either end, so it is not a channel. {ARROW_HINT}")
+        for a, b, mode in pairs:
+            if mode is None:
+                continue
+            if (a, b) in seen and seen[(a, b)] != mode:
+                die(f"conflicting rules for {a} -> {b}: {seen[(a, b)]} and {mode} (from {src} {op} {dst}); give each direction one rule")
+            seen[(a, b)] = mode
+            out.append((a, b, mode, label))
     return out
 
 
@@ -260,7 +273,7 @@ OPTS = {"msgs": [], "all": False, "run": "",
         "every": env_int("CHANNEL_CHECKALL_EVERY", 30),
         "timeout": env_int("CHANNEL_PING_TIMEOUT", 300, 1)}
 ARM = {"me": None, "plan": None}
-# channel-send: --timeout given (delivery wait), --retract MESSAGE, and this process's message
+# channel-send: --timeout given (PING only), --retract MESSAGE, and this process's message
 # once published (with its temp file, gone once the rename happened).
 SEND = {"timeout_given": False, "retract": "", "published": None, "tmp": None}
 
@@ -560,26 +573,28 @@ ACT_WATCH = {
         '  It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.',
         '  If it prints ALREADY-WATCHING and exits, a watch for this node is already running: do not start another. If it exits with any other message, that is blocked (above).',
         '  After a compaction, do not start another monitor while yours is still running.',
-        '  Long commands (sends, channel-ping): start each with the monitor tool (persistent: false), so its last line (the outcome) wakes you.',
+        "  Long commands (channel-ping, a send that may wait PENDING): start each with the monitor tool (persistent: false), so its last line wakes you.",
     ],
     "cursor": [
         '  Run exactly {WRAPPER} {PLAN} {NODE} as a background shell (block_until_ms: 0). Never run channel-arm yourself; the wrapper starts it once and it keeps running.',
-        '  Cursor wakes you only when a background shell finishes, so the wrapper ends as soon as a message is waiting: its last line is FILE <path> (the oldest message in your inbox). Handle that one file, rm it, then start the same wrapper command again before you end the turn; it waits for the next message, or ends at once if one is already waiting. If the file is already gone when you open it (the sender retracted it, or it was handled), skip it and start the wrapper again.',
+        "  Cursor wakes you only when a background shell finishes, so the wrapper ends as soon as a message is waiting: its last line is FILE <path> (the oldest message in your inbox). Handle that one file, rm it, then start the same wrapper command again before you end the turn; it waits for the next message, or ends at once if one is already waiting. If the file is already gone when you open it, you lost the race (see claim): say so in one line and start the wrapper again.",
         '  If it ends with WATCH-ENDED, that is blocked (above), with the line before it (ALREADY-WATCHING there means another session watches this node). If it ends with neither FILE nor WATCH-ENDED (cursor killed it), start it again.',
         '  After a compaction, start it again unless it is still running. The stop hook also reminds you of a waiting FILE.',
-        '  Long commands (sends, channel-ping): run each as a background shell (block_until_ms: 0) and read its last line (the outcome) before you report or resend, or read {OUTCOME}/<message file name>.',
+        "  Long commands (channel-ping, a send that may wait PENDING): run each as a background shell (block_until_ms: 0) and read its last line when it finishes.",
     ],
 }
 
 ACT_TAIL = [
-    '4. each FILE <path> is one message: handle the oldest (see read, ping, send), rm it when done, then end the turn.',
+    "4. each FILE <path> is one message: handle the oldest (see read, claim, ping, send), rm it when done, then end the turn.",
     'ping: a PING is an ordinary message. It wakes you as FILE and nothing answers it for you, so your PONG is the proof that you were woken. Answer it at once, before other work:',
-    "  {BIN}/channel-send {PLAN} {NODE} <FROM> PONG -m 'NONCE: <the PING's NONCE value>'   (plus the lines of the plan's PONG message block, if it has one), then rm the PING. With no arrow back to <FROM>, just rm it.",
+    "  {BIN}/channel-send {PLAN} {NODE} <FROM> PONG -m 'NONCE: <the PING's NONCE value>'   (plus the lines of the plan's PONG message block, if it has one), then rm the PING.",
+    "  With no arrow back to <FROM> you cannot send a PONG: say in one line that you got a PING from <FROM>, rm it, and go back to watching.",
     '  If the PING has SCOPE: all and RUN: <id>, then also start {BIN}/channel-ping --run <id> {PLAN} {NODE} in the background (see step 3) and report any TIMEOUT line it prints; it does nothing if this node already handled that run or ran a check-all in the last 30 minutes.',
-    '  A PONG for your own channel-ping is taken by the watch and never shown. To check a link yourself, run channel-ping (see tools); channel-send ... DEST PING is the same check for that one DEST (it sends the PING, waits for the PONG and prints PONG or TIMEOUT), so start either in the background (see step 3). channel-send refuses a PONG that does not answer a PING from DEST still in your inbox, so send the PONG before you rm the PING.',
+    "  A PONG for your own channel-ping is taken by the watch and never shown. To check a link yourself, run channel-ping (see tools); channel-send ... DEST PING is the same check for that one DEST, so start either in the background (see step 3). channel-send refuses a PONG that does not answer a PING from DEST still in your inbox, so send the PONG before you rm the PING.",
     'start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.',
     'read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.',
-    '  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.',
+    "  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.",
+    "claim: if mv or rm of a FILE says No such file, the sender took it back first: you lost the race. Say so in one line (LOST <file>: the sender took it back) and go back to watching for new messages; it is not an error.",
     'send: {BIN}/channel-send {PLAN} {NODE} DEST VERB BODYFILE [REF ...]',
     "  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB -m 'TEXT' [-m 'TEXT' ...] [REF ...]   (each -m is one block of lines; blocks are joined by a blank line)",
     '  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB - [REF ...]   (- or no BODYFILE reads the body from stdin)',
@@ -587,13 +602,13 @@ ACT_TAIL = [
     '  Body: copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.',
     '  Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.',
     '  REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.',
-    '  On a -> arrow the send waits until DEST removes your previous message; on -< it queues. PING and PONG never wait.',
-    "  Every send except PING/PONG waits for the outcome of its own message and ends with exactly one line: DELIVERED <path> (DEST took it: moved it to claimed/ or removed it; exit 0), RETRACTED <path> -> <where> (taken back, DEST never got it; exit 4) or ABORTED (it never reached DEST's inbox; exit 4). The same line is written to {OUTCOME}/<message file name>. With --timeout SEC it is retracted if DEST has not taken it by then.",
-    '  So start every send in the background (see step 3) and keep handling your inbox: on a -> arrow it first waits for DEST to take your previous message, and this way two nodes that wait on each other cannot deadlock. Report or resend only after you have read its outcome line.',
-    "  take back: {BIN}/channel-send {PLAN} {NODE} --retract <path from SENT>. Exactly one of you and DEST wins: RETRACTED (exit 0) means DEST never got it; DELIVERED (exit 5) means DEST already took it. Stopping a running send (interrupt, or kill -TERM) does the same retract, or prints ABORTED if it was not in DEST's inbox yet.",
+    "  At a -> end (one message in flight) the send first waits until DEST removes your previous message there (it prints PENDING <path>); at a -< end (crow's foot) it sends at once. PING and PONG never wait.",
+    "  A send is done when channel-send returns: DELIVERED <path> (exit 0) means the message is in DEST's inbox, and that ends your part. Never check DEST's inbox, its claimed/ or channel-status to see whether DEST has taken or handled it. A failed send exits non-zero with its reason; that is the only send result you act on. If you need an answer, it comes as a message in your own inbox (FILE).",
+    "  Start a send that may wait (PENDING) in the background (see step 3) and keep handling your inbox, so two nodes that wait on each other cannot deadlock.",
+    "  take back: {BIN}/channel-send {PLAN} {NODE} --retract <path from SENT>. It is one rename, so exactly one of you and DEST gets the file: RETRACTED <path> -> <where> (DEST never got it) or NOT-RETRACTED <path> (DEST already has it; you lost the race). Both exit 0: report which, and carry on. Stopping a send while it is PENDING prints ABORTED; nothing was sent.",
     'done: rm the FILE when you have finished it (from claimed/ only after your reply is sent). Removing it is the acknowledgement.',
-    "tools: {BIN}/channel-ping {PLAN} {NODE} sends a PING on each of your arrows and waits for that agent's own PONG (on a one-way arrow, for it to rm the PING); if none comes it prints TIMEOUT <DEST> (... the <DEST> agent was not woken or did not answer) and exits 1. Run it in the background (see step 3) so you can still answer PINGs; with --all every node it reaches passes the check on.",
-    "  {BIN}/channel-status {PLAN} shows each inbox's message count, oldest age, and claimed files.",
+    "tools: {BIN}/channel-ping {PLAN} {NODE} sends a PING on each of your arrows. Where DEST has an arrow back to you it waits only for DEST's PONG in your own inbox; if none comes it prints TIMEOUT <DEST> (... the <DEST> agent was not woken or did not answer) and exits 1. Where DEST has no arrow back it prints NO-RETURN <DEST> (the PING is delivered; no PONG is possible). Run it in the background (see step 3) so you can still answer PINGs; with --all every node it reaches passes the check on.",
+    "  {BIN}/channel-status {PLAN} shows each inbox's message count, oldest age, and claimed files; it is for David or for diagnosing a stuck node, not for checking your sends.",
     'after a compaction, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again and follow it (do not start a second watch), then check claimed/ (see start).',
     'duties (from the plan; PING and PONG are allowed on every arrow as well):',
 ]
@@ -606,8 +621,7 @@ def emit_act(me, plan_path, nodes, verbs, edges):
     inbox = os.path.abspath(str(nodes[me]))
     for line in ACT_HEAD + ACT_WATCH[kind] + ACT_TAIL:
         for key, val in (("{NODE}", me), ("{PLAN}", plan), ("{INBOX}", inbox), ("{BIN}", bin_dir),
-                         ("{AGENT}", kind), ("{WRAPPER}", wrapper),
-                         ("{OUTCOME}", os.path.join(os.path.dirname(inbox), "outcome"))):
+                         ("{AGENT}", kind), ("{WRAPPER}", wrapper)):
             line = line.replace(key, val)
         say(line)
     for src, dst, mode, _label in edges:
@@ -947,56 +961,55 @@ SIGNAL_NAMES = {signal.SIGINT: "interrupt", signal.SIGTERM: "terminated", signal
 
 
 def cmd_send(plan_path, me, recipient, verb, body_text, refs):
-    """Publish the message and, unless it is a PING or PONG, wait for its outcome and end with
-    one line: DELIVERED (exit 0), RETRACTED or ABORTED (exit 4). A signal or --timeout retracts.
-    CHANNEL_SEND_WAIT=0 skips the wait and ends with QUEUED (the outcome is then unknown)."""
+    """Publish the message and end with DELIVERED <path> once it is in DEST's inbox (exit 0).
+    Whether or when DEST takes or handles it is not channel-send's business. A signal while it
+    is PENDING (before the rename into DEST's inbox) prints ABORTED and exits 4."""
+    if "CHANNEL_SEND_WAIT" in os.environ:
+        die("CHANNEL_SEND_WAIT was removed; channel-send returns once the message is in DEST's inbox")
     loaded = load_plan(plan_path)
     require_me(me, loaded[1], loaded[0])
     if verb == "PING":
         send_ping(loaded, plan_path, me, recipient, body_text)
         return None
+    if SEND["timeout_given"]:
+        die("--timeout is only for channel-ping and channel-send DEST PING; a send ends once the message is in DEST's inbox")
     control_gate(loaded, me, recipient, verb, body_text)
-    control = verb in CONTROL and re.search(r"^[ \t]*NONCE:[ \t]*\S", body_text, re.M)
-    wait = os.environ.get("CHANNEL_SEND_WAIT", "")
-    if wait not in ("", "0", "1"):
-        die("CHANNEL_SEND_WAIT must be 0 or 1")
-    if not control:
-        def on_signal(signum, _frame):
-            for sg in SIGNAL_NAMES:
-                signal.signal(sg, signal.SIG_IGN)
-            name = SIGNAL_NAMES[signum]
-            dest, tmp = SEND["published"], SEND["tmp"]
-            if dest is None or (tmp is not None and tmp.exists()):
-                if tmp is not None:
-                    tmp.unlink(missing_ok=True)
-                say(f"ABORTED {recipient} {verb} (not sent: {name} before it reached {recipient}'s inbox)")
-                log_event("outcome", result="aborted", **{"from": me}, to=recipient, verb=verb)
-                os._exit(4)
-            line, code = retract_message(loaded, me, dest, f"stopped by {name}")
-            finish_outcome(loaded, me, dest, line)
-            os._exit(code)
+
+    def on_signal(signum, _frame):
         for sg in SIGNAL_NAMES:
-            signal.signal(sg, on_signal)
+            signal.signal(sg, signal.SIG_IGN)
+        dest, tmp = SEND["published"], SEND["tmp"]
+        if dest is None or (tmp is not None and tmp.exists()):
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+            say(f"ABORTED {recipient} {verb} (not sent: {SIGNAL_NAMES[signum]} before it reached {recipient}'s inbox)")
+            log_event("send", result="aborted", **{"from": me}, to=recipient, verb=verb)
+            os._exit(4)
+        say(f"DELIVERED {dest}")
+        os._exit(0)
+    for sg in SIGNAL_NAMES:
+        signal.signal(sg, on_signal)
     dest = send_message(loaded, me, recipient, verb, body_text, refs)
-    if control:
-        return dest
-    if wait == "0":
-        say(f"QUEUED {dest}")
-        return dest
-    line, code = await_outcome(loaded, me, dest)
     for sg in SIGNAL_NAMES:
         signal.signal(sg, signal.SIG_IGN)
-    finish_outcome(loaded, me, dest, line)
-    sys.exit(code)
+    say(f"DELIVERED {dest}")
+    return dest
 
 
 def retracted_path(loaded, me, dest):
     return node_dir(loaded[1][me]) / "retracted" / Path(dest).name
 
 
+def inbox_owner(nodes, inbox):
+    for name, path in nodes.items():
+        if os.path.abspath(str(path)) == os.path.abspath(str(inbox)):
+            return name
+    return "DEST"
+
+
 def retract_message(loaded, me, dest, why):
     """One rename of dest into nodes/ME/retracted/. The receiver's claim is one rename (or
-    unlink) too, so exactly one wins."""
+    unlink) too, so exactly one wins. Returns (line, won)."""
     rp = retracted_path(loaded, me, dest)
     if not rp.parent.is_dir():
         old = os.umask(0o002)
@@ -1011,53 +1024,16 @@ def retract_message(loaded, me, dest, why):
         os.rename(dest, rp)
     except FileNotFoundError:
         if rp.is_file():
-            return f"RETRACTED {dest} -> {rp} (already retracted)", 4
-        return f"DELIVERED {dest}", 0
+            return f"RETRACTED {dest} -> {rp} (already retracted)", True
+        return f"NOT-RETRACTED {dest} ({inbox_owner(loaded[1], Path(dest).parent)} already has it)", False
     except OSError as exc:
         die(f"cannot retract {dest}: {exc}")
-    return f"RETRACTED {dest} -> {rp} ({why})", 4
-
-
-def await_outcome(loaded, me, dest):
-    """Wait until dest leaves DEST's inbox (--timeout retracts it)."""
-    dest = Path(dest)
-    deadline = time.time() + OPTS["timeout"]
-    proc = None if use_poll() else try_inotify(
-        ["inotifywait", "-q", "-m", "-e", "moved_from", "-e", "delete", "--format", "%f", str(dest.parent)])
-    try:
-        while dest.is_file():
-            if SEND["timeout_given"] and time.time() >= deadline:
-                return retract_message(loaded, me, dest, f"not taken within {OPTS['timeout']}s")
-            time.sleep(POLL_SECONDS)
-            if proc is not None and proc.poll() is not None and dest.is_file():
-                die(f"inotifywait ended while waiting for the outcome of {dest}; it may still be in the inbox: "
-                    f"run channel-send {loaded[0]} {me} --retract {dest}")
-    finally:
-        if proc is not None:
-            stop_proc(proc)
-    rp = retracted_path(loaded, me, dest)
-    if rp.is_file():
-        return f"RETRACTED {dest} -> {rp} (by --retract)", 4
-    return f"DELIVERED {dest}", 0
-
-
-def finish_outcome(loaded, me, dest, line):
-    """Print the one outcome line and record it in nodes/ME/outcome/<file>."""
-    say(line)
-    odir = node_dir(loaded[1][me]) / "outcome"
-    old = os.umask(0o002)
-    try:
-        odir.mkdir(parents=True, exist_ok=True)
-        (odir / Path(dest).name).write_text(line + "\n")
-    except OSError as exc:
-        note(f"WARNING: cannot record the outcome in {odir}: {exc}")
-    finally:
-        os.umask(old)
-    log_event("outcome", result=line.split()[0].lower(), **{"from": me}, file=dest)
+    return f"RETRACTED {dest} -> {rp} ({why})", True
 
 
 def cmd_retract(plan_path, me, msg):
-    """Take one of this node's messages back, if DEST has not taken it yet."""
+    """Take one of this node's messages back. Exactly one of the sender and DEST gets it:
+    RETRACTED or NOT-RETRACTED, both exit 0. A message this node never sent dies."""
     loaded = load_plan(plan_path)
     plan_file, nodes, _verbs, _messages, edges = loaded
     require_me(me, nodes, plan_file)
@@ -1071,20 +1047,22 @@ def cmd_retract(plan_path, me, msg):
         if d not in inboxes:
             die(f"--retract: {msg} is not in the inbox of a node {me} sends to")
         inboxes = [d]
+    lost = None
     for ib in inboxes:
         dest = Path(ib) / base
-        line, code = retract_message(loaded, me, dest, "--retract")
-        if line.endswith("(already retracted)"):
+        line, won = retract_message(loaded, me, dest, "--retract")
+        if won:
             say(line)
+            log_event("retract", result="retracted", **{"from": me}, file=dest)
             sys.exit(0)
-        if code == 4:
-            finish_outcome(loaded, me, dest, line)
-            sys.exit(0)
+        lost = lost or line
     if not (node_dir(nodes[me]) / "out-seq.d" / str(int(m.group("seq")))).exists():
         die(f"--retract: no message {base} was sent by {me}")
-    dest = str(Path(inboxes[0]) / base) if len(inboxes) == 1 else base
-    finish_outcome(loaded, me, dest, f"DELIVERED {dest}")
-    sys.exit(5)
+    if len(inboxes) != 1:
+        lost = f"NOT-RETRACTED {base} (DEST already has it)"
+    say(lost)
+    log_event("retract", result="not-retracted", **{"from": me}, file=base)
+    sys.exit(0)
 
 
 def send_message(loaded, me, recipient, verb, body_text, refs):
@@ -1320,7 +1298,7 @@ PING_ONLY = {"dest": "", "nonce": ""}
 def send_ping(loaded, plan_path, me, recipient, body_text):
     """channel-send FILE ME DEST PING is channel-ping limited to DEST (same code): the body may be
     empty or give NONCE: <value> and lines of the plan's PING block; it sends the PING, waits for
-    the PONG and prints PONG, CONSUMED or TIMEOUT (exit 1)."""
+    the PONG and prints PONG or TIMEOUT (exit 1), or NO-RETURN when DEST has no arrow back."""
     if edge_between(loaded[4], me, recipient) is None:
         die(f"{me} is not allowed to send to {recipient}")
     m = re.search(r"^[ \t]*NONCE:[ \t]*(\S.*?)[ \t]*$", body_text, re.M)
@@ -1369,43 +1347,40 @@ def cmd_ping(plan_path, me):
             log_event("ping", result="fail", **{"from": me}, to=dst, run=run, why=failure)
             die(failure)
         sent = send_message(loaded, me, dst, "PING", body[0], [])
-        probes.append({"dest": dst, "nonce": nonce, "file": sent, "two": edge_between(edges, dst, me) is not None, "done": False})
+        if edge_between(edges, dst, me) is None:
+            say(f"NO-RETURN {dst} (the PING is delivered; {dst} has no arrow back to {me}, so no PONG is possible)")
+            log_event("ping", result="ok", **{"from": me}, to=dst, kind="no-return", run=run)
+            continue
+        probes.append({"dest": dst, "nonce": nonce, "file": sent, "done": False})
     deadline = start + OPTS["timeout"]
     while any(not pr["done"] for pr in probes) and time.time() < deadline:
         for pr in probes:
             if pr["done"]:
                 continue
             ok = False
-            if pr["two"]:
-                pp = pong_path(nodes, me, pr["nonce"])
-                if pp.is_file():
-                    pp.unlink()
-                    ok = True
-                else:
-                    for entry in message_names(nodes[me]):
-                        verb, _sender, nonce = read_head(entry)
-                        if verb == "PONG" and nonce == pr["nonce"]:
-                            entry.unlink(missing_ok=True)
-                            ok = True
-                            break
-            elif not Path(pr["file"]).is_file():
+            pp = pong_path(nodes, me, pr["nonce"])
+            if pp.is_file():
+                pp.unlink()
                 ok = True
+            else:
+                for entry in message_names(nodes[me]):
+                    verb, _sender, nonce = read_head(entry)
+                    if verb == "PONG" and nonce == pr["nonce"]:
+                        entry.unlink(missing_ok=True)
+                        ok = True
+                        break
             if ok:
                 pr["done"] = True
-                kind = "PONG" if pr["two"] else "CONSUMED"
                 secs = f"{time.time() - start:.1f}s"
-                say(f"{kind} {pr['dest']} {secs}")
-                log_event("ping", result="ok", **{"from": me}, to=pr["dest"], kind=kind.lower(), seconds=secs, run=run)
+                say(f"PONG {pr['dest']} {secs}")
+                log_event("ping", result="ok", **{"from": me}, to=pr["dest"], kind="pong", seconds=secs, run=run)
         time.sleep(POLL_SECONDS)
     failed = False
     for pr in probes:
         if pr["done"]:
             continue
         failed = True
-        if pr["two"]:
-            want = f"no PONG after {OPTS['timeout']}s: the {pr['dest']} agent was not woken or did not answer"
-        else:
-            want = f"PING not removed after {OPTS['timeout']}s: the {pr['dest']} agent was not woken or did not handle it"
+        want = f"no PONG after {OPTS['timeout']}s: the {pr['dest']} agent was not woken or did not answer"
         say(f"TIMEOUT {pr['dest']} ({want})")
         log_event("ping", result="timeout", **{"from": me}, to=pr["dest"], nonce=pr["nonce"], run=run)
     if failed:
@@ -1458,7 +1433,7 @@ def main(argv):
     if SEND["retract"] and command != "send":
         die("--retract is only for channel-send")
     if SEND["timeout_given"] and command not in ("send", "ping"):
-        die("--timeout is only for channel-send and channel-ping")
+        die("--timeout is only for channel-ping and channel-send DEST PING")
     if OPTS["msgs"] and command != "send":
         die("-m is only for channel-send")
     if command == "setup":

@@ -31,7 +31,7 @@ import (
 const poll = 200 * time.Millisecond
 
 var (
-	ops    = []string{"<->", ">-<", "<-", "->", "--", "-<", ">-"}
+	ops    = []string{"<->", "<-<", ">->", ">-<", "->", "-<", "<-", ">-", "--"}
 	nameRE = regexp.MustCompile(`^(\d{8}-\d{6}\.\d{3})__(.+)__(\d+)\.md$`)
 	nodeRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]*$`)
 	msgRE  = regexp.MustCompile(`(?m)^[ \t]*message[ \t]+([A-Za-z][A-Za-z0-9_.-]*)[ \t]*\{`)
@@ -172,17 +172,18 @@ send returns after the first try; the final outcome goes to syslog.
 Success prints "WEBHOOK NAME CODE RESPONSE". Any failure prints a WARNING on
 stderr; the message stays queued and the exit status is still 0.
 
-A send (not PING/PONG) waits for its own message's outcome and ends with one
-line: DELIVERED PATH (DEST took it; exit 0), RETRACTED PATH -> WHERE (taken
-back, not delivered; exit 4) or ABORTED (never reached DEST's inbox; exit 4),
-also written to nodes/NODE/outcome/FILE. A signal or --timeout SEC retracts it.
+A send ends with DELIVERED PATH (exit 0) once the message is in DEST's inbox;
+whether DEST has taken or handled it is not part of the send. At a -> end it
+first waits (PENDING PATH) until DEST removes the previous message; a signal
+then prints ABORTED (exit 4) and nothing is sent.
 --retract MESSAGE takes one back (one rename; the receiver's claim is one
-rename too, so exactly one wins): RETRACTED (exit 0) or DELIVERED (exit 5).
-CHANNEL_SEND_WAIT=0 ends right after SENT with QUEUED PATH (outcome unknown).
+rename too, so exactly one wins): RETRACTED PATH -> WHERE or NOT-RETRACTED
+PATH (DEST already has it), both exit 0.
 
 PING and PONG (body NONCE: <value>) are built in on every arrow; a PING wakes
 the agent as FILE and the agent answers it. channel-send FILE NODE DEST PING
-[-m 'NONCE: V'] is channel-ping to DEST only (waits for the PONG, prints PONG or TIMEOUT);
+[-m 'NONCE: V'] is channel-ping to DEST only (waits for the PONG, prints PONG or TIMEOUT;
+NO-RETURN, without waiting, when DEST has no arrow back);
 a PONG is sent only to answer a PING from DEST still in NODE's inbox or claimed/. channel-ping always sends; with --all it starts a
 check-all: every node reached also checks its own arrows (once per run id,
 and at most once per --every minutes, default 30, env CHANNEL_CHECKALL_EVERY). Events go to syslog, tag agent-channel, as key=value
@@ -283,7 +284,7 @@ func main() {
 		die("--retract is only for channel-send")
 	}
 	if timeoutGiven && mode != "send" && mode != "ping" {
-		die("--timeout is only for channel-send and channel-ping")
+		die("--timeout is only for channel-ping and channel-send DEST PING")
 	}
 	if len(msgs) > 0 && mode != "send" {
 		die("-m is only for channel-send")
@@ -564,7 +565,7 @@ func parseDiag(text string) [][4]string {
 		opsFound, parts := splitOps(stmt)
 		if len(opsFound) == 0 {
 			if strings.ContainsAny(stmt, "<>") {
-				die("unrecognized arrow in: " + strings.TrimSpace(stmt) + ". Use ->, <->, or -<.")
+				die("unrecognized arrow in: " + strings.TrimSpace(stmt) + ". Use -> (one message in flight) or -< (many queue) at either end, e.g. ->, -<, <->, >-<, >->; see docs/diagram-marks.md.")
 			}
 			continue
 		}
@@ -573,7 +574,7 @@ func parseDiag(text string) [][4]string {
 			rest = strings.Replace(rest, op, " ", 1)
 		}
 		if strings.ContainsAny(rest, "<>") {
-			die("unrecognized arrow in: " + strings.TrimSpace(stmt) + ". Use ->, <->, or -<.")
+			die("unrecognized arrow in: " + strings.TrimSpace(stmt) + ". Use -> (one message in flight) or -< (many queue) at either end, e.g. ->, -<, <->, >-<, >->; see docs/diagram-marks.md.")
 		}
 		var nodes []string
 		for index, part := range parts {
@@ -659,21 +660,43 @@ func splitOps(stmt string) ([]string, []string) {
 	return found, parts
 }
 
+// The mark at the end a message arrives at sets that direction: a head pointing at the node is
+// one message in flight (wait), a crow's foot opening toward it is many (queue), no mark is none.
+// Each end is read on its own, so <-> >-< >-> <-< are two directions on one line. The same
+// directed pair given two different modes is an error (the same mode twice is a duplicate
+// edge, checked later).
 func expand(raw [][4]string) []edge {
 	var out []edge
+	seen := map[string]string{}
 	for _, item := range raw {
 		src, op, dst, label := item[0], item[1], item[2], item[3]
-		switch op {
-		case "<->":
-			out = append(out, edge{src, dst, "wait", label}, edge{dst, src, "wait", label})
-		case "->":
-			out = append(out, edge{src, dst, "wait", label})
-		case "-<":
-			out = append(out, edge{src, dst, "queue", label})
-		case "<-", "--", ">-", ">-<":
-			die(op + " is drawn by blockdiag and is not a channel. Use ->, <->, or -<. See docs/diagram-marks.md.")
-		default:
+		if !containsLine(ops, op) {
 			die("unknown operator " + op)
+		}
+		endMode := func(c byte, head byte) string {
+			switch {
+			case c == head:
+				return "wait"
+			case c == '<' || c == '>':
+				return "queue"
+			}
+			return ""
+		}
+		fwd := endMode(op[len(op)-1], '>')
+		back := endMode(op[0], '<')
+		if fwd == "" && back == "" {
+			die(src + " " + op + " " + dst + ": " + op + " has no mark at either end, so it is not a channel. Use -> (one message in flight) or -< (many queue) at either end, e.g. ->, -<, <->, >-<, >->; see docs/diagram-marks.md.")
+		}
+		for _, d := range [][3]string{{src, dst, fwd}, {dst, src, back}} {
+			if d[2] == "" {
+				continue
+			}
+			key := d[0] + "\x00" + d[1]
+			if prev, ok := seen[key]; ok && prev != d[2] {
+				die("conflicting rules for " + d[0] + " -> " + d[1] + ": " + prev + " and " + d[2] + " (from " + src + " " + op + " " + dst + "); give each direction one rule")
+			}
+			seen[key] = d[2]
+			out = append(out, edge{d[0], d[1], d[2], label})
 		}
 	}
 	return out
@@ -951,26 +974,28 @@ var actWatch = map[string][]string{
 		"  It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.",
 		"  If it prints ALREADY-WATCHING and exits, a watch for this node is already running: do not start another. If it exits with any other message, that is blocked (above).",
 		"  After a compaction, do not start another monitor while yours is still running.",
-		"  Long commands (sends, channel-ping): start each with the monitor tool (persistent: false), so its last line (the outcome) wakes you.",
+		"  Long commands (channel-ping, a send that may wait PENDING): start each with the monitor tool (persistent: false), so its last line wakes you.",
 	},
 	"cursor": {
 		"  Run exactly {WRAPPER} {PLAN} {NODE} as a background shell (block_until_ms: 0). Never run channel-arm yourself; the wrapper starts it once and it keeps running.",
-		"  Cursor wakes you only when a background shell finishes, so the wrapper ends as soon as a message is waiting: its last line is FILE <path> (the oldest message in your inbox). Handle that one file, rm it, then start the same wrapper command again before you end the turn; it waits for the next message, or ends at once if one is already waiting. If the file is already gone when you open it (the sender retracted it, or it was handled), skip it and start the wrapper again.",
+		"  Cursor wakes you only when a background shell finishes, so the wrapper ends as soon as a message is waiting: its last line is FILE <path> (the oldest message in your inbox). Handle that one file, rm it, then start the same wrapper command again before you end the turn; it waits for the next message, or ends at once if one is already waiting. If the file is already gone when you open it, you lost the race (see claim): say so in one line and start the wrapper again.",
 		"  If it ends with WATCH-ENDED, that is blocked (above), with the line before it (ALREADY-WATCHING there means another session watches this node). If it ends with neither FILE nor WATCH-ENDED (cursor killed it), start it again.",
 		"  After a compaction, start it again unless it is still running. The stop hook also reminds you of a waiting FILE.",
-		"  Long commands (sends, channel-ping): run each as a background shell (block_until_ms: 0) and read its last line (the outcome) before you report or resend, or read {OUTCOME}/<message file name>.",
+		"  Long commands (channel-ping, a send that may wait PENDING): run each as a background shell (block_until_ms: 0) and read its last line when it finishes.",
 	},
 }
 
 var actTail = []string{
-	"4. each FILE <path> is one message: handle the oldest (see read, ping, send), rm it when done, then end the turn.",
+	"4. each FILE <path> is one message: handle the oldest (see read, claim, ping, send), rm it when done, then end the turn.",
 	"ping: a PING is an ordinary message. It wakes you as FILE and nothing answers it for you, so your PONG is the proof that you were woken. Answer it at once, before other work:",
-	"  {BIN}/channel-send {PLAN} {NODE} <FROM> PONG -m 'NONCE: <the PING's NONCE value>'   (plus the lines of the plan's PONG message block, if it has one), then rm the PING. With no arrow back to <FROM>, just rm it.",
+	"  {BIN}/channel-send {PLAN} {NODE} <FROM> PONG -m 'NONCE: <the PING's NONCE value>'   (plus the lines of the plan's PONG message block, if it has one), then rm the PING.",
+	"  With no arrow back to <FROM> you cannot send a PONG: say in one line that you got a PING from <FROM>, rm it, and go back to watching.",
 	"  If the PING has SCOPE: all and RUN: <id>, then also start {BIN}/channel-ping --run <id> {PLAN} {NODE} in the background (see step 3) and report any TIMEOUT line it prints; it does nothing if this node already handled that run or ran a check-all in the last 30 minutes.",
-	"  A PONG for your own channel-ping is taken by the watch and never shown. To check a link yourself, run channel-ping (see tools); channel-send ... DEST PING is the same check for that one DEST (it sends the PING, waits for the PONG and prints PONG or TIMEOUT), so start either in the background (see step 3). channel-send refuses a PONG that does not answer a PING from DEST still in your inbox, so send the PONG before you rm the PING.",
+	"  A PONG for your own channel-ping is taken by the watch and never shown. To check a link yourself, run channel-ping (see tools); channel-send ... DEST PING is the same check for that one DEST, so start either in the background (see step 3). channel-send refuses a PONG that does not answer a PING from DEST still in your inbox, so send the PONG before you rm the PING.",
 	"start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.",
 	"read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.",
 	"  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.",
+	"claim: if mv or rm of a FILE says No such file, the sender took it back first: you lost the race. Say so in one line (LOST <file>: the sender took it back) and go back to watching for new messages; it is not an error.",
 	"send: {BIN}/channel-send {PLAN} {NODE} DEST VERB BODYFILE [REF ...]",
 	"  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB -m 'TEXT' [-m 'TEXT' ...] [REF ...]   (each -m is one block of lines; blocks are joined by a blank line)",
 	"  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB - [REF ...]   (- or no BODYFILE reads the body from stdin)",
@@ -978,13 +1003,13 @@ var actTail = []string{
 	"  Body: copy every line without <...> exactly. For a line with <...>, keep the text before < and replace <...> with a real value.",
 	"  Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.",
 	"  REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.",
-	"  On a -> arrow the send waits until DEST removes your previous message; on -< it queues. PING and PONG never wait.",
-	"  Every send except PING/PONG waits for the outcome of its own message and ends with exactly one line: DELIVERED <path> (DEST took it: moved it to claimed/ or removed it; exit 0), RETRACTED <path> -> <where> (taken back, DEST never got it; exit 4) or ABORTED (it never reached DEST's inbox; exit 4). The same line is written to {OUTCOME}/<message file name>. With --timeout SEC it is retracted if DEST has not taken it by then.",
-	"  So start every send in the background (see step 3) and keep handling your inbox: on a -> arrow it first waits for DEST to take your previous message, and this way two nodes that wait on each other cannot deadlock. Report or resend only after you have read its outcome line.",
-	"  take back: {BIN}/channel-send {PLAN} {NODE} --retract <path from SENT>. Exactly one of you and DEST wins: RETRACTED (exit 0) means DEST never got it; DELIVERED (exit 5) means DEST already took it. Stopping a running send (interrupt, or kill -TERM) does the same retract, or prints ABORTED if it was not in DEST's inbox yet.",
+	"  At a -> end (one message in flight) the send first waits until DEST removes your previous message there (it prints PENDING <path>); at a -< end (crow's foot) it sends at once. PING and PONG never wait.",
+	"  A send is done when channel-send returns: DELIVERED <path> (exit 0) means the message is in DEST's inbox, and that ends your part. Never check DEST's inbox, its claimed/ or channel-status to see whether DEST has taken or handled it. A failed send exits non-zero with its reason; that is the only send result you act on. If you need an answer, it comes as a message in your own inbox (FILE).",
+	"  Start a send that may wait (PENDING) in the background (see step 3) and keep handling your inbox, so two nodes that wait on each other cannot deadlock.",
+	"  take back: {BIN}/channel-send {PLAN} {NODE} --retract <path from SENT>. It is one rename, so exactly one of you and DEST gets the file: RETRACTED <path> -> <where> (DEST never got it) or NOT-RETRACTED <path> (DEST already has it; you lost the race). Both exit 0: report which, and carry on. Stopping a send while it is PENDING prints ABORTED; nothing was sent.",
 	"done: rm the FILE when you have finished it (from claimed/ only after your reply is sent). Removing it is the acknowledgement.",
-	"tools: {BIN}/channel-ping {PLAN} {NODE} sends a PING on each of your arrows and waits for that agent's own PONG (on a one-way arrow, for it to rm the PING); if none comes it prints TIMEOUT <DEST> (... the <DEST> agent was not woken or did not answer) and exits 1. Run it in the background (see step 3) so you can still answer PINGs; with --all every node it reaches passes the check on.",
-	"  {BIN}/channel-status {PLAN} shows each inbox's message count, oldest age, and claimed files.",
+	"tools: {BIN}/channel-ping {PLAN} {NODE} sends a PING on each of your arrows. Where DEST has an arrow back to you it waits only for DEST's PONG in your own inbox; if none comes it prints TIMEOUT <DEST> (... the <DEST> agent was not woken or did not answer) and exits 1. Where DEST has no arrow back it prints NO-RETURN <DEST> (the PING is delivered; no PONG is possible). Run it in the background (see step 3) so you can still answer PINGs; with --all every node it reaches passes the check on.",
+	"  {BIN}/channel-status {PLAN} shows each inbox's message count, oldest age, and claimed files; it is for David or for diagnosing a stuck node, not for checking your sends.",
 	"after a compaction, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again and follow it (do not start a second watch), then check claimed/ (see start).",
 	"duties (from the plan; PING and PONG are allowed on every arrow as well):",
 }
@@ -1004,7 +1029,7 @@ func emitAct(me string, p plan) {
 		die("cannot find this program's path for the header: " + err.Error())
 	}
 	bin := filepath.Dir(exe)
-	r := strings.NewReplacer("{NODE}", me, "{PLAN}", plan, "{INBOX}", inbox, "{BIN}", bin, "{AGENT}", kind, "{WRAPPER}", wrapper, "{OUTCOME}", filepath.Join(filepath.Dir(inbox), "outcome"))
+	r := strings.NewReplacer("{NODE}", me, "{PLAN}", plan, "{INBOX}", inbox, "{BIN}", bin, "{AGENT}", kind, "{WRAPPER}", wrapper)
 	var lines []string
 	lines = append(lines, actHead...)
 	lines = append(lines, actWatch[kind]...)
@@ -1405,62 +1430,59 @@ func senderOf(name string) string {
 	return m[2]
 }
 
-// cmdSend publishes the message and, unless it is a PING or PONG, waits for its outcome and
-// ends with exactly one line: DELIVERED (DEST took it: moved it out of its inbox or removed
-// it; exit 0), RETRACTED (taken back into nodes/ME/retracted/, not delivered; exit 4), or
-// ABORTED (stopped before it reached DEST's inbox; exit 4). A signal or --timeout retracts.
-// CHANNEL_SEND_WAIT=0 skips the wait and ends with QUEUED (the outcome is then unknown).
+// cmdSend publishes the message and ends with DELIVERED <path> once it is in DEST's inbox
+// (exit 0). Whether or when DEST takes or handles it is not channel-send's business. A signal
+// while it is PENDING (before the rename into DEST's inbox) prints ABORTED and exits 4.
 func cmdSend(path, me, recipient, verb string, bodyText []byte, refs []string) {
+	if _, set := os.LookupEnv("CHANNEL_SEND_WAIT"); set {
+		die("CHANNEL_SEND_WAIT was removed; channel-send returns once the message is in DEST's inbox")
+	}
 	p := loadPlan(path)
 	requireMe(me, p)
 	if verb == "PING" {
 		sendPing(p, path, me, recipient, string(bodyText))
 		return
 	}
+	if timeoutGiven {
+		die("--timeout is only for channel-ping and channel-send DEST PING; a send ends once the message is in DEST's inbox")
+	}
 	controlGate(p, me, recipient, verb, string(bodyText))
-	control := isControl(verb) && hasNonce(string(bodyText))
-	wait := os.Getenv("CHANNEL_SEND_WAIT")
-	if wait != "" && wait != "0" && wait != "1" {
-		die("CHANNEL_SEND_WAIT must be 0 or 1")
-	}
 	sig := make(chan os.Signal, 1)
-	if !control {
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-		go func() {
-			s := <-sig
-			publishMu.Lock()
-			dest := published
-			if dest == "" {
-				say("ABORTED " + recipient + " " + verb + " (not sent: " + s.String() + " before it reached " + recipient + "'s inbox)")
-				logEvent("outcome", "result", "aborted", "from", me, "to", recipient, "verb", verb)
-				os.Exit(4)
-			}
-			line, code := retractMessage(p, me, dest, "stopped by "+s.String())
-			finishOutcome(p, me, dest, line)
-			os.Exit(code)
-		}()
-	}
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	go func() {
+		s := <-sig
+		publishMu.Lock()
+		dest := published
+		if dest == "" {
+			say("ABORTED " + recipient + " " + verb + " (not sent: " + s.String() + " before it reached " + recipient + "'s inbox)")
+			logEvent("send", "result", "aborted", "from", me, "to", recipient, "verb", verb)
+			os.Exit(4)
+		}
+		say("DELIVERED " + dest)
+		os.Exit(0)
+	}()
 	dest := sendMessage(p, me, recipient, verb, bodyText, refs)
-	if control {
-		return
-	}
-	if wait == "0" {
-		say("QUEUED " + dest)
-		return
-	}
-	line, code := awaitOutcome(p, me, dest)
-	publishMu.Lock()
-	finishOutcome(p, me, dest, line)
-	os.Exit(code)
+	publishMu.Lock() // held until exit, so a late signal cannot print a second line
+	say("DELIVERED " + dest)
 }
 
 func retractedPath(p plan, me, dest string) string {
 	return filepath.Join(filepath.Dir(p.nodes[me]), "retracted", filepath.Base(dest))
 }
 
+// inboxOwner names the node whose inbox dir is.
+func inboxOwner(p plan, dir string) string {
+	for name, ib := range p.nodes {
+		if abs, err := filepath.Abs(ib); err == nil && abs == dir {
+			return name
+		}
+	}
+	return "DEST"
+}
+
 // retractMessage takes dest back with one rename into nodes/ME/retracted/. The receiver's
-// claim is also one rename (or unlink), so exactly one of them wins.
-func retractMessage(p plan, me, dest, why string) (string, int) {
+// claim is also one rename (or unlink), so exactly one of them wins. Returns (line, won).
+func retractMessage(p plan, me, dest, why string) (string, bool) {
 	rp := retractedPath(p, me, dest)
 	old := syscall.Umask(0o002)
 	if err := os.MkdirAll(filepath.Dir(rp), 0o775); err != nil {
@@ -1471,79 +1493,19 @@ func retractMessage(p plan, me, dest, why string) (string, int) {
 	err := os.Rename(dest, rp)
 	switch {
 	case err == nil:
-		return "RETRACTED " + dest + " -> " + rp + " (" + why + ")", 4
+		return "RETRACTED " + dest + " -> " + rp + " (" + why + ")", true
 	case errors.Is(err, os.ErrNotExist):
 		if fileExists(rp) {
-			return "RETRACTED " + dest + " -> " + rp + " (already retracted)", 4
+			return "RETRACTED " + dest + " -> " + rp + " (already retracted)", true
 		}
-		return "DELIVERED " + dest, 0
+		return "NOT-RETRACTED " + dest + " (" + inboxOwner(p, filepath.Dir(dest)) + " already has it)", false
 	}
 	die("cannot retract " + dest + ": " + err.Error())
-	return "", 1
+	return "", false
 }
 
-// awaitOutcome waits until dest leaves DEST's inbox (or --timeout, which retracts).
-func awaitOutcome(p plan, me, dest string) (string, int) {
-	inbox := filepath.Dir(dest)
-	events := make(chan struct{}, 1)
-	ended := make(chan struct{})
-	if proc := tryInotify([]string{"inotifywait", "-m", "-q", "-e", "moved_from", "-e", "delete", "--format", "%f", inbox}); proc != nil {
-		defer stopProc(proc)
-		go func() {
-			sc := bufio.NewScanner(proc)
-			for sc.Scan() {
-				select {
-				case events <- struct{}{}:
-				default:
-				}
-			}
-			close(ended)
-		}()
-	}
-	var deadline time.Time
-	if timeoutGiven {
-		deadline = time.Now().Add(time.Duration(pingTimeout) * time.Second)
-	}
-	for fileExists(dest) {
-		if timeoutGiven && !time.Now().Before(deadline) {
-			publishMu.Lock()
-			line, code := retractMessage(p, me, dest, "not taken within "+strconv.Itoa(pingTimeout)+"s")
-			publishMu.Unlock()
-			return line, code
-		}
-		select {
-		case <-events:
-		case <-ended:
-			if fileExists(dest) {
-				die("inotifywait ended while waiting for the outcome of " + dest + "; it may still be in the inbox: run channel-send " + p.path + " " + me + " --retract " + dest)
-			}
-		case <-time.After(poll):
-		}
-	}
-	if fileExists(retractedPath(p, me, dest)) {
-		return "RETRACTED " + dest + " -> " + retractedPath(p, me, dest) + " (by --retract)", 4
-	}
-	return "DELIVERED " + dest, 0
-}
-
-// finishOutcome prints the one outcome line and records it in nodes/ME/outcome/<file>.
-func finishOutcome(p plan, me, dest, line string) {
-	say(line)
-	dir := filepath.Join(filepath.Dir(p.nodes[me]), "outcome")
-	old := syscall.Umask(0o002)
-	if err := os.MkdirAll(dir, 0o775); err == nil {
-		if err := os.WriteFile(filepath.Join(dir, filepath.Base(dest)), []byte(line+"\n"), 0o664); err != nil {
-			note("WARNING: cannot record the outcome in " + dir + ": " + err.Error())
-		}
-	} else {
-		note("WARNING: cannot record the outcome in " + dir + ": " + err.Error())
-	}
-	syscall.Umask(old)
-	result := strings.ToLower(strings.Fields(line)[0])
-	logEvent("outcome", "result", result, "from", me, "file", dest)
-}
-
-// cmdRetract takes one of this node's messages back, if DEST has not taken it yet.
+// cmdRetract takes one of this node's messages back. Exactly one of the sender and DEST gets
+// it: RETRACTED or NOT-RETRACTED, both exit 0. A message this node never sent dies.
 func cmdRetract(path, me, msg string) {
 	p := loadPlan(path)
 	requireMe(me, p)
@@ -1573,29 +1535,29 @@ func cmdRetract(path, me, msg string) {
 		}
 		inboxes = []string{dir}
 	}
+	lost := ""
 	for _, ib := range inboxes {
 		dest := filepath.Join(ib, base)
-		rp := retractedPath(p, me, dest)
-		line, code := retractMessage(p, me, dest, "--retract")
-		if code == 4 && !strings.HasSuffix(line, "(already retracted)") {
-			finishOutcome(p, me, dest, line)
+		line, won := retractMessage(p, me, dest, "--retract")
+		if won {
+			say(line)
+			logEvent("retract", "result", "retracted", "from", me, "file", dest)
 			os.Exit(0)
 		}
-		if fileExists(rp) {
-			say(line)
-			os.Exit(0)
+		if lost == "" {
+			lost = line
 		}
 	}
 	seq, _ := strconv.Atoi(m[3])
 	if !fileExists(filepath.Join(filepath.Dir(p.nodes[me]), "out-seq.d", strconv.Itoa(seq))) {
 		die("--retract: no message " + base + " was sent by " + me)
 	}
-	dest := base
-	if len(inboxes) == 1 {
-		dest = filepath.Join(inboxes[0], base)
+	if len(inboxes) != 1 {
+		lost = "NOT-RETRACTED " + base + " (DEST already has it)"
 	}
-	finishOutcome(p, me, dest, "DELIVERED "+dest)
-	os.Exit(5)
+	say(lost)
+	logEvent("retract", "result", "not-retracted", "from", me, "file", base)
+	os.Exit(0)
 }
 
 func isControl(verb string) bool { return verb == "PING" || verb == "PONG" }
@@ -2101,8 +2063,8 @@ func hasEdge(p plan, src, dst string) bool {
 
 // sendPing: channel-send FILE ME DEST PING is channel-ping limited to DEST (same code): the body
 // may be empty or give NONCE: <value> and lines of the plan's PING block; it sends the PING,
-// waits for the PONG (CHANNEL_PING_TIMEOUT / --timeout, default 300s) and prints PONG, CONSUMED
-// or TIMEOUT (exit 1).
+// waits for the PONG (CHANNEL_PING_TIMEOUT / --timeout, default 300s) and prints PONG
+// or TIMEOUT (exit 1), or NO-RETURN without waiting when DEST has no arrow back.
 func sendPing(p plan, path, me, recipient, body string) {
 	if !hasEdge(p, me, recipient) {
 		die(me + " is not allowed to send to " + recipient)
@@ -2152,7 +2114,7 @@ func cmdPing(path, me string) {
 	}
 	type probe struct {
 		dest, nonce, file string
-		twoWay, done      bool
+		done              bool
 	}
 	var probes []*probe
 	start := time.Now()
@@ -2164,7 +2126,7 @@ func cmdPing(path, me string) {
 		if pingNonce != "" {
 			nonce = pingNonce
 		}
-		pr := &probe{dest: e.dst, nonce: nonce, twoWay: hasEdge(p, e.dst, me)}
+		pr := &probe{dest: e.dst, nonce: nonce}
 		keys, fields := []string{"NONCE"}, map[string]string{"NONCE": nonce}
 		if pingAll {
 			keys = append(keys, "SCOPE", "RUN")
@@ -2176,6 +2138,11 @@ func cmdPing(path, me string) {
 			die(failure)
 		}
 		pr.file = sendMessage(p, me, e.dst, "PING", []byte(body), nil)
+		if !hasEdge(p, e.dst, me) {
+			say("NO-RETURN " + e.dst + " (the PING is delivered; " + e.dst + " has no arrow back to " + me + ", so no PONG is possible)")
+			logEvent("ping", "result", "ok", "from", me, "to", e.dst, "kind", "no-return", "run", run)
+			continue
+		}
 		probes = append(probes, pr)
 	}
 	deadline := start.Add(time.Duration(pingTimeout) * time.Second)
@@ -2186,34 +2153,26 @@ func cmdPing(path, me string) {
 				continue
 			}
 			ok := false
-			if pr.twoWay {
-				pp := pongPath(p, me, pr.nonce)
-				if fileExists(pp) {
-					_ = os.Remove(pp)
-					ok = true
-				} else {
-					for _, name := range messageNames(p.nodes[me]) {
-						full := filepath.Join(p.nodes[me], name)
-						if v, _, n := readHead(full); v == "PONG" && n == pr.nonce {
-							_ = os.Remove(full)
-							ok = true
-							break
-						}
+			pp := pongPath(p, me, pr.nonce)
+			if fileExists(pp) {
+				_ = os.Remove(pp)
+				ok = true
+			} else {
+				for _, name := range messageNames(p.nodes[me]) {
+					full := filepath.Join(p.nodes[me], name)
+					if v, _, n := readHead(full); v == "PONG" && n == pr.nonce {
+						_ = os.Remove(full)
+						ok = true
+						break
 					}
 				}
-			} else if !fileExists(pr.file) {
-				ok = true
 			}
 			if ok {
 				pr.done = true
 				left--
-				kind := "PONG"
-				if !pr.twoWay {
-					kind = "CONSUMED"
-				}
 				secs := fmt.Sprintf("%.1fs", time.Since(start).Seconds())
-				say(kind + " " + pr.dest + " " + secs)
-				logEvent("ping", "result", "ok", "from", me, "to", pr.dest, "kind", strings.ToLower(kind), "seconds", secs, "run", run)
+				say("PONG " + pr.dest + " " + secs)
+				logEvent("ping", "result", "ok", "from", me, "to", pr.dest, "kind", "pong", "seconds", secs, "run", run)
 			}
 		}
 		time.Sleep(poll)
@@ -2225,9 +2184,6 @@ func cmdPing(path, me string) {
 		}
 		failed = true
 		want := "no PONG after " + strconv.Itoa(pingTimeout) + "s: the " + pr.dest + " agent was not woken or did not answer"
-		if !pr.twoWay {
-			want = "PING not removed after " + strconv.Itoa(pingTimeout) + "s: the " + pr.dest + " agent was not woken or did not handle it"
-		}
 		say("TIMEOUT " + pr.dest + " (" + want + ")")
 		logEvent("ping", "result", "timeout", "from", me, "to", pr.dest, "nonce", pr.nonce, "run", run)
 	}

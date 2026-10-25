@@ -4,7 +4,7 @@ One inbox directory per agent. A sender renames a finished file into that inbox.
 
 ## The problem
 
-Agents that poll a mailbox spend their context window on the waiting. A long-running script watches one directory and wakes the agent only when a file is ready. A blockdiag file says who may speak, and whether a second message waits. Message blocks in that same file say what each word means and what the body looks like.
+Agents that poll a mailbox spend their context window on the waiting. A long-running script watches one directory and wakes the agent only when a file is ready. A blockdiag file says who may speak, and whether a second message waits (`->`, one in flight) or queues (`-<`). Message blocks in that same file say what each word means and what the body looks like.
 
 ## Dependencies
 
@@ -46,7 +46,7 @@ channel-send /path/to/comms.diag planner coder IMPLEMENT body.md
 
 When the work is done, the coder removes that one inbox file with `rm`.
 
-The send then waits and ends with one outcome line: `DELIVERED` once the coder took the file (moved it to `claimed/` or removed it), or `RETRACTED` / `ABORTED` if the planner took it back (`channel-send ... --retract PATH`, `--timeout SEC`, or a signal) before the coder did. See [bin/README.md](bin/README.md#delivery-outcome-and-retract).
+The send prints `SENT PATH`, then `DELIVERED PATH` (exit 0) once the file is in the coder's inbox, and returns. The sender's part ends there; it does not watch whether the coder has taken it. On a `->` arrow a second send prints `PENDING` and waits until the coder removes the first file; stopping it then prints `ABORTED` (nothing sent). `channel-send ... --retract PATH` takes a message back: `RETRACTED` if the coder had not taken it, `NOT-RETRACTED` if it had. See [bin/README.md](bin/README.md#send-and-retract).
 
 `body.md` has to match the `IMPLEMENT` message block. Lines with `<...>` are filled in. The other lines are copied as written. After a restart, `channel-arm /path/to/comms.diag coder --whatineedtoknow` prints the nodes and messages this coder uses, then exits. The same flag works on `channel-setup` and `channel-send`.
 
@@ -57,7 +57,7 @@ The send then waits and ends with one outcome line: `DELIVERED` once the coder t
 | [example/comms.diag](example/comms.diag) | A planner and a coder. Copy this and change the paths. |
 | [bin/README.md](bin/README.md) | What each script is for. |
 | [docs/plan-file.md](docs/plan-file.md) | `node`, `verb`, and `message` syntax. |
-| [docs/diagram-marks.md](docs/diagram-marks.md) | Why the arrow operators are `->`, `<->`, and `-<`. |
+| [docs/diagram-marks.md](docs/diagram-marks.md) | The arrow marks: `->` (one in flight), `-<` (queue), both on one line (`<->`, `>-<`, `>->`), and what blockdiag draws. |
 | [prompts/](prompts/) | Text to give each agent, and how to grant the scripts. |
 
 The license is [MIT](LICENSE).

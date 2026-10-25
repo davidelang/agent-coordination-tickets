@@ -1,9 +1,14 @@
-# -> waits. One unremoved file from that sender, then the next send waits until it is removed.
-# -< does not wait. Files queue at the crow's foot, and that foot can be at either end.
-# <-> is -> in both directions.
+# -> one message in flight: the next send waits until DEST removes the last one.
+# -< many queue: each send goes at once and files pile up at the crow's foot.
+# The mark is at the receiving end: an arrowhead (> on the right, < on the left) is ->,
+# a crow's foot (< on the right, > on the left) is -<.
+# One line can carry both directions: <->, >-<, >->.
+# blockdiag 3.0 draws all of these except >-> and <-< (see docs/diagram-marks.md).
 
 blockdiag {
-  planner <-> coder;
+  # planner to coder: one task in flight (planner waits for coder to finish it).
+  # coder to planner: reports queue (coder never waits on planner).
+  planner >-> coder;
 }
 
 /*

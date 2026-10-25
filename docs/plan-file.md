@@ -51,12 +51,16 @@ The text inside the outer braces is what the agent learns. `channel-arm FILE NOD
 
 ## Arrows
 
-Above the diagram, three lines are enough:
+Above the diagram, a few comment lines are enough:
 
 ```
-# -> waits. One unremoved file from that sender, then the next send waits.
-# -< does not wait. Files queue at the crow's foot, and that foot can be at either end.
-# <-> is -> in both directions.
+# -> one message in flight: the next send waits until DEST removes the last one.
+# -< many queue: each send goes at once and files pile up at the crow's foot.
+# The mark is at the receiving end: an arrowhead (> on the right, < on the left) is ->,
+# a crow's foot (< on the right, > on the left) is -<.
+# One line can carry both directions: <->, >-<, >->.
 ```
+
+For example `planner >-> coder;` means planner to coder waits (one task in flight) and coder to planner queues. `--` has no mark, so it is not a channel and is an error; any other mix of `<` and `>`, and two lines that give one direction different rules, are errors too. The same direction given twice with the same rule is a duplicate edge, also an error.
 
 The background for those operators is [diagram-marks.md](diagram-marks.md).

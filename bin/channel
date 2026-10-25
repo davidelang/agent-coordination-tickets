@@ -1391,7 +1391,7 @@ send_signal() {
 # inbox_owner INBOX: the node whose inbox that directory is.
 inbox_owner() {
   awk -F '\t' '$1=="N" { print $2 "\t" $3 }' "$PARSE" | while IFS='	' read -r oname opath; do
-    [ "$(abs_path "$opath")" = "$1" ] && printf '%s\n' "$oname"
+    if [ "$(abs_path "$opath")" = "$1" ]; then printf '%s\n' "$oname"; fi
   done
 }
 

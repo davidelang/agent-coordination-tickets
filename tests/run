@@ -1220,6 +1220,13 @@ for impl in go sh py; do
   mkdir -p "$Z/nodes/q/inbox/claimed"; mv "$f" "$Z/nodes/q/inbox/claimed/"
   rc=0; $S "$Z/z.diag" s --retract "$f" > "$Z/$impl-r3" 2>&1 || rc=$?
   if [ "$rc" = 0 ] && [ "$(cat "$Z/$impl-r3")" = "NOT-RETRACTED $f (q already has it)" ]; then ok "$impl retract lost: NOT-RETRACTED (exit 0)"; else bad "$impl retract lost: $rc $(cat "$Z/$impl-r3")"; fi
+  # retract lost: DEST (r, not the last node in the plan) removed it first
+  rm -f "$Z"/nodes/r/inbox/*.md
+  $S "$Z/z.diag" s r NOTE -m 'NOTE: six' > "$Z/$impl-q3" 2>&1
+  f=$(sed -n 's/^SENT //p' "$Z/$impl-q3")
+  rm -f "$f"
+  rc=0; $S "$Z/z.diag" s --retract "$f" > "$Z/$impl-r7" 2>&1 || rc=$?
+  if [ "$rc" = 0 ] && [ "$(cat "$Z/$impl-r7")" = "NOT-RETRACTED $f (r already has it)" ]; then ok "$impl retract lost to a removed file: NOT-RETRACTED (exit 0)"; else bad "$impl retract lost (removed): $rc $(cat "$Z/$impl-r7")"; fi
   # a message this node never sent, or another node's message, dies
   rc=0; $S "$Z/z.diag" s --retract "$Z/nodes/q/inbox/20260101-000000.000__s__9999.md" > "$Z/$impl-r4" 2>&1 || rc=$?
   if [ "$rc" = 1 ] && grep -q 'no message 20260101-000000.000__s__9999.md was sent by s' "$Z/$impl-r4"; then ok "$impl retract of a never-sent message dies"; else bad "$impl retract never sent: $rc $(cat "$Z/$impl-r4")"; fi

@@ -92,7 +92,11 @@ dry=0
 what=0
 wh_job=0
 flag_mode=
-MSGS=$(mktemp)
+# -m texts, joined by a blank line; written to a draft in the node directory by cmd_send.
+MSGS_TEXT=
+NL='
+'
+TAB='	'
 # Set only by cmd_ping for its own PING (in a subshell); never taken from the environment.
 INTERNAL_PING=0
 PING_ONLY=
@@ -112,8 +116,8 @@ while [ $# -gt 0 ]; do
     -n|--dry-run) dry=1; shift ;;
     --whatineedtoknow) what=1; shift ;;
     -m)
-      [ "$nmsg" -eq 0 ] || printf '\n' >> "$MSGS"
-      printf '%s\n' "$2" >> "$MSGS"
+      [ "$nmsg" -eq 0 ] || MSGS_TEXT=$MSGS_TEXT$NL
+      MSGS_TEXT=$MSGS_TEXT$2$NL
       nmsg=$((nmsg + 1))
       shift 2
       ;;
@@ -164,10 +168,13 @@ else
   invoked="channel --$mode"
 fi
 
-PARSE=$(mktemp)
-SHOWN=$(mktemp)
-BODYTMP=$(mktemp)
-trap 'rm -f "$PARSE" "$SHOWN" "$MSGS" "$BODYTMP"' EXIT INT TERM
+# channel never writes outside the plan's node directories. The parsed plan, the last
+# shown file, and the ping probes live in shell variables; the only scratch file is a
+# send's body draft, in the sending node's inbox under drafts/ (see make_draft).
+PARSE_DATA=
+SHOWN=
+DRAFT=
+trap 'if [ -n "$DRAFT" ]; then rm -f -- "$DRAFT"; fi' EXIT
 [ -z "$retract_arg" ] || [ "$mode" = send ] || die "--retract is only for channel-send"
 [ "$timeout_given" -eq 0 ] || [ "$mode" = send ] || [ "$mode" = ping ] || die "--timeout is only for channel-ping and channel-send DEST PING"
 [ "$nmsg" -eq 0 ] || [ "$mode" = send ] || die "-m is only for channel-send"
@@ -199,8 +206,11 @@ log_event() {
   fi
 }
 
+# The parsed plan (tab-separated records) for the awk readers below.
+parsed() { printf '%s\n' "$PARSE_DATA"; }
+
 parse_plan() {
-  awk -v plan="$1" '
+  PARSE_DATA=$(awk -v plan="$1" '
 function die(msg) { print msg > "/dev/stderr"; exit 1 }
 function count_nl(s,    i, n) {
   n = 0
@@ -584,7 +594,7 @@ BEGIN {
     for (k = 1; k <= nb; k++) if (bl[k] != "") print "B\t" bl[k]
   }
 }
-' "$1" > "$PARSE"
+' "$1")
 }
 
 require_me() {
@@ -596,7 +606,7 @@ require_me() {
     [A-Za-z]*) ;;
     *) die "node must be a bare name, not a path ($me)" ;;
   esac
-  awk -F '\t' -v m="$me" '$1=="N" && $2==m { found=1 } END { exit !found }' "$PARSE" \
+  parsed | awk -F '\t' -v m="$me" '$1=="N" && $2==m { found=1 } END { exit !found }' \
     || die "$me is not a node in $PLAN"
 }
 
@@ -608,7 +618,7 @@ abs_path() {
 
 report_edges() {
   say "OK $(abs_path "$PLAN")"
-  awk -F '\t' '$1=="E" { extra = ($5 != "" ? " " $5 : ""); print $2 " -> " $3 " " $4 extra }' "$PARSE"
+  parsed | awk -F '\t' '$1=="E" { extra = ($5 != "" ? " " $5 : ""); print $2 " -> " $3 " " $4 extra }'
   say "dry-run"
 }
 
@@ -696,7 +706,7 @@ tools: $bindir/channel-ping $plan $me sends a PING on each of your arrows. Where
 after a compaction, run $bindir/channel-arm $plan $me --whatineedtoknow again and follow it (do not start a second watch), then check claimed/ (see start).
 duties (from the plan; PING and PONG are allowed on every arrow as well):
 ACTEOF
-  awk -F '\t' -v me="$me" '
+  parsed | awk -F '\t' -v me="$me" '
 $1=="E" { ec++; es[ec] = $2; ed[ec] = $3; emode[ec] = $4; next }
 $1=="V" { verb[$2 " " $3] = $4; next }
 END {
@@ -705,7 +715,7 @@ END {
     if (ed[i] == me) print "  receive from " es[i] " (" emode[i] "): " verb[es[i] " " ed[i]]
   }
   print ""
-}' "$PARSE"
+}'
 }
 
 abs_path() {
@@ -717,7 +727,7 @@ abs_path() {
 
 emit_what() {
   emit_act "$1"
-  awk -F '\t' -v me="$1" '
+  parsed | awk -F '\t' -v me="$1" '
 function sort_into(src, dst,    n, i, j, tmp, k) {
   n = 0
   for (k in src) { n++; dst[n] = k }
@@ -757,11 +767,11 @@ END {
     print "}"
   }
 }
-' "$PARSE"
+'
 }
 
 node_path() {
-  awk -F '\t' -v m="$1" '$1=="N" && $2==m { print $3 }' "$PARSE"
+  parsed | awk -F '\t' -v m="$1" '$1=="N" && $2==m { print $3 }'
 }
 
 json_str() {
@@ -771,17 +781,23 @@ json_str() {
 # One POST. Sets code, resp, and retry (0 only for 401, 403, 404, 405, 410: a wrong key or
 # URL, which no retry fixes; 400 is retried, since a webhook host can report its rate limit as 400).
 post_once() {
-  wout=$(mktemp) || { code="mktemp failed"; resp=; retry=0; return 0; }
+  # The response body and, on the last line, the status code; no file.
+  wrc=0
   if [ -n "$2" ]; then
-    code=$(printf 'header = "Authorization: Bearer %s"\n' "$2" | curl -sS -o "$wout" -w '%{http_code}' \
+    wres=$(printf 'header = "Authorization: Bearer %s"\n' "$2" | curl -sS -w '\n%{http_code}' \
       --connect-timeout 5 --max-time 15 -X POST -K - -H 'Content-Type: application/json' \
-      --data-binary "$3" -- "$1" 2>&1) || code="curl error: $code"
+      --data-binary "$3" -- "$1" 2>&1) || wrc=$?
   else
-    code=$(curl -sS -o "$wout" -w '%{http_code}' --connect-timeout 5 --max-time 15 -X POST \
-      -H 'Content-Type: application/json' --data-binary "$3" -- "$1" 2>&1) || code="curl error: $code"
+    wres=$(curl -sS -w '\n%{http_code}' --connect-timeout 5 --max-time 15 -X POST \
+      -H 'Content-Type: application/json' --data-binary "$3" -- "$1" 2>&1) || wrc=$?
   fi
-  code=$(printf '%s' "$code" | tr '\n' ' ')
-  resp=$(head -c 300 "$wout" 2>/dev/null | tr '\n' ' '); rm -f "$wout"
+  if [ "$wrc" -ne 0 ]; then
+    code="curl error: $(printf '%s' "$wres" | tr '\n' ' ')"
+    resp=
+  else
+    code=${wres##*"$NL"}
+    resp=$(printf '%s' "${wres%"$NL"*}" | head -c 300 | tr '\n' ' ')
+  fi
   case "$code" in
     401|403|404|405|410) retry=0 ;;
     *) retry=1 ;;
@@ -791,7 +807,7 @@ post_once() {
 # After a successful send: POST to the recipient's webhook if its node line has one.
 # Failures warn on stderr and never change the exit status; the message stays queued.
 fire_webhook() {
-  wline=$(awk -F '\t' -v m="$1" '$1=="W" && $2==m { print; exit }' "$PARSE")
+  wline=$(parsed | awk -F '\t' -v m="$1" '$1=="W" && $2==m { print; exit }')
   [ -n "$wline" ] || return 0
   wurl=$(printf '%s\n' "$wline" | cut -f3)
   wfile=$(printf '%s\n' "$wline" | cut -f4)
@@ -904,7 +920,7 @@ control_gate() {
 }
 
 has_edge() {
-  awk -F '\t' -v s="$1" -v d="$2" '$1=="E" && $2==s && $3==d { found=1 } END { exit !found }' "$PARSE"
+  parsed | awk -F '\t' -v s="$1" -v d="$2" '$1=="E" && $2==s && $3==d { found=1 } END { exit !found }'
 }
 
 pong_path() {
@@ -918,7 +934,7 @@ pong_path() {
 control_body() {
   cverb_=$1
   shift
-  awk -F '\t' -v verb="$cverb_" -v kv="$(printf '%s\n' "$@")" -v plan="$PLAN" '
+  parsed | awk -F '\t' -v verb="$cverb_" -v kv="$(printf '%s\n' "$@")" -v plan="$PLAN" '
 BEGIN {
   n = split(kv, a, "\n")
   for (i = 1; i <= n; i++) {
@@ -955,7 +971,7 @@ END {
   }
   for (i = 1; i <= m; i++) print out[i]
   for (i = 1; i <= no; i++) if (!(order[i] in used)) print order[i] ": " val[order[i]]
-}' "$PARSE"
+}'
 }
 
 # channel-arm files a PONG for channel-ping so the agent is not woken by the answer to its own
@@ -996,7 +1012,7 @@ oldest_name() {
 announce() {
   inbox=$1
   [ -d "$inbox" ] || die "inbox disappeared: $inbox"
-  shown=$(cat "$SHOWN" 2>/dev/null || true)
+  shown=$SHOWN
   handle_control "$inbox"
   oldest=$(oldest_name "$inbox")
   if [ "$oldest" = "$shown" ]; then
@@ -1007,12 +1023,12 @@ announce() {
   fi
   [ -z "$shown" ] || log_event consumed node "$ARM_ME" file "$inbox/$shown"
   if [ -z "$oldest" ]; then
-    : > "$SHOWN"
+    SHOWN=
     return 0
   fi
   say "FILE $inbox/$oldest"
   log_event deliver node "$ARM_ME" file "$inbox/$oldest"
-  printf '%s\n' "$oldest" > "$SHOWN"
+  SHOWN=$oldest
 }
 
 watch_oldest() {
@@ -1179,7 +1195,7 @@ wait_until_removed() {
 check_body() {
   verb=$1
   body=$2
-  awk -F '\t' -v verb="$verb" -v body="$body" '
+  parsed | awk -F '\t' -v verb="$verb" -v body="$body" '
 function die(msg) { print msg > "/dev/stderr"; exit 1 }
 $1=="M" { cur=$2; on=(cur==verb); next }
 $1=="B" && on { tmpl[++n] = substr($0, 3); next }
@@ -1215,7 +1231,28 @@ END {
     }
   }
 }
-' "$PARSE"
+'
+}
+
+# make_draft INBOX: DRAFT=INBOX/drafts/body.PID, the body of this send while it is checked
+# and copied into the message (an inbox's subfolders are not messages; the watch ignores
+# them). Removed once copied, and by the EXIT trap; a signal exits so that trap runs. A draft
+# whose process is gone (killed with SIGKILL) is removed by the next send from this node.
+make_draft() {
+  ddir=$1/drafts
+  (umask 007; mkdir -p -- "$ddir") || die "cannot create the draft directory $ddir"
+  for old in "$ddir"/body.*; do
+    [ -f "$old" ] || continue
+    opid=${old##*.}
+    case "$opid" in ""|*[!0-9]*) continue ;; esac
+    [ "$opid" = "$$" ] || [ -d "/proc/$opid" ] || rm -f -- "$old"
+  done
+  DRAFT=$ddir/body.$$
+  trap 'if [ -n "$DRAFT" ]; then rm -f -- "$DRAFT"; fi' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  (umask 007; : > "$DRAFT") || die "cannot create the body draft $DRAFT"
 }
 
 cmd_send() {
@@ -1242,23 +1279,28 @@ cmd_send() {
   recipient=$3
   verb=$4
   shift 4
+  [ -f "$PLAN" ] || die "no plan file $PLAN"
+  parse_plan "$PLAN"
+  require_me "$me"
+  mine=$(node_path "$me")
+  [ -d "$mine" ] || die "no directory $mine; run channel-setup $PLAN $me"
   if [ "$nmsg" -gt 0 ]; then
-    body=$MSGS
+    make_draft "$mine"
+    printf '%s' "$MSGS_TEXT" > "$DRAFT" || die "cannot write the body draft $DRAFT"
+    body=$DRAFT
   elif [ $# -eq 0 ] || [ "$1" = - ]; then
-    cat > "$BODYTMP" || die "cannot read the body from stdin"
-    body=$BODYTMP
+    make_draft "$mine"
+    cat > "$DRAFT" || die "cannot read the body from stdin into $DRAFT"
+    body=$DRAFT
     [ $# -eq 0 ] || shift
   else
     body=$1
     shift
   fi
-  [ -f "$PLAN" ] || die "no plan file $PLAN"
-  parse_plan "$PLAN"
-  require_me "$me"
   node_path "$recipient" | grep -q . || die "unknown node (recipient=$recipient)"
-  mode_edge=$(awk -F '\t' -v s="$me" -v d="$recipient" '$1=="E" && $2==s && $3==d { print $4; found=1 } END { exit !found }' "$PARSE") \
+  mode_edge=$(parsed | awk -F '\t' -v s="$me" -v d="$recipient" '$1=="E" && $2==s && $3==d { print $4; found=1 } END { exit !found }') \
     || die "$me is not allowed to send to $recipient"
-  words=$(awk -F '\t' -v s="$me" -v d="$recipient" '$1=="V" && $2==s && $3==d { print $4 }' "$PARSE")
+  words=$(parsed | awk -F '\t' -v s="$me" -v d="$recipient" '$1=="V" && $2==s && $3==d { print $4 }')
   ok=0
   control=0
   case "$verb" in PING|PONG) control=1; ok=1 ;; esac
@@ -1274,7 +1316,7 @@ cmd_send() {
   else
     control_wait=0
   fi
-  if [ "$control" -eq 1 ] && ! awk -F '\t' -v v="$verb" '$1=="M" && $2==v { f=1 } END { exit !f }' "$PARSE"; then
+  if [ "$control" -eq 1 ] && ! parsed | awk -F '\t' -v v="$verb" '$1=="M" && $2==v { f=1 } END { exit !f }'; then
     awk '{ sub(/^[ \t]+/, "") } /^NONCE:[ \t]*[^ \t<]/ { f=1 } END { exit !f }' "$body" || die "$verb body is missing a value for: NONCE: <nonce>"
   else
     check_body "$verb" "$body"
@@ -1282,9 +1324,7 @@ cmd_send() {
   for ref in "$@"; do
     [ -f "$ref" ] || die "no referenced file $ref"
   done
-  mine=$(node_path "$me")
   inbox=$(node_path "$recipient")
-  [ -d "$mine" ] || die "no directory $mine; run channel-setup $PLAN $me"
   [ -d "$inbox" ] || die "no directory $inbox; run channel-setup $PLAN $recipient"
   if [ "$control" -eq 0 ] || [ "$control_wait" -eq 1 ]; then
     S_RECIPIENT=$recipient S_VERB=$verb S_ME=$me S_MINE=$mine
@@ -1355,6 +1395,10 @@ cmd_send() {
     last=$(tail -c 1 "$body" 2>/dev/null || true)
     [ "$last" = "" ] || [ "$last" = "$(printf '\n')" ] || printf '\n'
   } > "$tmp"
+  if [ -n "$DRAFT" ]; then
+    rm -f -- "$DRAFT"
+    DRAFT=
+  fi
   chmod 0660 "$tmp" || note "chmod 0660 $tmp failed"
   dev1=$(stat -c %d -- "$tmp")
   dev2=$(stat -c %d -- "$inbox")
@@ -1390,7 +1434,7 @@ send_signal() {
 
 # inbox_owner INBOX: the node whose inbox that directory is.
 inbox_owner() {
-  awk -F '\t' '$1=="N" { print $2 "\t" $3 }' "$PARSE" | while IFS='	' read -r oname opath; do
+  parsed | awk -F '\t' '$1=="N" { print $2 "\t" $3 }' | while IFS='	' read -r oname opath; do
     if [ "$(abs_path "$opath")" = "$1" ]; then printf '%s\n' "$oname"; fi
   done
 }
@@ -1431,7 +1475,7 @@ cmd_retract() {
   rbase=$(basename "$msg")
   printf '%s\n' "$rbase" | grep -Eq '^[0-9]{8}-[0-9]{6}\.[0-9]{3}__.+__[0-9]+\.md$' && [ "$(sender_of "$rbase")" = "$me" ] \
     || die "--retract: $msg is not a message file sent by $me"
-  ibs=$(awk -F '\t' -v s="$me" '$1=="E" && $2==s { print $3 }' "$PARSE" | while read -r d; do abs_path "$(node_path "$d")"; done)
+  ibs=$(parsed | awk -F '\t' -v s="$me" '$1=="E" && $2==s { print $3 }' | while read -r d; do abs_path "$(node_path "$d")"; done)
   case $msg in
     */*)
       rdir_in=$(cd "$(dirname "$msg")" 2>/dev/null && pwd) || rdir_in=$(dirname "$msg")
@@ -1490,6 +1534,14 @@ body_field() {
   awk -v k="$2:" 'b && index($0, k) == 1 { v = substr($0, length(k) + 1); gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit } $0 == "---" { b = 1 }' "$1" 2>/dev/null
 }
 
+# probe_fields LINE: dest, nonce and sent from one probes line.
+probe_fields() {
+  dest=${1%%"$TAB"*}
+  nonce=${1#*"$TAB"}
+  sent=${nonce#*"$TAB"}
+  nonce=${nonce%%"$TAB"*}
+}
+
 cmd_ping() {
   [ "$dry" -eq 0 ] && [ "$what" -eq 0 ] && [ $# -eq 2 ] || die "usage: $invoked FILE NODE [--all [--every MIN]] [--timeout SEC]"
   PLAN=$1
@@ -1510,8 +1562,9 @@ cmd_ping() {
     say "CHECKALL $me run $run"
     log_event checkall result start node "$me" run "$run"
   fi
-  probes=$(mktemp)
-  for dest in $(awk -F '\t' -v s="$me" '$1=="E" && $2==s { print $3 }' "$PARSE"); do
+  # One line per PING that waits for a PONG: DEST<TAB>NONCE<TAB>SENT.
+  probes=
+  for dest in $(parsed | awk -F '\t' -v s="$me" '$1=="E" && $2==s { print $3 }'); do
     [ -z "$PING_ONLY" ] || [ "$dest" = "$PING_ONLY" ] || continue
     nonce=${PING_NONCE:-$me-$dest-$(date +%Y%m%d-%H%M%S)-$$}
     if [ "$ping_all" -eq 1 ]; then
@@ -1519,13 +1572,13 @@ cmd_ping() {
     else
       pbody=$(control_body PING "NONCE=$nonce" 2>&1) || { log_event ping result fail from "$me" to "$dest" why "$pbody"; die "$pbody"; }
     fi
-    sent=$( (INTERNAL_PING=1 nmsg=1; printf '%s\n' "$pbody" > "$MSGS" && cmd_send "$PLAN" "$me" "$dest" PING) | awk '/^SENT / { print substr($0, 6) }')
+    sent=$( (INTERNAL_PING=1 nmsg=1 MSGS_TEXT=$pbody$NL; cmd_send "$PLAN" "$me" "$dest" PING) | awk '/^SENT / { print substr($0, 6) }')
     if ! has_edge "$dest" "$me"; then
       say "NO-RETURN $dest (the PING is delivered; $dest has no arrow back to $me, so no PONG is possible)"
       log_event ping result ok from "$me" to "$dest" kind no-return run "$run"
       continue
     fi
-    printf '%s\t%s\t%s\n' "$dest" "$nonce" "$sent" >> "$probes"
+    probes=$probes$dest$TAB$nonce$TAB$sent$NL
   done
   start=$(date +%s.%N)
   deadline=$(( $(date +%s) + ping_timeout ))
@@ -1533,7 +1586,10 @@ cmd_ping() {
   failed=0
   while :; do
     left=0
-    while IFS='	' read -r dest nonce sent; do
+    plist=$probes
+    while [ -n "$plist" ]; do
+      probe_fields "${plist%%"$NL"*}"
+      plist=${plist#*"$NL"}
       case " $done_list " in *" $dest "*) continue ;; esac
       ok=0
       pp=$(pong_path "$me" "$nonce")
@@ -1556,19 +1612,21 @@ cmd_ping() {
       else
         left=$((left + 1))
       fi
-    done < "$probes"
+    done
     [ "$left" -gt 0 ] || break
     [ "$(date +%s)" -lt "$deadline" ] || break
     sleep 0.2
   done
-  while IFS='	' read -r dest nonce sent; do
+  plist=$probes
+  while [ -n "$plist" ]; do
+    probe_fields "${plist%%"$NL"*}"
+    plist=${plist#*"$NL"}
     case " $done_list " in *" $dest "*) continue ;; esac
     failed=1
     want="no PONG after ${ping_timeout}s: the $dest agent was not woken or did not answer"
     say "TIMEOUT $dest ($want)"
     log_event ping result timeout from "$me" to "$dest" nonce "$nonce" run "$run"
-  done < "$probes"
-  rm -f "$probes"
+  done
   [ "$failed" -eq 0 ] || exit 1
 }
 
@@ -1578,7 +1636,7 @@ cmd_status() {
   [ -f "$PLAN" ] || die "no plan file $PLAN"
   parse_plan "$PLAN"
   now=$(date +%s)
-  awk -F '\t' '$1=="N" { print $2 "\t" $3 }' "$PARSE" | while IFS='	' read -r name inbox; do
+  parsed | awk -F '\t' '$1=="N" { print $2 "\t" $3 }' | while IFS='	' read -r name inbox; do
     if [ ! -e "$inbox" ]; then say "node $name $inbox missing"; continue; fi
     if ! ls -- "$inbox" >/dev/null 2>&1; then say "node $name $inbox no permission"; continue; fi
     count=0

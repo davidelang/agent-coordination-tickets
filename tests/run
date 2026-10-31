@@ -11,9 +11,15 @@ SH=$ROOT/bin/channel
 GO=$ROOT/go/channel
 PY=$ROOT/bin/channel.py
 
-TMP=$(mktemp -d /tmp/channel-tests.XXXXXX)
-# /tmp is a different filesystem from this tree, so a rename between them is EXDEV.
-SHM=$(mktemp -d "$ROOT/.test-exdev.XXXXXX")
+# All test state lives in this tree (.test-run.* is gitignored) and the trap removes it.
+TMP=$(mktemp -d "$ROOT/.test-run.XXXXXX")
+# This checkout may be a setgid directory of a group the tester is not in; then setup's
+# chmod 2775 silently loses the setgid bit. Give the scratch dir the tester's own group.
+chgrp "$(id -g)" "$TMP" && chmod g-s "$TMP" || { echo "cannot set the group of $TMP" >&2; rm -rf "$TMP"; exit 1; }
+# The cross-device rename test needs a directory on another filesystem than this tree;
+# /dev/shm is a tmpfs on every Linux host. The trap removes it.
+SHM=$(mktemp -d /dev/shm/channel-exdev.XXXXXX)
+[ "$(stat -c %d -- "$TMP")" != "$(stat -c %d -- "$SHM")" ] || { printf 'FAIL %s and %s are on the same filesystem; the cross-device test needs two\n' "$TMP" "$SHM" >&2; exit 1; }
 PIDS=$TMP/pids
 : > "$PIDS"
 pass=0
@@ -27,6 +33,8 @@ cleanup() {
       wait "$p" 2>/dev/null || true
     done < "$PIDS"
   fi
+  # Go marks its module cache read-only; make it removable first.
+  if [ -d "$TMP/gopath" ]; then chmod -R u+w "$TMP/gopath"; fi
   rm -rf "$TMP" "$SHM"
 }
 trap cleanup EXIT INT TERM
@@ -122,8 +130,8 @@ file_count() {
   printf '%s\n' "$n"
 }
 
-export GOCACHE=/tmp/go-build-cache
-export GOPATH=/tmp/gopath
+export GOCACHE=$TMP/go-build-cache
+export GOPATH=$TMP/gopath
 export GOTOOLCHAIN=local
 export CGO_ENABLED=0
 export GOPROXY=off

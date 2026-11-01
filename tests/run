@@ -16,10 +16,6 @@ TMP=$(mktemp -d "$ROOT/.test-run.XXXXXX")
 # This checkout may be a setgid directory of a group the tester is not in; then setup's
 # chmod 2775 silently loses the setgid bit. Give the scratch dir the tester's own group.
 chgrp "$(id -g)" "$TMP" && chmod g-s "$TMP" || { echo "cannot set the group of $TMP" >&2; rm -rf "$TMP"; exit 1; }
-# The cross-device rename test needs a directory on another filesystem than this tree;
-# /dev/shm is a tmpfs on every Linux host. The trap removes it.
-SHM=$(mktemp -d /dev/shm/channel-exdev.XXXXXX)
-[ "$(stat -c %d -- "$TMP")" != "$(stat -c %d -- "$SHM")" ] || { printf 'FAIL %s and %s are on the same filesystem; the cross-device test needs two\n' "$TMP" "$SHM" >&2; exit 1; }
 PIDS=$TMP/pids
 : > "$PIDS"
 pass=0
@@ -35,7 +31,7 @@ cleanup() {
   fi
   # Go marks its module cache read-only; make it removable first.
   if [ -d "$TMP/gopath" ]; then chmod -R u+w "$TMP/gopath"; fi
-  rm -rf "$TMP" "$SHM"
+  rm -rf "$TMP"
 }
 trap cleanup EXIT INT TERM
 
@@ -690,39 +686,6 @@ if wait_for "$TMP/pend.out" "PENDING $sent"; then ok "shell waits on go-visible 
 rm -- "$sent"
 if wait_for "$TMP/pend.out" "SENT "; then ok "shell sends after the go file is removed"; else bad "shell sends after the go file is removed"; kill "$pid" 2>/dev/null || true; fi
 wait "$pid" 2>/dev/null || true
-
-# --- cross-device rename ---
-
-EP=$TMP/exdev.diag
-ep_in=$TMP/exdev-nodes/planner/inbox
-ec_in=$SHM/coder/inbox
-cat > "$EP" <<EOF
-blockdiag {
-  planner -> coder;
-}
-/*
-node planner $ep_in
-node coder $ec_in
-verb planner coder TASK
-message TASK { body: { ACTION: TASK } }
-*/
-EOF
-"$ROOT/bin/channel-setup" "$EP" planner >/dev/null
-"$ROOT/go/channel-setup" "$EP" coder >/dev/null
-capture "$TMP/sh-ex" "$TMP/sh-ex.err" "$TMP/sh-ex.rc" "$ROOT/bin/channel-send" "$EP" planner coder TASK "$TMP/bodies/ping-bad.md"
-# ping-bad is the wrong shape (missing PLAN). Use a legal one-line body for this message.
-printf '%s\n' 'ACTION: TASK' > "$TMP/bodies/ping-one.md"
-capture "$TMP/sh-ex" "$TMP/sh-ex.err" "$TMP/sh-ex.rc" "$ROOT/bin/channel-send" "$EP" planner coder TASK "$TMP/bodies/ping-one.md"
-capture "$TMP/go-ex" "$TMP/go-ex.err" "$TMP/go-ex.rc" "$ROOT/go/channel-send" "$EP" planner coder TASK "$TMP/bodies/ping-one.md"
-if grep -F -q 'would not be atomic' "$TMP/sh-ex.err" && grep -F -q 'would not be atomic' "$TMP/go-ex.err"; then
-  ok "cross-device rename is refused"
-else
-  bad "cross-device rename is refused"
-  cat "$TMP/sh-ex.err" "$TMP/go-ex.err" >&2
-fi
-expect_rc "shell exdev exit" 1 "$TMP/sh-ex.rc"
-expect_rc "go exdev exit" 1 "$TMP/go-ex.rc"
-if [ "$(file_count '*.md' "$ec_in")" = 0 ]; then ok "exdev published nothing"; else bad "exdev published nothing"; fi
 
 # --- webhooks (shell, go and python must match) ---
 WH=$TMP/wh

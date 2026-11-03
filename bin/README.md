@@ -143,3 +143,64 @@ Each step has one defined path; when it cannot run, the command fails with a mes
 `channel-arm` only announces message files directly inside `inbox/`; subdirectories are ignored. A node may move a message it is working on into `inbox/claimed/` (create it with mode 2775) so the watch moves on. Remove the claimed file only after the reply to it has been sent.
 
 On a start or after a compaction, a node first reviews `inbox/claimed/`: those are messages it already started and may have partly finished. Before redoing anything it checks whether its reply was already sent (for example in the destination inbox, or its own notes). Claims are never reclaimed automatically by age; `channel-status` reports them with their ages so stale ones can be handled by a person. A node may write an optional sidecar `claimed/FILE.owner` (first line: who has it); `channel-status` shows it as `owner=`.
+
+## Command reference (formerly in `--help`)
+
+`--help` is now short. This is the full text it used to print, kept here so nothing is lost.
+`--webhook-retry` is internal: a send starts `channel --webhook-retry` in the background to retry one webhook (the job is passed in `CHANNEL_WH_*` environment variables); it is not for direct use.
+
+```text
+channel — one inbox directory per agent
+
+With no mode, this prints help and exits.
+
+  channel --setup FILE NODE [-n|--dry-run] [--whatineedtoknow]
+  channel --arm   FILE NODE [--whatineedtoknow]
+  channel --send  FILE NODE DEST VERB [BODYFILE|-|-m TEXT ...] [REF ...] [--timeout SEC] [--whatineedtoknow]
+  channel --send  FILE NODE --retract MESSAGE
+  channel --ping  FILE NODE [--all [--every MIN]] [--timeout SEC]
+  channel --status FILE
+
+channel-setup, channel-arm, and channel-send are names for this same program.
+The name selects the mode, so those forms do not need --setup, --arm, or --send.
+
+-n, --dry-run       check the plan and create nothing (setup only)
+--whatineedtoknow   print how to act (paths, watch/send commands, body rules), then
+                    the nodes and messages this node uses, then exit
+-h, --help          print this help
+
+Options may sit before or after the file and the node. -- ends the options.
+
+Webhooks (optional, per node, workflow-specific: they live only in that diag):
+  node NAME /abs/inbox webhook=URL [webhook_key=TOKEN | webhook_key_file=PATH]
+A relative webhook_key_file is resolved from the diag file's directory.
+Give only the key: the tool sends Authorization: Bearer KEY. A leading
+"Authorization: Bearer " or "Bearer " is stripped (key file: first line).
+After channel-send queues a message to NAME, it POSTs JSON
+  {"target","from","verb","inbox","file"}
+to URL with Content-Type: application/json.
+Optional webhook_retries=N (default 12) and webhook_backoff_max=T (default 30m;
+T is N, Ns, Nm or Nh): every failure except 401, 403, 404, 405 and 410 (key or
+URL wrong) is retried with exponential
+backoff (1s, 2s, 4s, ... capped at T) in a detached background process, so the
+send returns after the first try; the final outcome goes to syslog.
+Success prints "WEBHOOK NAME CODE RESPONSE". Any failure prints a WARNING on
+stderr; the message stays queued and the exit status is still 0.
+
+A send ends with DELIVERED PATH (exit 0) once the message is in DEST's inbox;
+whether DEST has taken or handled it is not part of the send. At a -> end it
+first waits (PENDING PATH) until DEST removes the previous message; a signal
+then prints ABORTED (exit 4) and nothing is sent.
+--retract MESSAGE takes one back (one rename; the receiver's claim is one
+rename too, so exactly one wins): RETRACTED PATH -> WHERE or NOT-RETRACTED
+PATH (DEST already has it), both exit 0.
+
+PING and PONG (body NONCE: <value>) are built in on every arrow; a PING wakes
+the agent as FILE and the agent answers it. channel-send FILE NODE DEST PING
+[-m 'NONCE: V'] is channel-ping to DEST only (waits for the PONG, prints PONG or TIMEOUT;
+NO-RETURN, without waiting, when DEST has no arrow back);
+a PONG is sent only to answer a PING from DEST still in NODE's inbox or claimed/. channel-ping always sends; with --all it starts a
+check-all: every node reached also checks its own arrows (once per run id,
+and at most once per --every minutes, default 30, env CHANNEL_CHECKALL_EVERY). Events go to syslog, tag agent-channel, as key=value
+(CHANNEL_SYSLOG=0 disables; CHANNEL_LOG_FILE=PATH also appends to a file).
+```

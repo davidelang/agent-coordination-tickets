@@ -1,6 +1,8 @@
 # Plan file
 
-One blockdiag file. The picture comes first. The key is below it, inside a `/* */` comment, because blockdiag drops that comment and then requires the rest of the file to be empty. The script reads the lines inside the comment. `/* */` does not hide them.
+One blockdiag file. In a consuming repo with several worktrees, keep it at `sandbox/connect/<workspace>/config`. `<workspace>` is the descriptive name: the branch argument to `setup_agent.sh` (for example `feature-x`) or `master` for that worktree. `setup_agent.sh` checks out into the next free `agent-N` directory and links `<workspace>.wt` there; the channel path uses the descriptive name so a reused slot keeps its own config and inboxes. Put that workspace's node inboxes under the same directory (`sandbox/connect/<workspace>/nodes/...`). `channel-setup`, `channel-arm`, `channel-ping`, and `channel-status` omit FILE and use that path from the current git worktree (`git rev-parse --show-toplevel` plus `git symbolic-ref --short HEAD`). `channel-send` still needs FILE. The tools also accept any path; this library's example stays `example/comms.diag`, with dummy inboxes under `/channel/connect/feature-x/`.
+
+The picture comes first. The key is below it, inside a `/* */` comment, because blockdiag drops that comment and then requires the rest of the file to be empty. The script reads the lines inside the comment. `/* */` does not hide them.
 
 A line that starts with `#` or `//` is a note. The script skips it. Put `#` or `//` in front of a `node`, `verb`, or `message` line to leave that line out.
 

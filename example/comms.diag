@@ -40,8 +40,13 @@ blockdiag {
 #   A line that starts with # or // is a note. The script skips it.
 #   Put # or // at the start of a node, verb, or message line to leave it out.
 
-node planner /channel/nodes/planner/inbox
-node coder /channel/nodes/coder/inbox
+# Dummy prefix /channel stands in for the sandbox absolute path. In a
+# consuming repo the plan is sandbox/connect/<workspace>/config and the
+# inboxes sit next to it. <workspace> is the descriptive name (the branch
+# given to setup_agent.sh, e.g. feature-x, or master); agent-N is only the
+# checkout slot.
+node planner /channel/connect/feature-x/nodes/planner/inbox
+node coder /channel/connect/feature-x/nodes/coder/inbox
 
 verb planner coder IMPLEMENT RESUME PROVIDE-EVIDENCE STOP
 verb coder planner COMPLETE FAILURE BLOCKED STOPPED DAVID-DIRECT

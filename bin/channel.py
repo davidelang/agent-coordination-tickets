@@ -37,6 +37,59 @@ def die(msg):
     raise SystemExit(1)
 
 
+def git_output(dirpath, *args):
+    if not dirpath:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", dirpath, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.decode().strip()
+
+
+def try_default_plan_at(dirpath):
+    """$git-toplevel/sandbox/connect/<branch>/config, or '' if not a worktree / detached."""
+    root = git_output(dirpath, "rev-parse", "--show-toplevel")
+    if not root:
+        return ""
+    branch = git_output(dirpath, "symbolic-ref", "--short", "HEAD")
+    if not branch or branch == "HEAD":
+        return ""
+    return os.path.join(root, "sandbox", "connect", branch, "config")
+
+
+def default_plan():
+    path = try_default_plan_at(".")
+    if path:
+        return path
+    if git_output(".", "rev-parse", "--show-toplevel"):
+        die("git HEAD is detached; pass the plan file or check out the workspace branch")
+    die("no git repository here; pass the plan file (sandbox/connect/<workspace>/config)")
+
+
+def take_plan_node(args, usage):
+    if len(args) == 2:
+        return args[0], args[1]
+    if len(args) == 1:
+        return default_plan(), args[0]
+    die(usage)
+
+
+def take_plan(args, usage):
+    if len(args) == 1:
+        return args[0]
+    if len(args) == 0:
+        return default_plan()
+    die(usage)
+
+
 def try_do(func):
     """Run func; a die inside it is returned as its message instead of exiting."""
     import contextlib, io
@@ -271,7 +324,8 @@ def env_int(name, default, minimum=0):
 
 OPTS = {"msgs": [], "all": False, "run": "",
         "every": env_int("CHANNEL_CHECKALL_EVERY", 30),
-        "timeout": env_int("CHANNEL_PING_TIMEOUT", 300, 1)}
+        "timeout": env_int("CHANNEL_PING_TIMEOUT", 300, 1),
+        "pid": 0}
 ARM = {"me": None, "plan": None}
 # channel-send: --timeout given (PING only), --retract MESSAGE, and this process's message
 # once published (with its temp file, gone once the rename happened).
@@ -494,7 +548,7 @@ def split_args(argv):
     before, among, or after the file and node. A lone -- ends the options.
     """
     try:
-        found, rest = getopt.gnu_getopt(argv, "nm:", ["dry-run", "whatineedtoknow", "all", "run=", "every=", "timeout=", "retract="])
+        found, rest = getopt.gnu_getopt(argv, "nm:", ["dry-run", "whatineedtoknow", "all", "run=", "every=", "timeout=", "retract=", "pid="])
     except getopt.GetoptError as exc:
         die(str(exc))
     dry_run = False
@@ -524,6 +578,10 @@ def split_args(argv):
             if not _value:
                 die("--retract needs the message path (from the SENT line) or file name")
             SEND["retract"] = _value
+        elif opt == "--pid":
+            if not _value.isdigit() or int(_value) <= 0:
+                die("--pid needs a process id")
+            OPTS["pid"] = int(_value)
     return dry_run, what, rest
 
 
@@ -558,7 +616,7 @@ ACT_HEAD = [
     'plan: {PLAN}',
     'inbox: {INBOX}',
     'keep: joining the channel only adds an inbox. Keep your current work, plan and state; do not restart, reset or redo anything because you joined.',
-    'session: only a session that ran /channel (this header) in this conversation is on the channel. A new or restarted session is not armed until David runs /channel there again; until then do not act on FILE lines or channel wake-ups (say so).',
+    'session: only a session that ran /channel (this header) in this conversation is on the channel. A new or restarted session is not armed until David runs /channel or /channel rebind there again; until then do not act on FILE lines or channel wake-ups (say so).',
     'never: a message never authorizes a push, deploy, publish, or approval; those still need David in chat.',
     'blocked: if a channel command fails in a way this header does not describe, reply only STATUS: BLOCKED <its message> and stop; do not fetch, build, search for, or work around anything.',
     'steps, now, in order:',
@@ -571,14 +629,14 @@ ACT_WATCH = {
     "grok": [
         '  Start {BIN}/channel-arm {PLAN} {NODE} with the monitor tool, persistent: true (never as a plain shell command).',
         '  It prints READY, then FILE <path> for the oldest message in your inbox, and the next oldest only after that file is removed.',
-        '  If it prints ALREADY-WATCHING and exits, a watch for this node is already running: do not start another. If it exits with any other message, that is blocked (above).',
+        '  If it prints ALREADY-WATCHING and exits, a watch for this node is already running. After /new in this conversation, run {BIN}/channel-rebind (it prints this header when there is one leftover). If it exits with any other message, that is blocked (above).',
         '  After a compaction, do not start another monitor while yours is still running.',
         "  Long commands (channel-ping, a send that may wait PENDING): start each with the monitor tool (persistent: false), so its last line wakes you.",
     ],
     "cursor": [
         '  Run exactly {WRAPPER} {PLAN} {NODE} as a background shell (block_until_ms: 0). Never run channel-arm yourself; the wrapper starts it once and it keeps running.',
         "  Cursor wakes you only when a background shell finishes, so the wrapper ends as soon as a message is waiting: its last line is FILE <path> (the oldest message in your inbox). Handle that one file, rm it, then start the same wrapper command again before you end the turn; it waits for the next message, or ends at once if one is already waiting. If the file is already gone when you open it, you lost the race (see claim): say so in one line and start the wrapper again.",
-        '  If it ends with WATCH-ENDED, that is blocked (above), with the line before it (ALREADY-WATCHING there means another session watches this node). If it ends with neither FILE nor WATCH-ENDED (cursor killed it), start it again.',
+        '  If it ends with WATCH-ENDED, that is blocked (above), with the line before it (ALREADY-WATCHING there: after /new run {BIN}/channel-rebind; another session still watching this node is blocked). If it ends with neither FILE nor WATCH-ENDED (cursor killed it), start it again.',
         '  After a compaction, start it again unless it is still running. The stop hook also reminds you of a waiting FILE.',
         "  Long commands (channel-ping, a send that may wait PENDING): run each as a background shell (block_until_ms: 0) and read its last line when it finishes.",
     ],
@@ -591,7 +649,7 @@ ACT_TAIL = [
     "  With no arrow back to <FROM> you cannot send a PONG: say in one line that you got a PING from <FROM>, rm it, and go back to watching.",
     '  If the PING has SCOPE: all and RUN: <id>, then also start {BIN}/channel-ping --run <id> {PLAN} {NODE} in the background (see step 3) and report any TIMEOUT line it prints; it does nothing if this node already handled that run or ran a check-all in the last 30 minutes.',
     "  A PONG for your own channel-ping is taken by the watch and never shown. To check a link yourself, run channel-ping (see tools); channel-send ... DEST PING is the same check for that one DEST, so start either in the background (see step 3). channel-send refuses a PONG that does not answer a PING from DEST still in your inbox, so send the PONG before you rm the PING.",
-    'start: before new messages, look in {INBOX}/claimed/. Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.',
+    'start: before new messages, look in {INBOX}/claimed/ (channel-setup creates it, mode 2775). Those are messages you already started and may have partly done. Check whether your reply was already sent before redoing anything. Nothing reclaims a claim by age; report claims you cannot finish.',
     'read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.',
     "  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.",
     "claim: if mv or rm of a FILE says No such file, the sender took it back first: you lost the race. Say so in one line (LOST <file>: the sender took it back) and go back to watching for new messages; it is not an error.",
@@ -698,13 +756,19 @@ def cmd_setup(plan_path, me, dry_run, what):
             refs.mkdir(parents=True, exist_ok=True)
             try_chmod(refs, 0o2775)
         inbox = nodes[me]
-        if inbox.is_dir():
+        existed = inbox.is_dir()
+        if not existed:
+            inbox.mkdir(parents=True, exist_ok=True)
+            node = node_dir(inbox)
+            try_chmod(node, 0o2775)
+            try_chmod(inbox, 0o2775)
+        claimed = inbox / "claimed"
+        if not claimed.is_dir():
+            claimed.mkdir(parents=True, exist_ok=True)
+            try_chmod(claimed, 0o2775)
+        if existed:
             say(f"node {me} inbox {inbox} existing")
             return
-        inbox.mkdir(parents=True, exist_ok=True)
-        node = node_dir(inbox)
-        try_chmod(node, 0o2775)
-        try_chmod(inbox, 0o2775)
         say(f"node {me} inbox {inbox}")
     finally:
         os.umask(old)
@@ -781,21 +845,318 @@ def watch_oldest(inbox, shown):
         time.sleep(POLL_SECONDS)
 
 
+def proc_cmdline(pid):
+    try:
+        data = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    if not data:
+        return []
+    return data.rstrip(b"\0").decode(errors="replace").split("\0")
+
+
+def _is_python_interp(base):
+    return base == "python" or base.startswith("python3")
+
+
+def _is_shell_interp(base):
+    return base in ("sh", "bash", "dash")
+
+
+def arm_prog_index(args):
+    """argv slot of channel-arm / channel.py / channel. A shell -c wrapper is not a watch."""
+    if not args:
+        return -1
+    i = 0
+    b = os.path.basename(args[0])
+    if _is_shell_interp(b) or _is_python_interp(b):
+        i = 1
+        if _is_python_interp(b):
+            while i < len(args) and args[i].startswith("-") and args[i] != "--":
+                if args[i] in ("-c", "-m") or args[i].startswith("-c") or args[i].startswith("-m"):
+                    return -1
+                if args[i] in ("-W", "-X"):
+                    i += 2
+                    continue
+                i += 1
+        elif i < len(args) and (args[i] == "-c" or args[i].startswith("-c")):
+            return -1
+        else:
+            while i < len(args) and args[i].startswith("-") and args[i] != "--":
+                if args[i] == "-c" or args[i].startswith("-c"):
+                    return -1
+                i += 1
+        if i < len(args) and args[i] == "--":
+            i += 1
+    if i >= len(args):
+        return -1
+    return i
+
+
+def parse_arm_cmdline(args):
+    """Return (plan, node) if args are a channel-arm invocation."""
+    i = arm_prog_index(args)
+    if i < 0:
+        return None
+    base = os.path.basename(args[i])
+    found = False
+    if base == "channel-arm":
+        found = True
+        i += 1
+    elif base == "channel.py" and i + 1 < len(args) and args[i + 1] == "arm":
+        found = True
+        i += 2
+    elif base == "channel":
+        for j in range(i + 1, len(args)):
+            if args[j] == "--arm":
+                found = True
+                i = j + 1
+                break
+    if not found:
+        return None
+    pos = []
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            pos.extend(args[i + 1:])
+            break
+        if a.startswith("-"):
+            i += 1
+            continue
+        pos.append(a)
+        i += 1
+    if len(pos) == 1 and NODE_RE.match(pos[0]) and "__" not in pos[0]:
+        return "", pos[0]
+    if len(pos) < 2 or not NODE_RE.match(pos[1]) or "__" in pos[1]:
+        return None
+    return pos[0], pos[1]
+
+
 def arm_alive(pid):
     """True if pid is a running channel-arm (any implementation)."""
+    return parse_arm_cmdline(proc_cmdline(pid)) is not None
+
+
+def proc_status_field(pid, key):
     try:
-        args = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").decode(errors="replace").split("\0")
+        text = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return ""
+    prefix = key + ":"
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return line.split(":", 1)[1].split()[0]
+    return ""
+
+
+def proc_pgid(pid):
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return 0
+    i = text.rfind(")")
+    if i < 0:
+        return 0
+    fields = text[i + 1:].split()
+    return int(fields[2]) if len(fields) > 2 else 0
+
+
+def proc_cwd(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def pid_alive(pid):
+    return os.path.isdir(f"/proc/{pid}")
+
+
+def is_grok(pid):
+    args = proc_cmdline(pid)
+    if args and os.path.basename(args[0]) == "grok":
+        return True
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip() == "grok"
     except OSError:
         return False
-    for i, arg in enumerate(args):
-        base = os.path.basename(arg)
-        if base == "channel-arm":
-            return True
-        if base == "channel.py" and i + 1 < len(args) and args[i + 1] == "arm":
-            return True
-        if base == "channel" and "--arm" in args[i + 1:]:
+
+
+def grok_ancestor(pid):
+    seen = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        if is_grok(pid):
+            return pid
+        raw = proc_status_field(pid, "PPid")
+        if not raw.isdigit():
+            return 0
+        pid = int(raw)
+        if pid <= 1:
+            return 0
+    return 0
+
+
+def under_tree(path, wd):
+    path, wd = os.path.normpath(path), os.path.normpath(wd)
+    return path == wd or path.startswith(wd + os.sep)
+
+
+def abs_arm_plan(plan, pid):
+    if os.path.isabs(plan):
+        return os.path.normpath(plan)
+    cwd = proc_cwd(pid)
+    if cwd:
+        return os.path.normpath(os.path.join(cwd, plan))
+    return plan
+
+
+def rebind_matches(pid, plan, args, wd):
+    cwd = proc_cwd(pid)
+    if cwd and under_tree(cwd, wd):
+        return True
+    ap = abs_arm_plan(plan, pid)
+    if ap and under_tree(ap, wd):
+        return True
+    if args:
+        bin_path = args[0]
+        if not os.path.isabs(bin_path) and cwd:
+            bin_path = os.path.join(cwd, bin_path)
+        if under_tree(bin_path, wd):
             return True
     return False
+
+
+def list_rebind(wd, uid, self_grok):
+    out = []
+    self = os.getpid()
+    try:
+        names = os.listdir("/proc")
+    except OSError as exc:
+        die(f"cannot list /proc: {exc}")
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == self:
+            continue
+        if proc_status_field(pid, "Uid") != str(uid):
+            continue
+        args = proc_cmdline(pid)
+        parsed = parse_arm_cmdline(args)
+        if not parsed:
+            continue
+        plan, node = parsed
+        if not plan:
+            plan = try_default_plan_at(proc_cwd(pid))
+            if not plan:
+                continue
+        else:
+            plan = abs_arm_plan(plan, pid)
+        if not rebind_matches(pid, plan, args, wd):
+            continue
+        g = grok_ancestor(pid)
+        if g and g != self_grok:
+            continue
+        out.append({"pid": pid, "pgid": proc_pgid(pid), "plan": plan, "node": node})
+    out.sort(key=lambda c: (c["node"], c["pid"]))
+    return out
+
+
+def proc_children(pid):
+    kids = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return kids
+    want = str(pid)
+    for name in names:
+        if name.isdigit() and proc_status_field(int(name), "PPid") == want:
+            kids.append(int(name))
+    return kids
+
+
+def wait_dead(pid, seconds=2):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return
+        time.sleep(0.05)
+
+
+def kill_arm_tree(pid):
+    my_pgid = os.getpgrp()
+    pgid = proc_pgid(pid)
+    if pgid > 1 and pgid != my_pgid:
+        try:
+            os.kill(-pgid, signal.SIGTERM)
+        except OSError:
+            pass
+        wait_dead(pid)
+        if pid_alive(pid):
+            try:
+                os.kill(-pgid, signal.SIGKILL)
+            except OSError:
+                pass
+            wait_dead(pid, 1)
+        return
+    for c in proc_children(pid):
+        try:
+            os.kill(c, signal.SIGTERM)
+        except OSError:
+            pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    wait_dead(pid)
+    if pid_alive(pid):
+        for c in proc_children(pid):
+            try:
+                os.kill(c, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        wait_dead(pid, 1)
+
+
+def take_rebind(c):
+    if not os.path.isfile(c["plan"]):
+        die("channel-rebind: plan file gone: " + c["plan"])
+    loaded = load_plan(c["plan"])
+    plan_path, nodes, verbs, messages, edges = loaded
+    require_me(c["node"], nodes, plan_path)
+    agent_kind()
+    kill_arm_tree(c["pid"])
+    if pid_alive(c["pid"]):
+        die(f"channel-rebind: pid {c['pid']} still running after kill")
+    log_event("rebind", result="ok", node=c["node"], plan=c["plan"], pid=c["pid"])
+    emit_what(c["node"], nodes, verbs, messages, edges, plan_path)
+
+
+def cmd_rebind():
+    try:
+        wd = os.path.abspath(os.getcwd())
+    except OSError as exc:
+        die(f"cannot read the current directory: {exc}")
+    cands = list_rebind(wd, os.getuid(), grok_ancestor(os.getpid()))
+    if OPTS["pid"]:
+        for c in cands:
+            if c["pid"] == OPTS["pid"]:
+                take_rebind(c)
+                return
+        die(f"channel-rebind: pid {OPTS['pid']} is not a reboundable watch in this worktree")
+    if not cands:
+        say("REBIND-NONE")
+    elif len(cands) == 1:
+        take_rebind(cands[0])
+    else:
+        say("REBIND-CHOOSE")
+        for c in cands:
+            say(f"pid={c['pid']} plan={c['plan']} node={c['node']}")
 
 
 def claim_watch(pid_file, me):
@@ -1434,23 +1795,26 @@ def main(argv):
         die("--retract is only for channel-send")
     if SEND["timeout_given"] and command not in ("send", "ping"):
         die("--timeout is only for channel-ping and channel-send DEST PING")
+    if OPTS["pid"] and command != "rebind":
+        die("--pid is only for channel-rebind")
     if OPTS["msgs"] and command != "send":
         die("-m is only for channel-send")
     if command == "setup":
-        if len(args) != 2:
-            die("usage: channel-setup FILE NODE [-n|--dry-run] [--whatineedtoknow]")
-        cmd_setup(args[0], args[1], dry_run, what)
+        path, me = take_plan_node(
+            args, "usage: channel-setup [FILE] NODE [-n|--dry-run] [--whatineedtoknow]"
+        )
+        cmd_setup(path, me, dry_run, what)
     elif command == "arm":
         if dry_run:
             die("--dry-run is only for channel-setup")
+        u = "usage: channel-arm [FILE] NODE"
         if what:
-            if len(args) != 2:
-                die("usage: channel-arm FILE NODE --whatineedtoknow")
-            show_what(args[0], args[1])
+            u = "usage: channel-arm [FILE] NODE --whatineedtoknow"
+        path, me = take_plan_node(args, u)
+        if what:
+            show_what(path, me)
             return
-        if len(args) != 2:
-            die("usage: channel-arm FILE NODE")
-        cmd_arm(args[0], args[1])
+        cmd_arm(path, me)
     elif command == "send":
         if dry_run:
             die("--dry-run is only for channel-setup")
@@ -1476,13 +1840,20 @@ def main(argv):
             body_text, refs = body.read_text(), args[5:]
         cmd_send(args[0], args[1], args[2], args[3], body_text, refs)
     elif command == "ping":
-        if dry_run or what or len(args) != 2:
-            die("usage: channel-ping FILE NODE [--all [--every MIN]] [--timeout SEC]")
-        cmd_ping(args[0], args[1])
+        u = "usage: channel-ping [FILE] NODE [--all [--every MIN]] [--timeout SEC]"
+        if dry_run or what:
+            die(u)
+        path, me = take_plan_node(args, u)
+        cmd_ping(path, me)
     elif command == "status":
-        if dry_run or what or len(args) != 1:
-            die("usage: channel-status FILE")
-        cmd_status(args[0])
+        u = "usage: channel-status [FILE]"
+        if dry_run or what:
+            die(u)
+        cmd_status(take_plan(args, u))
+    elif command == "rebind":
+        if dry_run or what or args:
+            die("usage: channel-rebind [--pid PID]")
+        cmd_rebind()
     else:
         die(f"unknown command {command}")
 

@@ -10,9 +10,9 @@ Agents that poll a mailbox spend their context window on the waiting. A long-run
 
 Two programs implement the same protocol.
 
-`bin/channel` is a `/bin/sh` script. `channel-setup`, `channel-arm`, and `channel-send` are links to it. It needs GNU `getopt`, `setsid`, `awk`, `stat`, and `date`. It also needs `inotifywait` (inotify-tools); without it `channel-arm` and a waiting `channel-send` exit with an error rather than switching to something else. `CHANNEL_POLL=1` is the one deliberate alternative: the watch lists the directory every 0.2 seconds and still prints a line only when the oldest file changes. If `inotifywait` stops while running, the command exits with an error.
+`bin/channel` is a `/bin/sh` script. `channel-setup`, `channel-arm`, `channel-send`, `channel-ping`, `channel-status`, and `channel-rebind` are links to it. It needs GNU `getopt`, `setsid`, `awk`, `stat`, and `date`. It also needs `inotifywait` (inotify-tools); without it `channel-arm` and a waiting `channel-send` exit with an error rather than switching to something else. `CHANNEL_POLL=1` is the one deliberate alternative: the watch lists the directory every 0.2 seconds and still prints a line only when the oldest file changes. If `inotifywait` stops while running, the command exits with an error.
 
-`go/channel` is a static binary built from the Go standard library only. The same three names are links to that binary. Build it with the command in [go/README.md](go/README.md). The agent runs that binary, so a permission grant keys off the program name.
+`go/channel` is a static binary built from the Go standard library only. The same names are links to that binary. Build it with the command in [go/README.md](go/README.md). The agent runs that binary, so a permission grant keys off the program name.
 
 `bin/channel.py` is an earlier Python form of the same protocol. It is kept for comparison. `tests/run` builds the Go binary and checks the shell program and the Go program against each other, including a file one of them wrote and the other one read.
 
@@ -23,38 +23,41 @@ Two programs implement the same protocol.
 ```sh
 export PATH="$PWD/bin:$PATH"
 # or: export PATH="$PWD/go:$PATH"
-cp example/comms.diag /path/to/comms.diag
-# replace the /channel prefix in that file
-channel-setup -n /path/to/comms.diag planner
-channel-setup /path/to/comms.diag planner
-channel-setup /path/to/comms.diag coder
+# consuming repo: ./setup_agent.sh feature-x  →  checkout in agent-N, symlink feature-x.wt
+cp example/comms.diag sandbox/connect/feature-x/config
+# replace the /channel prefix with the sandbox absolute path (keep connect/feature-x)
+channel-setup -n sandbox/connect/feature-x/config planner
+channel-setup sandbox/connect/feature-x/config planner
+channel-setup sandbox/connect/feature-x/config coder
 ```
 
-`-n` reads the plan and creates nothing. Each `channel-setup` creates that node's inbox and the shared `refs/` directory.
+`<workspace>` in `sandbox/connect/<workspace>/config` is the descriptive name: the branch given to `setup_agent.sh` (for example `feature-x`) or `master` for that worktree. `setup_agent.sh` places the checkout in `agent-N`; the channel path uses the descriptive name. Node inboxes go under the same directory (`sandbox/connect/<workspace>/nodes/...`). `channel-arm coder` (no path) uses `$git-toplevel/sandbox/connect/<git-branch>/config`. `channel-send` still needs the path. The tools also accept any path; this library's example stays `example/comms.diag`.
+
+`-n` reads the plan and creates nothing. Each `channel-setup` creates that node's inbox, `inbox/claimed/`, and the shared `refs/` directory.
 
 The coder watches:
 
 ```sh
-channel-arm /path/to/comms.diag coder
+channel-arm sandbox/connect/feature-x/config coder
 ```
 
 The planner sends:
 
 ```sh
-channel-send /path/to/comms.diag planner coder IMPLEMENT body.md
+channel-send sandbox/connect/feature-x/config planner coder IMPLEMENT body.md
 ```
 
 When the work is done, the coder removes that one inbox file with `rm`.
 
 The send prints `SENT PATH`, then `DELIVERED PATH` (exit 0) once the file is in the coder's inbox, and returns. The sender's part ends there; it does not watch whether the coder has taken it. On a `->` arrow a second send prints `PENDING` and waits until the coder removes the first file; stopping it then prints `ABORTED` (nothing sent). `channel-send ... --retract PATH` takes a message back: `RETRACTED` if the coder had not taken it, `NOT-RETRACTED` if it had. See [bin/README.md](bin/README.md#send-and-retract).
 
-`body.md` has to match the `IMPLEMENT` message block. Lines with `<...>` are filled in. The other lines are copied as written. After a restart, `channel-arm /path/to/comms.diag coder --whatineedtoknow` prints the nodes and messages this coder uses, then exits. The same flag works on `channel-setup` and `channel-send`.
+`body.md` has to match the `IMPLEMENT` message block. Lines with `<...>` are filled in. The other lines are copied as written. After a restart, `channel-arm sandbox/connect/feature-x/config coder --whatineedtoknow` prints the nodes and messages this coder uses, then exits. The same flag works on `channel-setup` and `channel-send`.
 
 ## More
 
 | Path | What it is |
 |---|---|
-| [example/comms.diag](example/comms.diag) | A planner and a coder. Copy this and change the paths. |
+| [example/comms.diag](example/comms.diag) | A planner and a coder. Copy to `sandbox/connect/<workspace>/config` and replace `/channel`. |
 | [bin/README.md](bin/README.md) | What each script is for. |
 | [docs/plan-file.md](docs/plan-file.md) | `node`, `verb`, and `message` syntax. |
 | [docs/diagram-marks.md](docs/diagram-marks.md) | The arrow marks: `->` (one in flight), `-<` (queue), both on one line (`<->`, `>-<`, `>->`), and what blockdiag draws. |

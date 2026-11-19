@@ -40,7 +40,7 @@ bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1" >&2; }
 
 # The how-to-act header names the running binary's directory, which differs
 # between the shell, Python, and Go builds; compare it as a bare command name.
-norm_bin() { sed -E 's#[^ ]*/(channel-(setup|arm|send|ping|status)) #\1 #g' "$1"; }
+norm_bin() { sed -E 's#[^ ]*/(channel-(setup|arm|send|ping|status|rebind))#\1#g' "$1"; }
 
 same() {
   norm_bin "$2" > "$2.norm"
@@ -133,7 +133,7 @@ export CGO_ENABLED=0
 export GOPROXY=off
 go build -C "$ROOT/go" -trimpath -ldflags '-s -w' -o channel .
 
-for name in channel-setup channel-arm channel-send; do
+for name in channel-setup channel-arm channel-send channel-rebind; do
   if [ "$(readlink "$ROOT/bin/$name")" = channel ] && [ "$(readlink "$ROOT/go/$name")" = channel ]; then
     ok "symlink $name"
   else
@@ -174,14 +174,14 @@ same "arm --help is help" "$TMP/go-h" "$TMP/go-help"
 capture "$TMP/sh-nomode" "$TMP/sh-nomode.err" "$TMP/sh-nomode.rc" "$SH" "$ROOT/example/comms.diag"
 capture "$TMP/go-nomode" "$TMP/go-nomode.err" "$TMP/go-nomode.rc" "$GO" "$ROOT/example/comms.diag"
 same "no mode stderr" "$TMP/sh-nomode.err" "$TMP/go-nomode.err"
-expect_text "no mode text" "$TMP/sh-nomode.err" "no mode; use --setup, --arm, --send, --ping, or --status"
+expect_text "no mode text" "$TMP/sh-nomode.err" "no mode; use --setup, --arm, --send, --ping, --status, or --rebind"
 expect_rc "no mode exit" 1 "$TMP/sh-nomode.rc"
 expect_rc "go no mode exit" 1 "$TMP/go-nomode.rc"
 
 capture "$TMP/sh-pick" "$TMP/sh-pick.err" "$TMP/sh-pick.rc" "$SH" --setup --arm
 capture "$TMP/go-pick" "$TMP/go-pick.err" "$TMP/go-pick.rc" "$GO" --arm --send
 same "two mode flags" "$TMP/sh-pick.err" "$TMP/go-pick.err"
-expect_text "pick one" "$TMP/sh-pick.err" "pick one of --setup, --arm, --send, --ping, or --status"
+expect_text "pick one" "$TMP/sh-pick.err" "pick one of --setup, --arm, --send, --ping, --status, or --rebind"
 expect_rc "pick one exit" 1 "$TMP/sh-pick.rc"
 
 capture "$TMP/sh-conf" "$TMP/sh-conf.err" "$TMP/sh-conf.rc" "$ROOT/bin/channel-arm" --setup
@@ -192,8 +192,14 @@ expect_text "conflict text" "$TMP/sh-conf.err" "this command is arm; setup is a 
 capture "$TMP/sh-use" "$TMP/sh-use.err" "$TMP/sh-use.rc" "$ROOT/bin/channel-setup"
 capture "$TMP/go-use" "$TMP/go-use.err" "$TMP/go-use.rc" "$ROOT/go/channel-setup"
 same "setup usage" "$TMP/sh-use.err" "$TMP/go-use.err"
-expect_text "setup usage text" "$TMP/sh-use.err" "usage: channel-setup FILE NODE [-n|--dry-run] [--whatineedtoknow]"
+expect_text "setup usage text" "$TMP/sh-use.err" "usage: channel-setup [FILE] NODE [-n|--dry-run] [--whatineedtoknow]"
 expect_rc "setup usage exit" 1 "$TMP/sh-use.rc"
+
+capture "$TMP/sh-armu" "$TMP/sh-armu.err" "$TMP/sh-armu.rc" "$ROOT/bin/channel-arm"
+capture "$TMP/go-armu" "$TMP/go-armu.err" "$TMP/go-armu.rc" "$ROOT/go/channel-arm"
+same "arm usage" "$TMP/sh-armu.err" "$TMP/go-armu.err"
+expect_text "arm usage text" "$TMP/sh-armu.err" "usage: channel-arm [FILE] NODE"
+expect_rc "arm usage exit" 1 "$TMP/sh-armu.rc"
 
 capture "$TMP/sh-use2" "$TMP/sh-use2.err" "$TMP/sh-use2.rc" "$SH" --send
 capture "$TMP/go-use2" "$TMP/go-use2.err" "$TMP/go-use2.rc" "$GO" --send
@@ -227,7 +233,7 @@ capture "$TMP/go-n" "$TMP/go-n.err" "$TMP/go-n.rc" "$ROOT/go/channel-setup" "$EX
 same "example dry-run shell" "$TMP/py-n" "$TMP/sh-n"
 same "example dry-run go" "$TMP/py-n" "$TMP/go-n"
 empty_file "example dry-run stderr" "$TMP/sh-n.err"
-if [ ! -d /channel/nodes ]; then ok "dry-run does not create /channel"; else bad "dry-run created /channel"; fi
+if [ ! -d /channel/connect ]; then ok "dry-run does not create /channel"; else bad "dry-run created /channel"; fi
 
 capture "$TMP/py-w" "$TMP/py-w.err" "$TMP/py-w.rc" python3 "$PY" arm "$EX" coder --whatineedtoknow
 capture "$TMP/sh-w" "$TMP/sh-w.err" "$TMP/sh-w.rc" "$SH" --arm "$EX" coder --whatineedtoknow
@@ -487,11 +493,12 @@ if [ -d "$PIN" ] && [ ! -d "$CIN" ] && [ ! -d "$AIN" ]; then
 else
   bad "setup creates only this inbox"
 fi
-if [ "$(stat -c %a "$TMP/nodes/planner")" = 2775 ] && [ "$(stat -c %a "$PIN")" = 2775 ] && [ "$(stat -c %a "$TMP/refs")" = 2775 ]; then
+if [ "$(stat -c %a "$TMP/nodes/planner")" = 2775 ] && [ "$(stat -c %a "$PIN")" = 2775 ] && [ "$(stat -c %a "$PIN/claimed")" = 2775 ] && [ "$(stat -c %a "$TMP/refs")" = 2775 ]; then
   ok "shell directory modes"
 else
-  bad "shell directory modes $(stat -c %a "$TMP/nodes/planner") $(stat -c %a "$PIN") $(stat -c %a "$TMP/refs")"
+  bad "shell directory modes $(stat -c %a "$TMP/nodes/planner") $(stat -c %a "$PIN") $(stat -c %a "$PIN/claimed") $(stat -c %a "$TMP/refs")"
 fi
+if [ -d "$PIN/claimed" ]; then ok "setup creates claimed"; else bad "setup creates claimed"; fi
 
 capture "$TMP/go-set" "$TMP/go-set.err" "$TMP/go-set.rc" "$ROOT/go/channel-setup" "$PLAN" coder
 expect_text "go setup line" "$TMP/go-set" "node coder inbox $CIN"
@@ -506,11 +513,14 @@ same "setup rerun shell/py" "$TMP/sh-re" "$TMP/py-re"
 expect_rc "shell setup rerun exit" 0 "$TMP/sh-re.rc"
 if [ -f "$CIN/keep-me" ] && [ "$(stat -c %a "$CIN")" = 2775 ]; then ok "setup rerun kept inbox contents"; else bad "setup rerun kept inbox contents"; fi
 rm -f "$CIN/keep-me"
-if [ "$(stat -c %a "$TMP/nodes/coder")" = 2775 ] && [ "$(stat -c %a "$CIN")" = 2775 ]; then
+if [ "$(stat -c %a "$TMP/nodes/coder")" = 2775 ] && [ "$(stat -c %a "$CIN")" = 2775 ] && [ "$(stat -c %a "$CIN/claimed")" = 2775 ]; then
   ok "go directory modes"
 else
   bad "go directory modes"
 fi
+rmdir "$CIN/claimed"
+capture "$TMP/go-reclaim" "$TMP/go-reclaim.err" "$TMP/go-reclaim.rc" "$ROOT/go/channel-setup" "$PLAN" coder
+if [ -d "$CIN/claimed" ] && grep -q ' existing$' "$TMP/go-reclaim"; then ok "setup rerun creates missing claimed"; else bad "setup rerun creates missing claimed"; fi
 if [ ! -d "$AIN" ]; then ok "go setup left auditor absent"; else bad "go setup left auditor absent"; fi
 
 # --- send errors, before any publish ---
@@ -1259,6 +1269,309 @@ for impl in go sh py; do
   if [ "$rc" = 1 ] && grep -q 'usage: channel-send FILE NODE --retract MESSAGE' "$Z/$impl-bu"; then ok "$impl --retract with send args is refused"; else bad "$impl --retract usage (rc=$rc): $(cat "$Z/$impl-bu")"; fi
   rm -rf "$Z"/nodes/*/inbox/*.md "$Z"/nodes/q/inbox/claimed
 done
+
+# --- rebind: leftover watches in this worktree ---
+RB=$TMP/rb
+mkdir -p "$RB"
+cat > "$RB/rb.diag" <<EOF
+blockdiag {
+  a <-> b;
+}
+/*
+node a $RB/nodes/a/inbox
+node b $RB/nodes/b/inbox
+verb a b NOTE
+verb b a NOTE
+message NOTE {
+A note.
+body: {
+NOTE: <t>
+}
+}
+*/
+EOF
+"$ROOT/go/channel-setup" "$RB/rb.diag" a >/dev/null
+"$ROOT/go/channel-setup" "$RB/rb.diag" b >/dev/null
+pkill -9 -f "$TMP/" 2>/dev/null || true
+
+capture "$TMP/sh-rbu" "$TMP/sh-rbu.err" "$TMP/sh-rbu.rc" "$ROOT/bin/channel-rebind" extra
+capture "$TMP/go-rbu" "$TMP/go-rbu.err" "$TMP/go-rbu.rc" "$ROOT/go/channel-rebind" extra
+same "rebind extra args shell/go" "$TMP/sh-rbu.err" "$TMP/go-rbu.err"
+expect_text "rebind usage" "$TMP/sh-rbu.err" "usage: channel-rebind [--pid PID]"
+expect_rc "rebind extra args exit" 1 "$TMP/sh-rbu.rc"
+
+(
+  cd "$ROOT"
+  capture "$TMP/sh-none" "$TMP/sh-none.err" "$TMP/sh-none.rc" "$ROOT/bin/channel-rebind"
+  capture "$TMP/go-none" "$TMP/go-none.err" "$TMP/go-none.rc" "$ROOT/go/channel-rebind"
+  capture "$TMP/py-none" "$TMP/py-none.err" "$TMP/py-none.rc" python3 "$PY" rebind
+)
+same "rebind none shell/go" "$TMP/sh-none" "$TMP/go-none"
+same "rebind none shell/py" "$TMP/sh-none" "$TMP/py-none"
+expect_text "rebind none text" "$TMP/sh-none" "REBIND-NONE"
+expect_rc "rebind none exit" 0 "$TMP/sh-none.rc"
+
+for impl in go sh py; do
+  case $impl in
+    go) A="$ROOT/go/channel-arm"; RBIN="$ROOT/go/channel-rebind" ;;
+    sh) A="$ROOT/bin/channel-arm"; RBIN="$ROOT/bin/channel-rebind" ;;
+    py) A="python3 $PY arm"; RBIN="python3 $PY rebind" ;;
+  esac
+  rm -f "$RB"/nodes/*/arm.pid
+  pkill -9 -f "$RB/rb.diag" 2>/dev/null || true
+  $A "$RB/rb.diag" a > "$RB/$impl-arm-a" 2>&1 &
+  pa=$!
+  wait_for "$RB/$impl-arm-a" READY || true
+  (
+    cd "$ROOT"
+    capture "$RB/$impl-one" "$RB/$impl-one.err" "$RB/$impl-one.rc" $RBIN
+  )
+  if grep -q '^how to act:' "$RB/$impl-one" && grep -q "you are node a " "$RB/$impl-one" && [ "$(cat "$RB/$impl-one.rc")" = 0 ]; then
+    ok "$impl rebind one leftover prints the header"
+  else
+    bad "$impl rebind one leftover prints the header: $(head -5 "$RB/$impl-one" "$RB/$impl-one.err")"
+  fi
+  if ! kill -0 "$pa" 2>/dev/null; then ok "$impl rebind killed the leftover"; else bad "$impl rebind killed the leftover"; kill -9 "$pa" 2>/dev/null || true; fi
+  wait "$pa" 2>/dev/null || true
+
+  $A "$RB/rb.diag" a > "$RB/$impl-arm-a2" 2>&1 &
+  pa=$!
+  $A "$RB/rb.diag" b > "$RB/$impl-arm-b2" 2>&1 &
+  pb=$!
+  wait_for "$RB/$impl-arm-a2" READY || true
+  wait_for "$RB/$impl-arm-b2" READY || true
+  (
+    cd "$ROOT"
+    capture "$RB/$impl-ch" "$RB/$impl-ch.err" "$RB/$impl-ch.rc" $RBIN
+  )
+  if grep -q '^REBIND-CHOOSE$' "$RB/$impl-ch" && grep -q "node=a" "$RB/$impl-ch" && grep -q "node=b" "$RB/$impl-ch" && [ "$(cat "$RB/$impl-ch.rc")" = 0 ]; then
+    ok "$impl rebind several prints REBIND-CHOOSE"
+  else
+    bad "$impl rebind several prints REBIND-CHOOSE: $(cat "$RB/$impl-ch" "$RB/$impl-ch.err")"
+  fi
+  if kill -0 "$pa" 2>/dev/null && kill -0 "$pb" 2>/dev/null; then ok "$impl rebind choose does not kill"; else bad "$impl rebind choose does not kill"; fi
+  (
+    cd "$ROOT"
+    capture "$RB/$impl-pid" "$RB/$impl-pid.err" "$RB/$impl-pid.rc" $RBIN --pid "$pa"
+  )
+  if grep -q '^how to act:' "$RB/$impl-pid" && grep -q "you are node a " "$RB/$impl-pid"; then
+    ok "$impl rebind --pid takes that watch"
+  else
+    bad "$impl rebind --pid takes that watch: $(head -5 "$RB/$impl-pid" "$RB/$impl-pid.err")"
+  fi
+  if ! kill -0 "$pa" 2>/dev/null && kill -0 "$pb" 2>/dev/null; then ok "$impl rebind --pid left the other watch"; else bad "$impl rebind --pid left the other watch"; fi
+  wait "$pa" 2>/dev/null || true
+  (
+    cd "$ROOT"
+    capture "$RB/$impl-rest" "$RB/$impl-rest.err" "$RB/$impl-rest.rc" $RBIN
+  )
+  if grep -q '^how to act:' "$RB/$impl-rest" && grep -q "you are node b " "$RB/$impl-rest"; then
+    ok "$impl rebind takes the remaining watch"
+  else
+    bad "$impl rebind takes the remaining watch: $(head -5 "$RB/$impl-rest" "$RB/$impl-rest.err")"
+  fi
+  wait "$pb" 2>/dev/null || true
+
+  $A "$RB/rb.diag" a > "$RB/$impl-arm-wt" 2>&1 &
+  pa=$!
+  wait_for "$RB/$impl-arm-wt" READY || true
+  (
+    cd /tmp
+    capture "$RB/$impl-away" "$RB/$impl-away.err" "$RB/$impl-away.rc" $RBIN
+  )
+  if grep -q '^REBIND-NONE$' "$RB/$impl-away" && kill -0 "$pa" 2>/dev/null; then
+    ok "$impl rebind ignores a watch from another directory"
+  else
+    bad "$impl rebind ignores a watch from another directory: $(cat "$RB/$impl-away") alive=$(kill -0 "$pa" 2>/dev/null && echo yes || echo no)"
+  fi
+  kill -9 "$pa" 2>/dev/null || true
+  wait "$pa" 2>/dev/null || true
+
+  # A shell wrapper that only mentions channel-arm is not itself a watch.
+  /bin/sh -c '"$@" & wait' x $A "$RB/rb.diag" a > "$RB/$impl-arm-wrap" 2>&1 &
+  wp=$!
+  wait_for "$RB/$impl-arm-wrap" READY || true
+  (
+    cd "$ROOT"
+    capture "$RB/$impl-wrap" "$RB/$impl-wrap.err" "$RB/$impl-wrap.rc" $RBIN
+  )
+  n=0
+  while kill -0 "$wp" 2>/dev/null && [ "$n" -lt 40 ]; do
+    n=$((n + 1))
+    sleep 0.05
+  done
+  if grep -q '^how to act:' "$RB/$impl-wrap" && grep -q "you are node a " "$RB/$impl-wrap" && ! kill -0 "$wp" 2>/dev/null; then
+    ok "$impl rebind one leftover through a shell wrapper"
+  else
+    bad "$impl rebind one leftover through a shell wrapper: $(head -5 "$RB/$impl-wrap" "$RB/$impl-wrap.err" "$RB/$impl-arm-wrap") alive=$(kill -0 "$wp" 2>/dev/null && echo yes || echo no)"
+  fi
+  kill -9 "$wp" 2>/dev/null || true
+  wait "$wp" 2>/dev/null || true
+  rm -f "$RB"/nodes/*/arm.pid
+  pkill -9 -f "$RB/rb.diag" 2>/dev/null || true
+
+  # A watch whose closest grok ancestor is not ours is left alone.
+  # argv0 basename grok (POSIX: a symlink named grok; exec -a is not in dash).
+  ln -sfn /bin/sh "$RB/grok"
+  ("$RB/grok" -c '"$@" & wait' x $A "$RB/rb.diag" a) > "$RB/$impl-arm-fk" 2>&1 &
+  fk=$!
+  wait_for "$RB/$impl-arm-fk" READY || true
+  (
+    cd "$ROOT"
+    capture "$RB/$impl-fk" "$RB/$impl-fk.err" "$RB/$impl-fk.rc" $RBIN
+  )
+  if grep -q '^REBIND-NONE$' "$RB/$impl-fk" && grep -q READY "$RB/$impl-arm-fk" && kill -0 "$fk" 2>/dev/null; then
+    ok "$impl rebind skips a watch bound to another grok"
+  else
+    bad "$impl rebind skips a watch bound to another grok: $(cat "$RB/$impl-fk" "$RB/$impl-arm-fk") alive=$(kill -0 "$fk" 2>/dev/null && echo yes || echo no)"
+  fi
+  kill -9 "$fk" 2>/dev/null || true
+  pkill -9 -f "$RB/rb.diag" 2>/dev/null || true
+  wait "$fk" 2>/dev/null || true
+done
+
+# --- default FILE: $git-toplevel/sandbox/connect/<branch>/config ---
+WS=$TMP/ws
+mkdir -p "$WS"
+GIT_CEILING_DIRECTORIES=$TMP
+export GIT_CEILING_DIRECTORIES
+(
+  cd "$WS"
+  git init -q --initial-branch=feature-x
+)
+want_plan=$WS/sandbox/connect/feature-x/config
+mkdir -p "$WS/sandbox/connect/feature-x"
+cat > "$want_plan" <<EOF
+blockdiag {
+  planner >-> coder;
+}
+/*
+node planner $WS/sandbox/connect/feature-x/nodes/planner/inbox
+node coder $WS/sandbox/connect/feature-x/nodes/coder/inbox
+verb planner coder NOTE
+verb coder planner NOTE
+message NOTE {
+A note.
+body: {
+NOTE: <t>
+}
+}
+*/
+EOF
+
+(
+  cd "$WS"
+  capture "$TMP/sh-def-miss" "$TMP/sh-def-miss.err" "$TMP/sh-def-miss.rc" "$ROOT/bin/channel-arm" ghost
+  capture "$TMP/go-def-miss" "$TMP/go-def-miss.err" "$TMP/go-def-miss.rc" "$ROOT/go/channel-arm" ghost
+  capture "$TMP/py-def-miss" "$TMP/py-def-miss.err" "$TMP/py-def-miss.rc" python3 "$PY" arm ghost
+)
+same "default plan unknown node shell/go" "$TMP/sh-def-miss.err" "$TMP/go-def-miss.err"
+same "default plan unknown node shell/py" "$TMP/sh-def-miss.err" "$TMP/py-def-miss.err"
+expect_text "default plan unknown node text" "$TMP/sh-def-miss.err" "ghost is not a node in $want_plan"
+expect_rc "default plan unknown node exit" 1 "$TMP/sh-def-miss.rc"
+
+(
+  cd "$WS"
+  capture "$TMP/sh-def-setup" "$TMP/sh-def-setup.err" "$TMP/sh-def-setup.rc" "$ROOT/bin/channel-setup" planner
+  capture "$TMP/go-def-setup" "$TMP/go-def-setup.err" "$TMP/go-def-setup.rc" "$ROOT/go/channel-setup" coder
+)
+if [ -d "$WS/sandbox/connect/feature-x/nodes/planner/inbox/claimed" ] && [ "$(cat "$TMP/sh-def-setup.rc")" = 0 ]; then
+  ok "setup one-arg uses default plan"
+else
+  bad "setup one-arg uses default plan: $(cat "$TMP/sh-def-setup" "$TMP/sh-def-setup.err")"
+fi
+if [ -d "$WS/sandbox/connect/feature-x/nodes/coder/inbox/claimed" ] && [ "$(cat "$TMP/go-def-setup.rc")" = 0 ]; then
+  ok "go setup one-arg uses default plan"
+else
+  bad "go setup one-arg uses default plan: $(cat "$TMP/go-def-setup" "$TMP/go-def-setup.err")"
+fi
+
+(
+  cd "$WS"
+  capture "$TMP/sh-def-w" "$TMP/sh-def-w.err" "$TMP/sh-def-w.rc" "$ROOT/bin/channel-arm" planner --whatineedtoknow
+  capture "$TMP/go-def-w" "$TMP/go-def-w.err" "$TMP/go-def-w.rc" "$ROOT/go/channel-arm" planner --whatineedtoknow
+  capture "$TMP/py-def-w" "$TMP/py-def-w.err" "$TMP/py-def-w.rc" python3 "$PY" arm planner --whatineedtoknow
+)
+same "default plan whatineedtoknow shell/go" "$TMP/sh-def-w" "$TMP/go-def-w"
+same "default plan whatineedtoknow shell/py" "$TMP/sh-def-w" "$TMP/py-def-w"
+if grep -q '^how to act:' "$TMP/sh-def-w" && grep -q "plan: $want_plan" "$TMP/sh-def-w" && grep -q "you are node planner " "$TMP/sh-def-w"; then
+  ok "default plan whatineedtoknow names the config"
+else
+  bad "default plan whatineedtoknow names the config: $(head -8 "$TMP/sh-def-w" "$TMP/sh-def-w.err")"
+fi
+expect_rc "default plan whatineedtoknow exit" 0 "$TMP/sh-def-w.rc"
+
+(
+  cd "$WS"
+  capture "$TMP/sh-def-st" "$TMP/sh-def-st.err" "$TMP/sh-def-st.rc" "$ROOT/bin/channel-status"
+  capture "$TMP/go-def-st" "$TMP/go-def-st.err" "$TMP/go-def-st.rc" "$ROOT/go/channel-status"
+)
+same "default plan status shell/go" "$TMP/sh-def-st" "$TMP/go-def-st"
+if grep -q "node planner " "$TMP/sh-def-st" && grep -q "node coder " "$TMP/sh-def-st" && [ "$(cat "$TMP/sh-def-st.rc")" = 0 ]; then
+  ok "status no-arg uses default plan"
+else
+  bad "status no-arg uses default plan: $(cat "$TMP/sh-def-st" "$TMP/sh-def-st.err")"
+fi
+
+NG=$TMP/nongit
+mkdir -p "$NG"
+(
+  cd "$NG"
+  capture "$TMP/sh-nogit" "$TMP/sh-nogit.err" "$TMP/sh-nogit.rc" "$ROOT/bin/channel-arm" planner
+  capture "$TMP/go-nogit" "$TMP/go-nogit.err" "$TMP/go-nogit.rc" "$ROOT/go/channel-arm" planner
+  capture "$TMP/py-nogit" "$TMP/py-nogit.err" "$TMP/py-nogit.rc" python3 "$PY" arm planner
+)
+same "no git default plan shell/go" "$TMP/sh-nogit.err" "$TMP/go-nogit.err"
+same "no git default plan shell/py" "$TMP/sh-nogit.err" "$TMP/py-nogit.err"
+expect_text "no git default plan text" "$TMP/sh-nogit.err" "no git repository here; pass the plan file (sandbox/connect/<workspace>/config)"
+expect_rc "no git default plan exit" 1 "$TMP/sh-nogit.rc"
+
+(
+  cd "$WS"
+  git -c user.email=t@t -c user.name=t commit --allow-empty -q -m i
+  git checkout -q --detach
+  capture "$TMP/sh-det" "$TMP/sh-det.err" "$TMP/sh-det.rc" "$ROOT/bin/channel-arm" planner
+  capture "$TMP/go-det" "$TMP/go-det.err" "$TMP/go-det.rc" "$ROOT/go/channel-arm" planner
+  capture "$TMP/py-det" "$TMP/py-det.err" "$TMP/py-det.rc" python3 "$PY" arm planner
+)
+same "detached HEAD default plan shell/go" "$TMP/sh-det.err" "$TMP/go-det.err"
+same "detached HEAD default plan shell/py" "$TMP/sh-det.err" "$TMP/py-det.err"
+expect_text "detached HEAD default plan text" "$TMP/sh-det.err" "git HEAD is detached; pass the plan file or check out the workspace branch"
+expect_rc "detached HEAD default plan exit" 1 "$TMP/sh-det.rc"
+
+(
+  cd "$WS"
+  git checkout -q feature-x
+)
+rm -f "$WS"/sandbox/connect/feature-x/nodes/*/arm.pid
+( cd "$WS" && exec "$ROOT/go/channel-arm" planner ) > "$TMP/def-arm.out" 2>"$TMP/def-arm.err" &
+pa=$!
+echo "$pa" >> "$PIDS"
+wait_for "$TMP/def-arm.out" READY || true
+(
+  cd "$WS"
+  capture "$TMP/sh-def-rb" "$TMP/sh-def-rb.err" "$TMP/sh-def-rb.rc" "$ROOT/bin/channel-rebind"
+)
+if grep -q '^how to act:' "$TMP/sh-def-rb" && grep -q "you are node planner " "$TMP/sh-def-rb" && grep -q "plan: $want_plan" "$TMP/sh-def-rb" && [ "$(cat "$TMP/sh-def-rb.rc")" = 0 ]; then
+  ok "rebind recovers a one-arg leftover watch"
+else
+  bad "rebind recovers a one-arg leftover watch: $(head -8 "$TMP/sh-def-rb" "$TMP/sh-def-rb.err" "$TMP/def-arm.out" "$TMP/def-arm.err")"
+fi
+if ! kill -0 "$pa" 2>/dev/null; then ok "rebind killed the one-arg leftover"; else bad "rebind killed the one-arg leftover"; kill -9 "$pa" 2>/dev/null || true; fi
+wait "$pa" 2>/dev/null || true
+
+# Missing default file: same git layout, no config.
+MISS=$TMP/miss
+mkdir -p "$MISS"
+(
+  cd "$MISS"
+  git init -q --initial-branch=feature-x
+  capture "$TMP/sh-nofile" "$TMP/sh-nofile.err" "$TMP/sh-nofile.rc" "$ROOT/bin/channel-arm" planner
+  capture "$TMP/go-nofile" "$TMP/go-nofile.err" "$TMP/go-nofile.rc" "$ROOT/go/channel-arm" planner
+)
+same "missing default plan file shell/go" "$TMP/sh-nofile.err" "$TMP/go-nofile.err"
+expect_text "missing default plan file text" "$TMP/sh-nofile.err" "no plan file $MISS/sandbox/connect/feature-x/config"
+expect_rc "missing default plan file exit" 1 "$TMP/sh-nofile.rc"
 
 printf '%s\n' "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

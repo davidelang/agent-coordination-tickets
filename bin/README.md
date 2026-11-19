@@ -1,16 +1,17 @@
 # Scripts
 
-`channel` is the program. `channel-setup`, `channel-arm`, `channel-send`, `channel-ping`, and `channel-status` are symlinks to it. The name selects the mode. `channel` with no mode flags prints help and exits. `--setup`, `--arm`, `--send`, `--ping`, and `--status` select the mode when the name is `channel`. The same layout exists for the shell script here and for the Go binary in [../go](../go/).
+`channel` is the program. `channel-setup`, `channel-arm`, `channel-send`, `channel-ping`, `channel-status`, and `channel-rebind` are symlinks to it. The name selects the mode. `channel` with no mode flags prints help and exits. `--setup`, `--arm`, `--send`, `--ping`, `--status`, and `--rebind` select the mode when the name is `channel`. The same layout exists for the shell script here and for the Go binary in [../go](../go/).
 
-Each command takes the plan file and a bare node name. Options follow the `getopt_long` rules: `-n` and `--whatineedtoknow` may sit before, among, or after those arguments. `--` ends the options. A name and a different mode flag is an error.
+Each command takes the plan file and a bare node name. `FILE` may be omitted on setup, arm, ping, and status: it is `$git-toplevel/sandbox/connect/<git-branch>/config`. `channel-send` still needs FILE. Options follow the `getopt_long` rules: `-n` and `--whatineedtoknow` may sit before, among, or after those arguments. `--` ends the options. A name and a different mode flag is an error.
 
 | Script | When |
 |---|---|
-| `channel-setup FILE NODE [-n\|--dry-run] [--whatineedtoknow]` | Once per node, by a human. Creates that node's inbox and a `refs/` directory next to the plan file, all mode 2775 (setgid, group-writable, no sticky bit). Safe to rerun: on an existing node it prints `node NODE inbox PATH existing`, exits 0, and changes nothing, so a skill can call it whenever the inbox is missing. `-n` checks the plan, prints the directed edges, and creates nothing. |
-| `channel-arm FILE NODE [--whatineedtoknow]` | The receiver leaves this running. It prints `READY`, then `FILE <path>` for the oldest message in that inbox. When that file is removed, it prints the new oldest. It does not print a newer file while an older one is still there. |
+| `channel-setup [FILE] NODE [-n\|--dry-run] [--whatineedtoknow]` | Once per node, by a human. Creates that node's inbox, `inbox/claimed/`, and a `refs/` directory next to the plan file, all mode 2775 (setgid, group-writable, no sticky bit). Safe to rerun: on an existing node it prints `node NODE inbox PATH existing`, exits 0, creates `claimed/` if it is missing, and changes nothing else, so a skill can call it whenever the inbox is missing. `-n` checks the plan, prints the directed edges, and creates nothing. |
+| `channel-arm [FILE] NODE [--whatineedtoknow]` | The receiver leaves this running. It prints `READY`, then `FILE <path>` for the oldest message in that inbox. When that file is removed, it prints the new oldest. It does not print a newer file while an older one is still there. |
 | `channel-send FILE NODE DEST VERB [BODYFILE\|-\|-m TEXT ...] [REF ...] [--whatineedtoknow]`<br>`channel-send FILE NODE --retract MESSAGE` | The sender. The body comes from BODYFILE, from stdin (`-` or no body argument), or from `-m TEXT` (repeatable like git; each `-m` is one block of lines, blocks joined by a blank line; with `-m`, every positional after VERB is a REF). A message may carry several REF files. Checks `VERB` is allowed on that arrow and that the body matches the message block. Copies refs into `refs/`, then renames the message into the destination inbox. On a `->` arrow it waits (`PENDING`) until this sender's previous file there is removed; on a `-<` arrow it sends at once. The destination inbox has to exist already. It ends with `DELIVERED PATH` once the file is in the destination inbox; see Send and retract. `--retract` takes a sent message back. `--timeout` is only for `DEST PING`. |
-| `channel-ping FILE NODE [--all [--every MIN]] [--run ID] [--timeout SEC]` | Connectivity test. Sends a built-in PING on every arrow out of NODE. Where DEST has an arrow back it waits only for the PONG and prints `PONG DEST 0.2s` or `TIMEOUT DEST (...)` (exit 1). Where DEST has no arrow back no PONG is possible: it prints `NO-RETURN DEST (the PING is delivered; ...)` and does not wait. An explicit ping is never rate-limited. `--all` starts a check-all run that spreads over every link (see [Check-all](#check-all-links)); `--run ID` is how a receiving node joins a run. `--timeout` defaults to 300s (env `CHANNEL_PING_TIMEOUT`). |
-| `channel-status FILE` | One line per node: `node NAME INBOX messages N [oldest AGEs] claimed M`, then `  claimed FILE AGEs [owner=...]` for each claimed file. An inbox it cannot read prints `no permission` (or `missing`). |
+| `channel-ping [FILE] NODE [--all [--every MIN]] [--run ID] [--timeout SEC]` | Connectivity test. Sends a built-in PING on every arrow out of NODE. Where DEST has an arrow back it waits only for the PONG and prints `PONG DEST 0.2s` or `TIMEOUT DEST (...)` (exit 1). Where DEST has no arrow back no PONG is possible: it prints `NO-RETURN DEST (the PING is delivered; ...)` and does not wait. An explicit ping is never rate-limited. `--all` starts a check-all run that spreads over every link (see [Check-all](#check-all-links)); `--run ID` is how a receiving node joins a run. `--timeout` defaults to 300s (env `CHANNEL_PING_TIMEOUT`). |
+| `channel-status [FILE]` | One line per node: `node NAME INBOX messages N [oldest AGEs] claimed M`, then `  claimed FILE AGEs [owner=...]` for each claimed file. An inbox it cannot read prints `no permission` (or `missing`). |
+| `channel-rebind [--pid PID]` | After `/new`, take back this worktree's leftover `channel-arm`. Same user, cwd or argv under `$PWD`, and either no grok ancestor or the same grok process that is running rebind (a watch bound to a different grok is left alone). No leftover: `REBIND-NONE`. Several: `REBIND-CHOOSE` then `pid=N plan=PATH node=NAME` lines (nothing is killed). One leftover, or `--pid` of one of those lines: kill that process group and print the `--whatineedtoknow` header. Pending `channel-send` processes are left running. |
 
 `--whatineedtoknow` starts with a "how to act" header filled in for that node: the absolute plan and inbox paths, the exact `channel-arm` watch and `channel-send` commands (the running binary's siblings), what goes in the body file, handling the oldest file first, and removing a file from the inbox when done. Then it prints the nodes this one talks to and the `message` blocks on those arrows, and exits. A bot needs nothing beyond that output. It does not create directories, send, or watch. Run it on `channel-arm` after a start or a compact. The flag is on all three so the dump is not a fourth command.
 
@@ -127,6 +128,8 @@ node review /abs/inbox webhook=http://127.0.0.1:8765/hook                # no Au
 
 `channel-arm` records itself in `nodes/NODE/arm.pid` (`PID HOST`). If that file names a live `channel-arm` on this host, a second `channel-arm` for the same node prints `ALREADY-WATCHING NODE pid PID (...)` and exits with status 3 instead of starting; the running watch keeps going. A pid that is gone or is not a `channel-arm` does not block. A pid recorded by another host cannot be checked, so it is reported the same way; remove the file if that watch is gone.
 
+After `/new` that leftover watch is still running under the same grok process, but the new conversation has no monitor. `channel-rebind` (the `/channel rebind` skill) finds it in `/proc`, kills it, and prints the header so the agent can start a new watch.
+
 ## No fallbacks
 
 Each step has one defined path; when it cannot run, the command fails with a message instead of quietly doing something else.
@@ -140,7 +143,7 @@ Each step has one defined path; when it cannot run, the command fails with a mes
 
 ## In-progress files and restarts
 
-`channel-arm` only announces message files directly inside `inbox/`; subdirectories are ignored. A node may move a message it is working on into `inbox/claimed/` (create it with mode 2775) so the watch moves on. Remove the claimed file only after the reply to it has been sent.
+`channel-arm` only announces message files directly inside `inbox/`; subdirectories are ignored. `channel-setup` creates `inbox/claimed/` (mode 2775). A node may move a message it is working on into `claimed/` so the watch moves on. Remove the claimed file only after the reply to it has been sent.
 
 On a start or after a compaction, a node first reviews `inbox/claimed/`: those are messages it already started and may have partly finished. Before redoing anything it checks whether its reply was already sent (for example in the destination inbox, or its own notes). Claims are never reclaimed automatically by age; `channel-status` reports them with their ages so stale ones can be handled by a person. A node may write an optional sidecar `claimed/FILE.owner` (first line: who has it); `channel-status` shows it as `owner=`.
 
@@ -154,19 +157,21 @@ channel — one inbox directory per agent
 
 With no mode, this prints help and exits.
 
-  channel --setup FILE NODE [-n|--dry-run] [--whatineedtoknow]
-  channel --arm   FILE NODE [--whatineedtoknow]
+  channel --setup [FILE] NODE [-n|--dry-run] [--whatineedtoknow]
+  channel --arm   [FILE] NODE [--whatineedtoknow]
   channel --send  FILE NODE DEST VERB [BODYFILE|-|-m TEXT ...] [REF ...] [--timeout SEC] [--whatineedtoknow]
   channel --send  FILE NODE --retract MESSAGE
-  channel --ping  FILE NODE [--all [--every MIN]] [--timeout SEC]
-  channel --status FILE
+  channel --ping  [FILE] NODE [--all [--every MIN]] [--timeout SEC]
+  channel --status [FILE]
+  channel --rebind [--pid PID]
 
-channel-setup, channel-arm, and channel-send are names for this same program.
-The name selects the mode, so those forms do not need --setup, --arm, or --send.
+channel-setup, channel-arm, channel-send, and channel-rebind are names for this same program.
+The name selects the mode, so those forms do not need --setup, --arm, --send, or --rebind.
 
 -n, --dry-run       check the plan and create nothing (setup only)
 --whatineedtoknow   print how to act (paths, watch/send commands, body rules), then
                     the nodes and messages this node uses, then exit
+--pid PID           rebind: take this leftover watch (required if several)
 -h, --help          print this help
 
 Options may sit before or after the file and the node. -- ends the options.

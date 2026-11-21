@@ -6,7 +6,7 @@ The split of work:
 
 | Here (generic) | In the consumer's `run-*` wrapper (the launch hook) |
 |--|--|
-| the job loop, review rounds, done checks, replies | which account runs each role (`sudo -u ...`) |
+| the job loop, review rounds, done checks, replies | which account runs the agents (the wrapper may switch once at start with `sudo -u`, so the dispatcher and every agent share one account; or the hook may pick one per role) |
 | the agent command line for each backend | the landlock for each role and access level |
 | role cards and prompt templates (overridable) | the config home (`GROK_HOME`), which sets the context window |
 | reading the diag and the sidecar | finding the standard diag and asking whether to use it |

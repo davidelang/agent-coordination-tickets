@@ -1,0 +1,64 @@
+# Sidecar for example/comms.diag: dispatch settings the channel never reads.
+# The dispatcher loads DIAG.dispatch when it exists (or -s/--sidecar FILE).
+# The same KEY=VALUE lines may sit in the diag itself as '# dispatch.KEY=VALUE'.
+# Priority: command line > this file > '# dispatch.' lines > dispatch/roles/ROLE.conf.
+# Within a source: review.NAME.KEY > ROLE.KEY > KEY.
+#
+# Nothing here names an account, a landlock, a cwd or a config home. Those
+# belong to the launch hook (a consumer's run-* wrapper), which the
+# dispatcher calls as:
+#   HOOK --role ROLE --access read-write|read-only --job-dir DIR --worktree DIR -- AGENT-ARGV...
+# Relative paths below are resolved from this file's directory.
+
+# Which diag node each role serves.
+executor.node=coder
+# reviewer.node=review
+
+# Launch hooks (normally passed by the wrapper with -l/--launch instead).
+# launch=../../run-script-grok-hook
+# reviewer.launch=../../run-script-grok-hook
+
+# Agent settings. model/effort are passed to the backend as given.
+executor.backend=grok-build
+executor.model=grok-4.7
+executor.effort=high
+executor.max_turns=80
+# executor.timeout=3600
+# executor.agent_bin=/path/to/grok
+
+# Done means: a STATUS: SUCCESS line, a new commit, and (when set) this tag on HEAD.
+executor.require_commit=yes
+# executor.done_tag=builds
+
+# Project rules added to every executor prompt ({{ADDENDUM}}), e.g. a preflight step.
+# executor.addendum=executor-addendum.md
+# A project role card instead of dispatch/roles/executor.md:
+# executor.rules=../../roles/executor.md
+
+# Review rounds before the job is reported as FAILURE.
+executor.rounds=3
+
+# Reply verbs (each needs a message block in the diag).
+executor.reply.complete=COMPLETE
+executor.reply.failure=FAILURE
+executor.reply.blocked=BLOCKED
+executor.reply.stopped=STOPPED
+
+# --- review registry --------------------------------------------------------
+# The built-in 'conformance' review (blocking, in-process, reviewer role) is on
+# by default; review.conformance.enabled=no turns it off.
+review.conformance.blocking=yes
+review.conformance.max_turns=40
+# review.conformance.effort=medium
+# review.conformance.rules=../../roles/reviewer.md
+
+# A non-blocking review: starts after COMPLETE is sent, nothing waits for it.
+# review.regression.role=tester
+# review.regression.blocking=no
+# review.regression.mode=in-process
+# review.regression.on_fail_verb=DAVID-DIRECT
+#
+# Or hand it to a separate reviewer process on its own node (fire and forget):
+# review.regression.mode=channel
+# review.regression.node=review
+# review.regression.verb=REVIEW

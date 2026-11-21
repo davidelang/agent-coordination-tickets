@@ -16,3 +16,5 @@ channel-rebind
 channel-send sandbox/connect/feature-x/config planner coder IMPLEMENT body.md
 rm /path/to/the/inbox/file
 ```
+
+`comms.dispatch` holds the settings `dispatch/dispatch` reads beside this diag (nodes per role, review registry, reply verbs). The channel never reads it. See [docs/dispatch.md](../docs/dispatch.md).

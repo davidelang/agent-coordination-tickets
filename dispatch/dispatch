@@ -312,7 +312,7 @@ review_mode() {
 # whose REF matches. Other messages stay queued. No reply within wait_timeout: ERROR.
 run_channel_review() {
   # The wait parses other messages; keep the job message's M_* and MF for its reply.
-  local s_from="$M_FROM" s_verb="$M_VERB" s_seq="$M_SEQ" k
+  local s_from="${M_FROM:-}" s_verb="${M_VERB:-}" s_seq="${M_SEQ:-}" k
   local -A s_mf=()
   for k in "${!MF[@]}"; do s_mf[$k]="${MF[$k]}"; done
   channel_review_wait "$@"

@@ -191,6 +191,10 @@ wait_reply() {
 reset_case() { rm -f "$C/nodes/planner/inbox/"*.md "$T/agent.log" "$T/reviews" "$T/execs"; : >"$T/coder.log"; : >"$T/reviewer.log"; }
 count() { grep -c "$1" "$2" 2>/dev/null || echo 0; }
 
+# 0. -p (no message) dry run with a channel review: settings and the REVIEW it would send
+out=$(cd "$W" && "$D" -n -d "$C/config.diag" -r executor -p "$T/plan.md" 2>&1); rc=$?
+check "-p dry run with review_node" '[[ $rc == 0 ]] && grep -q "mode=channel node=reviewer" <<<"$out" && grep -q "would wait for the reply with REF" <<<"$out"'
+
 start reviewer reviewer; start coder executor; sleep 1
 
 # 1. FAIL -> fix -> PASS over the channel, PING queued during the wait

@@ -26,19 +26,26 @@ export PATH="$PWD/bin:$PATH"
 # consuming repo: ./setup_agent.sh feature-x  →  checkout in agent-N, symlink feature-x.wt
 cp example/comms.diag sandbox/connect/feature-x/config
 # replace the /channel prefix with the sandbox absolute path (keep connect/feature-x)
-channel-setup -n sandbox/connect/feature-x/config planner
-channel-setup sandbox/connect/feature-x/config planner
-channel-setup sandbox/connect/feature-x/config coder
+# from that worktree (git branch feature-x):
+channel-setup -n planner
+channel-setup planner
+channel-setup coder
 ```
 
-`<workspace>` in `sandbox/connect/<workspace>/config` is the descriptive name: the branch given to `setup_agent.sh` (for example `feature-x`) or `master` for that worktree. `setup_agent.sh` places the checkout in `agent-N`; the channel path uses the descriptive name. Node inboxes go under the same directory (`sandbox/connect/<workspace>/nodes/...`). `channel-arm coder` (no path) uses `$git-toplevel/sandbox/connect/<git-branch>/config`. `channel-send` still needs the path. The tools also accept any path; this library's example stays `example/comms.diag`.
+`<workspace>` in `sandbox/connect/<workspace>/config` is the descriptive name: the branch given to `setup_agent.sh` (for example `feature-x`) or `master` for that worktree. `setup_agent.sh` places the checkout in `agent-N`; the channel path uses the descriptive name. Node inboxes go under the same directory (`sandbox/connect/<workspace>/nodes/...`). Omitted FILE on setup, arm, ping, and status is `$git-toplevel/sandbox/connect/<git-branch>/config`. `channel-send` still needs the path. The tools also accept any path; this library's example stays `example/comms.diag`.
 
 `-n` reads the plan and creates nothing. Each `channel-setup` creates that node's inbox, `inbox/claimed/`, and the shared `refs/` directory.
 
 The coder watches:
 
 ```sh
-channel-arm sandbox/connect/feature-x/config coder
+channel-arm coder
+```
+
+After `/new`, take back that leftover watch:
+
+```sh
+channel-rebind
 ```
 
 The planner sends:
@@ -51,7 +58,7 @@ When the work is done, the coder removes that one inbox file with `rm`.
 
 The send prints `SENT PATH`, then `DELIVERED PATH` (exit 0) once the file is in the coder's inbox, and returns. The sender's part ends there; it does not watch whether the coder has taken it. On a `->` arrow a second send prints `PENDING` and waits until the coder removes the first file; stopping it then prints `ABORTED` (nothing sent). `channel-send ... --retract PATH` takes a message back: `RETRACTED` if the coder had not taken it, `NOT-RETRACTED` if it had. See [bin/README.md](bin/README.md#send-and-retract).
 
-`body.md` has to match the `IMPLEMENT` message block. Lines with `<...>` are filled in. The other lines are copied as written. After a restart, `channel-arm sandbox/connect/feature-x/config coder --whatineedtoknow` prints the nodes and messages this coder uses, then exits. The same flag works on `channel-setup` and `channel-send`.
+`body.md` has to match the `IMPLEMENT` message block. Lines with `<...>` are filled in. The other lines are copied as written. After a restart, `channel-arm coder --whatineedtoknow` prints the nodes and messages this coder uses, then exits. The same flag works on `channel-setup` and `channel-send`.
 
 ## More
 

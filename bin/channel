@@ -16,7 +16,7 @@ note() { printf '%s\n' "$1" >&2; }
 
 help() {
   cat <<'EOF'
-usage: channel [-h] MODE FILE [NODE ...] [options]
+usage: channel [-h] MODE [FILE] [NODE ...] [options]
 
 One inbox directory per agent: set up, arm, send to, ping and check the
 nodes a diag FILE names. With no mode, this prints help and exits.
@@ -67,7 +67,7 @@ case "$base" in
 esac
 
 parsed=$(getopt -n "$base" -o hnm: -l help,dry-run,whatineedtoknow,setup,arm,send,ping,status,rebind,all,run:,every:,timeout:,webhook-retry,retract:,pid: -- "$@") || {
-  note "usage: channel [-h] MODE FILE [NODE ...] [options]"
+  note "usage: channel [-h] MODE [FILE] [NODE ...] [options]"
   exit 2
 }
 eval set -- "$parsed"

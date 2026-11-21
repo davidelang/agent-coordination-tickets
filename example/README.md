@@ -7,8 +7,12 @@ A planner and one coder. Each direction is one-at-a-time.
 `<workspace>` is the descriptive name: the branch given to `setup_agent.sh` (for example `feature-x`) or `master` for that worktree. `setup_agent.sh` checks out into `agent-N` and links `<workspace>.wt` there. See [../docs/plan-file.md](../docs/plan-file.md).
 
 ```sh
-channel-arm sandbox/connect/feature-x/config coder
-channel-arm sandbox/connect/feature-x/config coder --whatineedtoknow
+channel-setup -n planner
+channel-setup planner
+channel-setup coder
+channel-arm coder
+channel-arm coder --whatineedtoknow
+channel-rebind
 channel-send sandbox/connect/feature-x/config planner coder IMPLEMENT body.md
 rm /path/to/the/inbox/file
 ```

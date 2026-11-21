@@ -211,7 +211,7 @@ capture "$TMP/go-badopt" "$TMP/go-badopt.err" "$TMP/go-badopt.rc" "$GO" --nope
 expect_rc "shell unknown option" 2 "$TMP/sh-badopt.rc"
 expect_rc "go unknown option" 2 "$TMP/go-badopt.rc"
 expect_text "go unknown option text" "$TMP/go-badopt.err" "option --nope not recognized
-usage: channel [-h] MODE FILE [NODE ...] [options]"
+usage: channel [-h] MODE [FILE] [NODE ...] [options]"
 if grep -F -q -- 'nope' "$TMP/sh-badopt.err"; then ok "shell unknown option names it"; else bad "shell unknown option names it"; fi
 for impl in sh go; do
   if [ "$(wc -l < "$TMP/$impl-badopt.err")" -eq 2 ] && grep -q '^usage: channel ' "$TMP/$impl-badopt.err" && [ ! -s "$TMP/$impl-badopt" ]; then ok "$impl unknown option: one error plus the usage line"; else bad "$impl unknown option: one error plus the usage line"; fi
@@ -222,7 +222,7 @@ capture "$TMP/sh-eq" "$TMP/sh-eq.err" "$TMP/sh-eq.rc" "$SH" --dry-run=1
 capture "$TMP/go-eq" "$TMP/go-eq.err" "$TMP/go-eq.rc" "$GO" --dry-run=1
 expect_rc "shell option value" 2 "$TMP/sh-eq.rc"
 expect_text "go option value" "$TMP/go-eq.err" "option --dry-run must not have a value
-usage: channel [-h] MODE FILE [NODE ...] [options]"
+usage: channel [-h] MODE [FILE] [NODE ...] [options]"
 
 # --- example plan oracle (python) ---
 

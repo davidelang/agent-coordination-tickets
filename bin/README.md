@@ -62,7 +62,7 @@ The agent's PONG is checked against the PONG block like any send. `channel-ping`
 
 ## Check-all (links)
 
-`channel-ping --all FILE NODE` checks every link reachable from NODE, not just its own arrows. The origin makes a run id (`NODE-YYYYmmdd-HHMMSS-PID`, printed as `CHECKALL NODE RUN`) and sends PINGs whose body is
+`channel-ping --all [FILE] NODE` checks every link reachable from NODE, not just its own arrows. The origin makes a run id (`NODE-YYYYmmdd-HHMMSS-PID`, printed as `CHECKALL NODE RUN`) and sends PINGs whose body is
 
 ```
 NONCE: <value>
@@ -70,7 +70,7 @@ SCOPE: all
 RUN: <run id>
 ```
 
-A node that receives such a PING answers PONG as usual and then starts `channel-ping --run RUN FILE NODE` in the background, which pings its own outgoing arrows with the same RUN. The agent does this (its `--whatineedtoknow` header says so); the watch never does.
+A node that receives such a PING answers PONG as usual and then starts `channel-ping --run RUN [FILE] NODE` in the background, which pings its own outgoing arrows with the same RUN. The agent does this (its `--whatineedtoknow` header says so); the watch never does.
 
 Propagation is what could loop, so `channel-ping --run` (never a plain ping) stops early, printing `SKIP`, in two cases:
 
@@ -156,6 +156,8 @@ On a start or after a compaction, a node first reviews `inbox/claimed/`: those a
 channel — one inbox directory per agent
 
 With no mode, this prints help and exits.
+Omitted FILE (setup, arm, ping, status) is
+$git-toplevel/sandbox/connect/<git-branch>/config. Send still needs FILE.
 
   channel --setup [FILE] NODE [-n|--dry-run] [--whatineedtoknow]
   channel --arm   [FILE] NODE [--whatineedtoknow]
@@ -165,7 +167,8 @@ With no mode, this prints help and exits.
   channel --status [FILE]
   channel --rebind [--pid PID]
 
-channel-setup, channel-arm, channel-send, and channel-rebind are names for this same program.
+channel-setup, channel-arm, channel-send, channel-ping, channel-status, and channel-rebind
+are names for this same program.
 The name selects the mode, so those forms do not need --setup, --arm, --send, or --rebind.
 
 -n, --dry-run       check the plan and create nothing (setup only)

@@ -138,7 +138,7 @@ func say(line string) {
 func note(msg string) { fmt.Fprintln(os.Stderr, msg) }
 
 func help() {
-	fmt.Print(`usage: channel [-h] MODE FILE [NODE ...] [options]
+	fmt.Print(`usage: channel [-h] MODE [FILE] [NODE ...] [options]
 
 One inbox directory per agent: set up, arm, send to, ping and check the
 nodes a diag FILE names. With no mode, this prints help and exits.
@@ -180,7 +180,7 @@ func main() {
 	if err != nil {
 		// Same shape as the shell form: the error, then the usage line, exit 2.
 		note(err.Error())
-		note("usage: channel [-h] MODE FILE [NODE ...] [options]")
+		note("usage: channel [-h] MODE [FILE] [NODE ...] [options]")
 		os.Exit(2)
 	}
 	dry, what, helpFlag := false, false, false

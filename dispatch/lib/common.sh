@@ -205,4 +205,5 @@ render() {
 # ------------------------------------------------------------------- git
 git_head()  { git -C "$WORKTREE" rev-parse -q --verify HEAD 2>/dev/null || printf 'none\n'; }
 git_dirty() { git -C "$WORKTREE" status --porcelain 2>/dev/null | sha256sum | cut -c1-16; }
-tag_commit() { git -C "$WORKTREE" rev-parse -q --verify "refs/tags/$1^{commit}" 2>/dev/null || true; }
+# -q: a missing tag prints nothing and exits 1; that is "no commit", not an error.
+tag_commit() { git -C "$WORKTREE" rev-parse -q --verify "refs/tags/$1^{commit}" || return 0; }

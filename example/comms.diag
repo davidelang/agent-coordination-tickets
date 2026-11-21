@@ -50,6 +50,13 @@ node coder /channel/connect/feature-x/nodes/coder/inbox
 
 verb planner coder IMPLEMENT RESUME PROVIDE-EVIDENCE STOP
 verb coder planner COMPLETE FAILURE BLOCKED STOPPED DAVID-DIRECT
+# A reviewer node the coder's dispatcher talks to directly (executor.review_node=reviewer),
+# so reviews do not wake the planner. Add the arrow `coder >-> reviewer;`, these lines,
+# and REVIEW / REVIEW-PASS / REVIEW-FAIL / REVIEW-ERROR blocks with PLAN, RANGE, ROUND
+# and REF lines (the replies also STATUS, REASON, VERDICT-FILE); see tests/dispatch.
+# node reviewer /channel/connect/feature-x/nodes/reviewer/inbox
+# verb coder reviewer REVIEW
+# verb reviewer coder REVIEW-PASS REVIEW-FAIL REVIEW-ERROR
 
 message IMPLEMENT {
 This message is one approved plan to be implemented. It is sent after the user has approved a specific plan, or a project that this plan is part of.

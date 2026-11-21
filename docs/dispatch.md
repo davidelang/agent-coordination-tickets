@@ -34,7 +34,6 @@ dispatch -d DIAG -r ROLE [-l HOOK] [options]
 | `-t, --max-turns N` | turn cap per agent run (default 80 executor, 40 reviewer, 60 tester) |
 | `-T, --timeout SEC` | wall-clock cap per run, via `timeout` (0 = none) |
 | `-u, --rules FILE` | role card for this role |
-| `-k, --rounds N` | review rounds before FAILURE (default 3) |
 | `-w, --review-launch CMD` | hook for the reviews an executor runs |
 | `-s, --sidecar FILE` | settings file (default `DIAG.dispatch` if present) |
 | `-c, --channel PATH` | channel program (default `channel` on `PATH`) |
@@ -94,16 +93,22 @@ Inside each source `review.NAME.KEY` beats `ROLE.KEY`, which beats a bare `KEY`.
 | `max_turns` | 80 / 40 / 60 | turn cap |
 | `timeout` | 0 | seconds per run |
 | `rules` | `roles/ROLE.md` | role card (always passed: `--rules` for grok, prepended to the prompt otherwise) |
-| `prompt`, `fix_prompt`, `evidence_prompt` | `roles/*.prompt` | templates |
+| `prompt`, `fix_prompt`, `retry_prompt`, `evidence_prompt` | `roles/*.prompt` | templates |
 | `addendum` | none | file appended to the prompt as `{{ADDENDUM}}` (project steps such as a preflight) |
-| `executor.rounds` | 3 | review rounds before FAILURE |
+| `executor.review_node` | none | node that runs the blocking reviews over the channel (`review.NAME.node` for one review); none = in-process |
+| `executor.retry_effort` | none | effort for the fresh session after a session that ended not done (e.g. `xhigh`) |
+| `executor.reset_keep` | none | paths an out's reset leaves alone, space separated (as `orch/reset-to-builds.sh`) |
+| `executor.failure_log_dir` | the job dir | where the failure log goes after the third reset |
 | `executor.require_commit` | yes | SUCCESS without a new commit is not done |
 | `executor.done_tag` | none | tag that must point at HEAD (e.g. `builds`) |
 | `ROLE.reply.KIND` | executor: COMPLETE, FAILURE, BLOCKED, STOPPED; reviewer/tester: none | reply verb per outcome (`complete`, `failure`, `blocked`, `stopped`; `pass`, `fail`, `error`) |
 | `review.NAME.role` | `reviewer` | role that runs the review |
 | `review.NAME.enabled` | yes | |
 | `review.NAME.blocking` | yes | blocking reviews gate the reply; non-blocking start after COMPLETE |
-| `review.NAME.mode` | `in-process` | `channel`: send `verb` to `node` and do not wait (non-blocking only in v1) |
+| `review.NAME.mode` | `in-process` | non-blocking: `channel` sends `verb` to `node` and does not wait. A blocking review goes over the channel when it has a node |
+| `review.NAME.node` | `executor.review_node` | reviewer node for this review |
+| `review.NAME.verb`, `reviewer.verb` | `REVIEW` | request verb for a channel review |
+| `review.NAME.wait_timeout`, `reviewer.wait_timeout` | 3600 | seconds the executor waits for the verdict; then no verdict |
 | `review.NAME.on_fail_verb` | none | non-blocking in-process review: verb sent to the planner on FAIL |
 
 Account, landlock, cwd and config-home keys do not exist here on purpose.
@@ -115,18 +120,23 @@ Account, landlock, cwd and config-home keys do not exist here on purpose.
 1. Move the message to `inbox/claimed/`, record HEAD.
 2. Round 1: render `executor.prompt` (plan, start step, recorded HEAD, addendum) and start a fresh agent.
 3. Done check. Not done when: there is no `STATUS:` line; `STATUS:` is not SUCCESS (BLOCKED and NEEDS-INPUT reply BLOCKED, anything else FAILURE); HEAD did not move (`require_commit`); `done_tag` is set and not on HEAD; the run timed out.
-4. Each enabled blocking review runs as a fresh read-only agent on `RECORDED..HEAD`. Its last `STATUS:` line is the verdict (PASS / FAIL; anything else, no line, or a changed tree is ERROR → FAILURE). The full reply is saved as `verdict.txt`.
-5. On FAIL, a new round: a fresh executor gets `executor-fix.prompt` with the plan, the range so far and the verdict text, and must verify each finding against the code before fixing it, and say which it rejects. Then the reviews run again on the whole range. After `rounds` rounds still failing, the reply is FAILURE with the verdict path.
+4. Each enabled blocking review checks `APPROACH-START..HEAD`. In process, it is a fresh read-only agent; its last `STATUS:` line is the verdict (PASS / FAIL; anything else, no line, or a changed tree is ERROR). Over the channel (`review_node` set), the executor sends `REVIEW` (PLAN, RANGE, ROUND, REF) to the reviewer node and waits in its own inbox for the reply with the same `REF`, so the planner is not woken for reviews. While waiting, other messages stay queued, a `STOP` ends the job (reply STOPPED, the STOP is consumed), and after `wait_timeout` the request is retracted and the review counts as no verdict. A reply that arrives after its wait has ended is removed as stale. A review with no verdict is retried once as a fresh run (roles/coder.md); a second ERROR is FAILURE (a tool problem, not a strike). The full reply is saved as `verdict.txt`.
+5. Retries follow the "3 strikes, 3 outs" rule (`AGENTS.md` Retry; fixed counts). The split:
+   - Inside a session the agent owns its build failures: a typo-class red build is fixed in place and does not count; any other failure gets an original plus two fixups, then `reset-to-builds` and a new original; after the third reset it ends `STATUS: BLOCKED needs replan`, which the dispatcher replies as BLOCKED at once. The dispatcher never counts these.
+   - Across sessions the dispatcher counts strikes: a session that ends not done (FAILURE, no STATUS, no commit, `done_tag` not on HEAD, timeout) and a blocking review FAIL. After a review FAIL the next session gets `executor-fix.prompt` (verify each finding, say which it rejects); after a session that ended not done it gets `executor-retry.prompt` at `retry_effort`.
+   - Three strikes on one approach is an out: the approach's commits are kept at `refs/dispatch/failed/JOB-aN`, the worktree is reset to where the approach started (mixed reset, restore, `git clean -fd`, sparing `reset_keep`; not the builds tag, which may have moved onto the abandoned commits), and a new original starts with `{{HISTORY}}` naming what was tried.
+   - After the third out the dispatcher writes a failure log to `failure_log_dir` and replies FAILURE "re-plan needed". Only then does the planner hear about it.
+   Each job writes `strikes.txt` in its job directory.
 6. Reply (`COMPLETE` / `FAILURE` / `BLOCKED`) to the sender, with the body built from the diag's message block (`STATUS`, `PLAN`, `RESPONDING-TO`, `REASON` filled; other `<...>` fields get `none`). The claimed file is removed only after the reply is sent.
 7. After COMPLETE, non-blocking reviews start in the background.
 
 Sessions are never resumed: a resumed session carries its whole history and compacts again, which costs more than a fresh session given the plan, the range and the verdict.
 
-`PROVIDE-EVIDENCE` runs `executor-evidence.prompt` (run the CHECK, change nothing) and replies COMPLETE or FAILURE. `STOP` replies STOPPED: jobs run one at a time, so a STOP is read between jobs (an agent already running stops at its turn cap or timeout). `PING` is answered with `PONG`.
+`PROVIDE-EVIDENCE` runs `executor-evidence.prompt` (run the CHECK, change nothing) and replies COMPLETE or FAILURE. `STOP` replies STOPPED: jobs run one at a time, so a STOP is read between jobs or while a channel review is awaited (an agent already running stops at its turn cap or timeout). `PING` is answered with `PONG`.
 
 ### Reviewer / tester node (or `-p PLAN -R A..B`)
 
-A message with `PLAN:` and `RANGE:` gets one read-only review. The reply verb is `ROLE.reply.pass|fail|error` (none by default); the body's `STATUS`, `REASON`, `VERDICT` / `VERDICT-FILE` fields are filled.
+A message with `PLAN:` and `RANGE:` gets one read-only review. The reply goes to whichever node sent the request; its verb is `ROLE.reply.pass|fail|error` (none by default); the body's `STATUS`, `REASON`, `VERDICT` / `VERDICT-FILE` fields are filled, and `REF` / `ROUND` are copied from the request.
 
 ### Restart
 
@@ -158,8 +168,12 @@ dispatch/backends/grokbot-webhook.sh
 dispatch/hooks/direct
 dispatch/roles/executor.conf   dispatch/roles/reviewer.conf   dispatch/roles/tester.conf
 dispatch/roles/executor.md     dispatch/roles/reviewer.md     dispatch/roles/tester.md
-dispatch/roles/executor.prompt dispatch/roles/executor-fix.prompt dispatch/roles/executor-evidence.prompt
+dispatch/roles/executor.prompt dispatch/roles/executor-fix.prompt dispatch/roles/executor-retry.prompt dispatch/roles/executor-evidence.prompt
 dispatch/roles/reviewer.prompt dispatch/roles/tester.prompt
 ```
 
 The files must keep this layout relative to each other (`dispatch` finds the rest from its own location, following symlinks). Needs bash 4.3+, GNU `getopt`, `jq`, `git`, coreutils `timeout`.
+
+## Test
+
+`tests/dispatch` runs two real dispatcher processes (coder and reviewer) with a scripted fake agent on a scratch diag: review FAIL, fix, PASS over the channel; a message queued during the wait; STOP during the wait; a stale reply; review timeout; a session that ends not done; 3 strikes x 3 outs. `tests/run` calls it. No real agent runs.

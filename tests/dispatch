@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# End-to-end test of dispatch/dispatch with a scripted fake agent and two real dispatcher
+# processes on a scratch diag: a coder (executor, watch mode) and a reviewer (watch mode)
+# talking over the channel (bin/channel). The test plays the planner. No real agent runs.
+# Cases: review FAIL -> fix -> PASS over the channel; an unrelated message queued during the
+# wait; review timeout; STOP during the wait; a session that ends not done (retry prompt +
+# retry effort); 3 strikes x 3 outs -> failure log, reset, FAILURE to the planner.
+# Run from anywhere: tests/dispatch   (tests/run calls it)
+set -euo pipefail
+export LC_ALL=C CHANNEL_AGENT=grok DISPATCH_POLL_SEC=0.2
+ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
+CH=$ROOT/bin/channel
+D=$ROOT/dispatch/dispatch
+T=$(mktemp -d "$ROOT/.test-run.XXXXXX")
+chgrp "$(id -g)" "$T" && chmod g-s "$T"
+pass=0; fail=0
+PIDS=()
+cleanup() {
+  local p
+  for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null || :; done
+  pkill -f "$T/" 2>/dev/null || :
+  [[ -n "${KEEP:-}" ]] && echo "kept $T" >&2 || rm -rf "$T"
+}
+trap cleanup EXIT INT TERM
+ok()  { pass=$((pass + 1)); printf 'ok  %s\n' "$1"; }
+bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1" >&2; }
+check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+
+# ---- fake agent: executor commits; reviewer takes one line per review from $T/reviews
+cat >"$T/fake" <<'EOF'
+#!/usr/bin/env bash
+rules=""; pf=""; eff=""
+while [[ $# -gt 0 ]]; do case "$1" in --rules) rules="$2"; shift 2;; --prompt-file) pf="$2"; shift 2;; --reasoning-effort) eff="$2"; shift 2;; *) shift;; esac; done
+S=$FAKE_DIR
+if [[ "$rules" == *"Role: reviewer"* ]]; then
+  line=$(head -1 "$S/reviews" 2>/dev/null || echo PASS); sed -i '1d' "$S/reviews" 2>/dev/null || :
+  echo "review $line" >>"$S/agent.log"
+  case "$line" in
+    SLEEP*) sleep "${line#SLEEP }"; t="slow ok\nSTATUS: PASS" ;;
+    FAIL) t="a.txt: finding\nSTATUS: FAIL" ;;
+    *) t="ok\nSTATUS: PASS" ;;
+  esac
+else
+  line=$(head -1 "$S/execs" 2>/dev/null || echo SUCCESS); sed -i '1d' "$S/execs" 2>/dev/null || :
+  kind=original; grep -q '^Fix round' "$pf" && kind=fix; grep -q '^Retry for' "$pf" && kind=retry
+  echo "exec $kind effort=${eff:-none} $line" >>"$S/agent.log"
+  if [[ "$line" == FAILURE ]]; then t="could not\nSTATUS: FAILURE build red"
+  else date +%s%N >>a.txt; git add a.txt; git commit -qm "fake $kind"; t="done\nSTATUS: SUCCESS"; fi
+fi
+printf '{"text":"%s","total_cost_usd":0}\n' "$t"
+EOF
+chmod +x "$T/fake"
+
+# ---- scratch repo, diag, sidecar
+W=$T/work; C=$T/connect
+git init -q "$W"; git -C "$W" config user.email t@t; git -C "$W" config user.name t
+echo base >"$W/a.txt"; echo keep >"$W/ENGINEERING_LOG.md"; git -C "$W" add -A; git -C "$W" commit -qm base
+mkdir -p "$C"; echo "# plan" >"$T/plan.md"
+cat >"$C/config.diag" <<EOF
+blockdiag {
+  planner >-> coder;
+  coder >-> reviewer;
+}
+/*
+node planner $C/nodes/planner/inbox
+node coder $C/nodes/coder/inbox
+node reviewer $C/nodes/reviewer/inbox
+verb planner coder IMPLEMENT STOP
+verb coder planner COMPLETE FAILURE BLOCKED STOPPED
+verb coder reviewer REVIEW
+verb reviewer coder REVIEW-PASS REVIEW-FAIL REVIEW-ERROR
+message IMPLEMENT {
+body: {
+ACTION: IMPLEMENT
+PLAN: <plan>
+FROM-STEP: <step>
+}
+}
+message STOP {
+body: {
+ACTION: STOP
+PLAN: <plan>
+}
+}
+message COMPLETE {
+body: {
+STATUS: COMPLETE
+PLAN: <plan>
+RESPONDING-TO: <msg>
+}
+}
+message FAILURE {
+body: {
+STATUS: FAILURE
+PLAN: <plan>
+RESPONDING-TO: <msg>
+REASON: <reason>
+}
+}
+message BLOCKED {
+body: {
+STATUS: BLOCKED
+PLAN: <plan>
+RESPONDING-TO: <msg>
+REASON: <reason>
+}
+}
+message STOPPED {
+body: {
+STATUS: STOPPED
+PLAN: <plan>
+RESPONDING-TO: <msg>
+REASON: <reason>
+}
+}
+message REVIEW {
+body: {
+ACTION: REVIEW
+PLAN: <plan>
+RANGE: <range>
+ROUND: <round>
+REF: <ref>
+}
+}
+message REVIEW-PASS {
+body: {
+STATUS: <PASS>
+REF: <ref>
+ROUND: <round>
+RANGE: <range>
+REASON: <reason>
+VERDICT-FILE: <file>
+}
+}
+message REVIEW-FAIL {
+body: {
+STATUS: <FAIL>
+REF: <ref>
+ROUND: <round>
+RANGE: <range>
+REASON: <reason>
+VERDICT-FILE: <file>
+}
+}
+message REVIEW-ERROR {
+body: {
+STATUS: <ERROR>
+REF: <ref>
+ROUND: <round>
+RANGE: <range>
+REASON: <reason>
+VERDICT-FILE: <file>
+}
+}
+*/
+EOF
+cat >"$C/config.diag.dispatch" <<EOF
+executor.node=coder
+reviewer.node=reviewer
+launch=$ROOT/dispatch/hooks/direct
+agent_bin=$T/fake
+channel=$CH
+executor.review_node=reviewer
+executor.retry_effort=xhigh
+executor.reset_keep=ENGINEERING_LOG.md
+executor.failure_log_dir=$T/failure-logs
+reviewer.wait_timeout=4
+reviewer.reply.pass=REVIEW-PASS
+reviewer.reply.fail=REVIEW-FAIL
+reviewer.reply.error=REVIEW-ERROR
+EOF
+for n in planner coder reviewer; do "$CH" --setup "$C/config.diag" "$n" >/dev/null; done
+export FAKE_DIR=$T
+
+start() {  # start NAME ROLE: one dispatcher in watch mode, log in $T/NAME.log
+  ( cd "$W" && exec "$D" -d "$C/config.diag" -r "$2" ) >>"$T/$1.log" 2>&1 &
+  PIDS+=("$!"); eval "PID_$1=$!"
+}
+stop_role() { local v="PID_$1"; kill "${!v}" 2>/dev/null || :; wait "${!v}" 2>/dev/null || :; }
+implement() { "$CH" --send "$C/config.diag" planner coder IMPLEMENT -m "ACTION: IMPLEMENT" -m "PLAN: $T/plan.md" -m "FROM-STEP: the beginning" >/dev/null; }
+# wait_reply VERB SECS: wait for a VERB message in the planner inbox, print its path
+wait_reply() {
+  local i f
+  for ((i = 0; i < $2 * 5; i++)); do
+    f=$(grep -ls "^VERB: $1\$" "$C/nodes/planner/inbox"/*.md | head -1 || :)
+    [[ -n "$f" ]] && { printf '%s\n' "$f"; return 0; }
+    sleep 0.2
+  done
+  return 1
+}
+reset_case() { rm -f "$C/nodes/planner/inbox/"*.md "$T/agent.log" "$T/reviews" "$T/execs"; : >"$T/coder.log"; : >"$T/reviewer.log"; }
+count() { grep -c "$1" "$2" 2>/dev/null || echo 0; }
+
+start reviewer reviewer; start coder executor; sleep 1
+
+# 1. FAIL -> fix -> PASS over the channel, PING queued during the wait
+reset_case; printf 'FAIL\nSLEEP 2\n' >"$T/reviews"
+implement
+sleep 1.2
+( "$CH" --send "$C/config.diag" planner coder PING --timeout 30 >"$T/ping.out" 2>&1; echo $? >"$T/ping.rc" ) &
+sleep 0.6
+check "PING sent during the review wait stays queued in the coder inbox" 'grep -lqs "^VERB: PING" "$C/nodes/coder/inbox"/*.md && ! grep -q "MESSAGE .*verb=PING" "$T/coder.log"'
+f=$(wait_reply COMPLETE 30 || :)
+check "fail-fix-pass: planner gets COMPLETE" '[[ -n "$f" ]]'
+check "fail-fix-pass: one strike then a fix round" 'grep -q "STRIKE 1 of 3 on approach 1" "$T/coder.log" && grep -q "exec fix" "$T/agent.log"'
+check "fail-fix-pass: two reviews ran in the reviewer process" '[[ $(count "^review" "$T/agent.log") == 2 ]] && [[ $(count "MESSAGE .* action=REVIEW" "$T/reviewer.log") == 2 ]]'
+check "fail-fix-pass: verdicts went to the coder, not the planner" '! grep -qs "^VERB: REVIEW-" "$C/nodes/planner/inbox"/*.md && [[ $(count "REPLY REVIEW-" "$T/coder.log") == 2 ]]'
+for i in $(seq 50); do [[ -s "$T/ping.rc" ]] && break; sleep 0.2; done
+check "queued PING handled after the job and answered" '[[ "$(cat "$T/ping.rc" 2>/dev/null)" == 0 ]] && [[ $(grep -n "MESSAGE .*verb=PING" "$T/coder.log" | cut -d: -f1) -gt $(grep -n "SEND COMPLETE" "$T/coder.log" | cut -d: -f1) ]]'
+
+# 2. session not done -> retry prompt with retry effort, counted as a strike
+reset_case; printf 'FAILURE\nSUCCESS\n' >"$T/execs"; printf 'PASS\n' >"$T/reviews"
+implement; f=$(wait_reply COMPLETE 30 || :)
+check "not-done session: COMPLETE after a retry" '[[ -n "$f" ]]'
+check "not-done session: retry prompt at retry_effort" 'grep -q "exec retry effort=xhigh SUCCESS" "$T/agent.log" && grep -q "STRIKE 1 of 3 .*session not done" "$T/coder.log"'
+
+# 3. STOP during the wait
+reset_case; printf 'SLEEP 3\n' >"$T/reviews"
+implement; sleep 1.5
+"$CH" --send "$C/config.diag" planner coder STOP -m "ACTION: STOP" -m "PLAN: $T/plan.md" >/dev/null
+f=$(wait_reply STOPPED 20 || :)
+check "STOP during the review wait: STOPPED to the planner" '[[ -n "$f" ]] && grep -q "STOP from planner while waiting" "$f"'
+check "STOP during the review wait: the STOP is consumed" '! grep -lq "^VERB: STOP" "$C/nodes/coder/inbox"/* 2>/dev/null'
+sleep 3; check "late reply after STOP is dropped as stale" 'grep -q "stale review reply" "$T/coder.log"'
+
+# 4. timeout: no reviewer process; one fresh retry, then FAILURE (not a strike)
+stop_role reviewer
+reset_case
+implement; f=$(wait_reply FAILURE 30 || :)
+check "review timeout: FAILURE after one retry" '[[ -n "$f" ]] && grep -q "gave no verdict twice" "$f" && [[ $(count "no reply from reviewer within 4s" "$T/coder.log") -ge 2 ]]'
+check "review timeout: no strike counted, requests retracted" '! grep -q STRIKE "$T/coder.log" && [[ -z "$(ls -A "$C/nodes/reviewer/inbox" | grep -v claimed)" ]]'
+start reviewer reviewer; sleep 1
+
+# 5. three strikes, three outs
+reset_case; for i in 1 2 3 4 5 6 7 8 9; do echo FAIL; done >"$T/reviews"
+h0=$(git -C "$W" rev-parse HEAD)
+implement; f=$(wait_reply FAILURE 90 || :)
+check "3x3: FAILURE says re-plan needed" '[[ -n "$f" ]] && grep -q "re-plan needed" "$f"'
+check "3x3: nine executor sessions, three outs" '[[ $(count "^exec" "$T/agent.log") == 9 ]] && [[ $(count "^.* OUT [123]:" "$T/coder.log") == 3 ]]'
+check "3x3: tree reset to the start, kept log untouched" '[[ "$(git -C "$W" rev-parse HEAD)" == "$h0" ]] && [[ "$(cat "$W/ENGINEERING_LOG.md")" == keep ]]'
+check "3x3: each approach kept under refs/dispatch/failed" '[[ $(git -C "$W" for-each-ref refs/dispatch/failed | wc -l) == 3 ]]'
+check "3x3: failure log written" '[[ $(ls "$T/failure-logs" | wc -l) == 1 ]] && grep -q "Approach 3 was abandoned" "$T/failure-logs"/*'
+check "3x3: new original after each out, with history" 'grep -q "Approach 1 was abandoned" "$(ls -d "$C"/dispatch/coder/*-IMPLEMENT | tail -1)/r4-executor/prompt.txt"'
+
+printf '%s\n' "dispatch: $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

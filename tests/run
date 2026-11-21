@@ -1573,5 +1573,9 @@ same "missing default plan file shell/go" "$TMP/sh-nofile.err" "$TMP/go-nofile.e
 expect_text "missing default plan file text" "$TMP/sh-nofile.err" "no plan file $MISS/sandbox/connect/feature-x/config.diag"
 expect_rc "missing default plan file exit" 1 "$TMP/sh-nofile.rc"
 
+# The dispatcher end to end (two dispatcher processes, fake agent, this tree's bin/channel).
+if "$ROOT/tests/dispatch" >"$TMP/dispatch.out" 2>&1; then ok "dispatcher end to end (tests/dispatch: $(tail -1 "$TMP/dispatch.out"))"
+else cat "$TMP/dispatch.out" >&2; bad "dispatcher end to end (tests/dispatch)"; fi
+
 printf '%s\n' "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -35,8 +35,13 @@ executor.require_commit=yes
 # A project role card instead of dispatch/roles/executor.md:
 # executor.rules=../../roles/executor.md
 
-# Review rounds before the job is reported as FAILURE.
-executor.rounds=3
+# Retries follow the "3 strikes, 3 outs" rule (AGENTS.md Retry); the counts are fixed.
+# executor.retry_effort=xhigh
+# executor.reset_keep=ENGINEERING_LOG.md TODO.md project-facts.md
+# executor.failure_log_dir=../../implementation-failure-logs
+# Blocking reviews over the channel: the coder sends REVIEW and waits for the verdict.
+# executor.review_node=reviewer
+# reviewer.wait_timeout=3600
 
 # Reply verbs (each needs a message block in the diag).
 executor.reply.complete=COMPLETE

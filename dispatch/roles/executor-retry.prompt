@@ -1,0 +1,16 @@
+Retry for an approved plan (attempt {{ATTEMPT}} of {{STRIKES}} on approach {{APPROACH}} of {{RESETS}}). You are a fresh session; the earlier executor session is gone.
+
+Plan: {{PLAN}}
+Start from: {{FROM_STEP}}
+Worktree (your cwd): {{WORKTREE}}
+This approach started at {{RECORDED_HEAD}}; commits since then ({{RANGE}}) are earlier attempts on it. Do not reset them.
+
+Why the previous session did not finish:
+----
+{{VERDICT}}
+----
+Its final text is in {{VERDICT_FILE}}.
+
+Read the plan, check what is already in the tree, and finish the plan. Commit your work.
+{{ADDENDUM}}
+End with exactly one STATUS line as your last line (SUCCESS, FAILURE <reason>, BLOCKED <reason>, NEEDS-INPUT <reason>).

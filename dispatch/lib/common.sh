@@ -14,7 +14,7 @@ declare -A CFG_CLI=() CFG_SIDE=() CFG_DIAG=() CFG_ROLE=()
 # Keys whose values are paths, resolved against the file that set them.
 is_path_key() {
   case "${1##*.}" in
-    rules|prompt|fix_prompt|evidence_prompt|addendum) return 0 ;;
+    rules|prompt|fix_prompt|retry_prompt|evidence_prompt|addendum|failure_log_dir) return 0 ;;
   esac
   return 1
 }

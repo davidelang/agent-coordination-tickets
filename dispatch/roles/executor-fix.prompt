@@ -1,4 +1,4 @@
-Fix round {{ROUND}} for an approved plan. You are a fresh session; the earlier executor and reviewer sessions are gone, so everything you need is below or in the files named.
+Fix round {{ROUND}} for an approved plan (attempt {{ATTEMPT}} of {{STRIKES}} on approach {{APPROACH}} of {{RESETS}}). You are a fresh session; the earlier executor and reviewer sessions are gone, so everything you need is below or in the files named.
 
 Plan: {{PLAN}}
 Worktree (your cwd): {{WORKTREE}}

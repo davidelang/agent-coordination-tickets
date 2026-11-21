@@ -143,7 +143,7 @@ func help() {
 One inbox directory per agent: set up, arm, send to, ping and check the
 nodes a diag FILE names. With no mode, this prints help and exits.
 Omitted FILE (setup, arm, ping, status) is
-$git-toplevel/sandbox/connect/<git-branch>/config. Send still needs FILE.
+$git-toplevel/sandbox/connect/<git-branch>/config.diag. Send still needs FILE.
 
 modes (the link of the same name, e.g. channel-send, needs no mode flag):
   --setup  [FILE] NODE [-n] [--whatineedtoknow]
@@ -482,7 +482,7 @@ func gitOutput(dir string, args ...string) (string, bool) {
 	return s, true
 }
 
-// tryDefaultPlanAt is $git-toplevel/sandbox/connect/<branch>/config, or "" if
+// tryDefaultPlanAt is $git-toplevel/sandbox/connect/<branch>/config.diag, or "" if
 // dir is not a git worktree or HEAD is detached.
 func tryDefaultPlanAt(dir string) string {
 	root, ok := gitOutput(dir, "rev-parse", "--show-toplevel")
@@ -493,7 +493,7 @@ func tryDefaultPlanAt(dir string) string {
 	if !ok || branch == "HEAD" {
 		return ""
 	}
-	return filepath.Join(root, "sandbox", "connect", branch, "config")
+	return filepath.Join(root, "sandbox", "connect", branch, "config.diag")
 }
 
 func defaultPlan() string {
@@ -503,7 +503,7 @@ func defaultPlan() string {
 	if _, ok := gitOutput(".", "rev-parse", "--show-toplevel"); ok {
 		die("git HEAD is detached; pass the plan file or check out the workspace branch")
 	}
-	die("no git repository here; pass the plan file (sandbox/connect/<workspace>/config)")
+	die("no git repository here; pass the plan file (sandbox/connect/<workspace>/config.diag)")
 	return ""
 }
 

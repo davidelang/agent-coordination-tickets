@@ -2,7 +2,7 @@
 
 `channel` is the program. `channel-setup`, `channel-arm`, `channel-send`, `channel-ping`, `channel-status`, and `channel-rebind` are symlinks to it. The name selects the mode. `channel` with no mode flags prints help and exits. `--setup`, `--arm`, `--send`, `--ping`, `--status`, and `--rebind` select the mode when the name is `channel`. The same layout exists for the shell script here and for the Go binary in [../go](../go/).
 
-Each command takes the plan file and a bare node name. `FILE` may be omitted on setup, arm, ping, and status: it is `$git-toplevel/sandbox/connect/<git-branch>/config`. `channel-send` still needs FILE. Options follow the `getopt_long` rules: `-n` and `--whatineedtoknow` may sit before, among, or after those arguments. `--` ends the options. A name and a different mode flag is an error.
+Each command takes the plan file and a bare node name. `FILE` may be omitted on setup, arm, ping, and status: it is `$git-toplevel/sandbox/connect/<git-branch>/config.diag`. `channel-send` still needs FILE. Options follow the `getopt_long` rules: `-n` and `--whatineedtoknow` may sit before, among, or after those arguments. `--` ends the options. A name and a different mode flag is an error.
 
 | Script | When |
 |---|---|
@@ -157,7 +157,7 @@ channel — one inbox directory per agent
 
 With no mode, this prints help and exits.
 Omitted FILE (setup, arm, ping, status) is
-$git-toplevel/sandbox/connect/<git-branch>/config. Send still needs FILE.
+$git-toplevel/sandbox/connect/<git-branch>/config.diag. Send still needs FILE.
 
   channel --setup [FILE] NODE [-n|--dry-run] [--whatineedtoknow]
   channel --arm   [FILE] NODE [--whatineedtoknow]

@@ -55,14 +55,14 @@ def git_output(dirpath, *args):
 
 
 def try_default_plan_at(dirpath):
-    """$git-toplevel/sandbox/connect/<branch>/config, or '' if not a worktree / detached."""
+    """$git-toplevel/sandbox/connect/<branch>/config.diag, or '' if not a worktree / detached."""
     root = git_output(dirpath, "rev-parse", "--show-toplevel")
     if not root:
         return ""
     branch = git_output(dirpath, "symbolic-ref", "--short", "HEAD")
     if not branch or branch == "HEAD":
         return ""
-    return os.path.join(root, "sandbox", "connect", branch, "config")
+    return os.path.join(root, "sandbox", "connect", branch, "config.diag")
 
 
 def default_plan():
@@ -71,7 +71,7 @@ def default_plan():
         return path
     if git_output(".", "rev-parse", "--show-toplevel"):
         die("git HEAD is detached; pass the plan file or check out the workspace branch")
-    die("no git repository here; pass the plan file (sandbox/connect/<workspace>/config)")
+    die("no git repository here; pass the plan file (sandbox/connect/<workspace>/config.diag)")
 
 
 def take_plan_node(args, usage):

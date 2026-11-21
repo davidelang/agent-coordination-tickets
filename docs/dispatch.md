@@ -20,7 +20,7 @@ dispatch -d DIAG -r ROLE [-l HOOK] [options]
 
 | Option | Meaning |
 |--|--|
-| `-d, --diag FILE` | channel plan. Required; there is no default (the wrapper finds `sandbox/connect/<branch>/config`) |
+| `-d, --diag FILE` | channel plan. Required; there is no default (the wrapper finds `sandbox/connect/<branch>/config.diag`) |
 | `-r, --role ROLE` | `executor`, `reviewer` or `tester`. Required |
 | `-l, --launch CMD` | launch hook. Required here or as `launch=` / `ROLE.launch=` |
 | `-p, --plan FILE` | one job, no channel. Executor: implement; reviewer/tester: review `-R` |
@@ -81,7 +81,7 @@ Settings come from, highest first:
 3. `# dispatch.KEY=VALUE` lines in the diag (the channel skips every `#` line, so its parser is unchanged),
 4. `dispatch/roles/ROLE.conf`.
 
-Inside each source `review.NAME.KEY` beats `ROLE.KEY`, which beats a bare `KEY`. Relative paths (`rules`, `prompt`, `fix_prompt`, `evidence_prompt`, `addendum`, and the program in `launch`, `channel`, `agent_bin`) are resolved from the file that set them. [example/comms.dispatch](../example/comms.dispatch) shows every key.
+Inside each source `review.NAME.KEY` beats `ROLE.KEY`, which beats a bare `KEY`. Relative paths (`rules`, `prompt`, `fix_prompt`, `evidence_prompt`, `addendum`, and the program in `launch`, `channel`, `agent_bin`) are resolved from the file that set them. [example/comms.diag.dispatch](../example/comms.diag.dispatch) shows every key.
 
 | Key | Default | Meaning |
 |--|--|--|

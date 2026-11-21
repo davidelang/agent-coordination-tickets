@@ -1430,7 +1430,7 @@ for impl in go sh py; do
   wait "$fk" 2>/dev/null || true
 done
 
-# --- default FILE: $git-toplevel/sandbox/connect/<branch>/config ---
+# --- default FILE: $git-toplevel/sandbox/connect/<branch>/config.diag ---
 WS=$TMP/ws
 mkdir -p "$WS"
 GIT_CEILING_DIRECTORIES=$TMP
@@ -1439,7 +1439,7 @@ export GIT_CEILING_DIRECTORIES
   cd "$WS"
   git init -q --initial-branch=feature-x
 )
-want_plan=$WS/sandbox/connect/feature-x/config
+want_plan=$WS/sandbox/connect/feature-x/config.diag
 mkdir -p "$WS/sandbox/connect/feature-x"
 cat > "$want_plan" <<EOF
 blockdiag {
@@ -1523,7 +1523,7 @@ mkdir -p "$NG"
 )
 same "no git default plan shell/go" "$TMP/sh-nogit.err" "$TMP/go-nogit.err"
 same "no git default plan shell/py" "$TMP/sh-nogit.err" "$TMP/py-nogit.err"
-expect_text "no git default plan text" "$TMP/sh-nogit.err" "no git repository here; pass the plan file (sandbox/connect/<workspace>/config)"
+expect_text "no git default plan text" "$TMP/sh-nogit.err" "no git repository here; pass the plan file (sandbox/connect/<workspace>/config.diag)"
 expect_rc "no git default plan exit" 1 "$TMP/sh-nogit.rc"
 
 (
@@ -1570,7 +1570,7 @@ mkdir -p "$MISS"
   capture "$TMP/go-nofile" "$TMP/go-nofile.err" "$TMP/go-nofile.rc" "$ROOT/go/channel-arm" planner
 )
 same "missing default plan file shell/go" "$TMP/sh-nofile.err" "$TMP/go-nofile.err"
-expect_text "missing default plan file text" "$TMP/sh-nofile.err" "no plan file $MISS/sandbox/connect/feature-x/config"
+expect_text "missing default plan file text" "$TMP/sh-nofile.err" "no plan file $MISS/sandbox/connect/feature-x/config.diag"
 expect_rc "missing default plan file exit" 1 "$TMP/sh-nofile.rc"
 
 printf '%s\n' "$pass passed, $fail failed"

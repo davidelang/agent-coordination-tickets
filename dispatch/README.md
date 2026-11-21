@@ -24,4 +24,4 @@ dispatch ... -n                                                  # dry run: sett
 | `roles/*.prompt` | job prompt templates (`{{PLAN}}`, `{{RANGE}}`, `{{VERDICT}}`, ...) |
 | `hooks/direct` | trivial launch hook: runs the agent as the current user |
 
-The dispatcher knows nothing about accounts, landlock, cwd beyond the git worktree, config homes, or a project's `roles.config`. Those belong to the launch hook, a consumer's `run-*` wrapper. Full description: [docs/dispatch.md](../docs/dispatch.md). Example settings: [example/comms.dispatch](../example/comms.dispatch).
+The dispatcher knows nothing about accounts, landlock, cwd beyond the git worktree, config homes, or a project's `roles.config`. Those belong to the launch hook, a consumer's `run-*` wrapper. Full description: [docs/dispatch.md](../docs/dispatch.md). Example settings: [example/comms.diag.dispatch](../example/comms.diag.dispatch).

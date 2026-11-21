@@ -21,7 +21,7 @@ usage: channel [-h] MODE [FILE] [NODE ...] [options]
 One inbox directory per agent: set up, arm, send to, ping and check the
 nodes a diag FILE names. With no mode, this prints help and exits.
 Omitted FILE (setup, arm, ping, status) is
-$git-toplevel/sandbox/connect/<git-branch>/config. Send still needs FILE.
+$git-toplevel/sandbox/connect/<git-branch>/config.diag. Send still needs FILE.
 
 modes (the link of the same name, e.g. channel-send, needs no mode flag):
   --setup  [FILE] NODE [-n] [--whatineedtoknow]
@@ -169,14 +169,14 @@ trap 'if [ -n "$DRAFT" ]; then rm -f -- "$DRAFT"; fi' EXIT
 [ "$nmsg" -eq 0 ] || [ "$mode" = send ] || die "-m is only for channel-send"
 bindir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
-# $git-toplevel/sandbox/connect/<branch>/config, or fail.
+# $git-toplevel/sandbox/connect/<branch>/config.diag, or fail.
 try_default_plan_at() {
   [ -n "$1" ] || return 1
   root=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
   [ -n "$root" ] || return 1
   branch=$(git -C "$1" symbolic-ref --short HEAD 2>/dev/null) || return 1
   [ -n "$branch" ] && [ "$branch" != HEAD ] || return 1
-  printf '%s\n' "$root/sandbox/connect/$branch/config"
+  printf '%s\n' "$root/sandbox/connect/$branch/config.diag"
 }
 
 # Sets PLAN to the default, or dies (same messages as the Go/Python tools).
@@ -186,7 +186,7 @@ require_default_plan() {
   if git -C . rev-parse --show-toplevel >/dev/null 2>&1; then
     die "git HEAD is detached; pass the plan file or check out the workspace branch"
   fi
-  die "no git repository here; pass the plan file (sandbox/connect/<workspace>/config)"
+  die "no git repository here; pass the plan file (sandbox/connect/<workspace>/config.diag)"
 }
 
 # Sets PLAN and me from remaining args: 2 = FILE NODE, 1 = default FILE + NODE.

@@ -41,7 +41,7 @@ blockdiag {
 #   Put # or // at the start of a node, verb, or message line to leave it out.
 
 # Dummy prefix /channel stands in for the sandbox absolute path. In a
-# consuming repo the plan is sandbox/connect/<workspace>/config and the
+# consuming repo the plan is sandbox/connect/<workspace>/config.diag and the
 # inboxes sit next to it. <workspace> is the descriptive name (the branch
 # given to setup_agent.sh, e.g. feature-x, or master); agent-N is only the
 # checkout slot.

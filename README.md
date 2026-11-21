@@ -24,7 +24,7 @@ Two programs implement the same protocol.
 export PATH="$PWD/bin:$PATH"
 # or: export PATH="$PWD/go:$PATH"
 # consuming repo: ./setup_agent.sh feature-x  →  checkout in agent-N, symlink feature-x.wt
-cp example/comms.diag sandbox/connect/feature-x/config
+cp example/comms.diag sandbox/connect/feature-x/config.diag
 # replace the /channel prefix with the sandbox absolute path (keep connect/feature-x)
 # from that worktree (git branch feature-x):
 channel-setup -n planner
@@ -32,7 +32,7 @@ channel-setup planner
 channel-setup coder
 ```
 
-`<workspace>` in `sandbox/connect/<workspace>/config` is the descriptive name: the branch given to `setup_agent.sh` (for example `feature-x`) or `master` for that worktree. `setup_agent.sh` places the checkout in `agent-N`; the channel path uses the descriptive name. Node inboxes go under the same directory (`sandbox/connect/<workspace>/nodes/...`). Omitted FILE on setup, arm, ping, and status is `$git-toplevel/sandbox/connect/<git-branch>/config`. `channel-send` still needs the path. The tools also accept any path; this library's example stays `example/comms.diag`.
+`<workspace>` in `sandbox/connect/<workspace>/config.diag` is the descriptive name: the branch given to `setup_agent.sh` (for example `feature-x`) or `master` for that worktree. `setup_agent.sh` places the checkout in `agent-N`; the channel path uses the descriptive name. Node inboxes go under the same directory (`sandbox/connect/<workspace>/nodes/...`). Omitted FILE on setup, arm, ping, and status is `$git-toplevel/sandbox/connect/<git-branch>/config.diag`. `channel-send` still needs the path. The tools also accept any path; this library's example stays `example/comms.diag`.
 
 `-n` reads the plan and creates nothing. Each `channel-setup` creates that node's inbox, `inbox/claimed/`, and the shared `refs/` directory.
 
@@ -51,7 +51,7 @@ channel-rebind
 The planner sends:
 
 ```sh
-channel-send sandbox/connect/feature-x/config planner coder IMPLEMENT body.md
+channel-send sandbox/connect/feature-x/config.diag planner coder IMPLEMENT body.md
 ```
 
 When the work is done, the coder removes that one inbox file with `rm`.
@@ -64,12 +64,12 @@ The send prints `SENT PATH`, then `DELIVERED PATH` (exit 0) once the file is in 
 
 | Path | What it is |
 |---|---|
-| [example/comms.diag](example/comms.diag) | A planner and a coder. Copy to `sandbox/connect/<workspace>/config` and replace `/channel`. |
+| [example/comms.diag](example/comms.diag) | A planner and a coder. Copy to `sandbox/connect/<workspace>/config.diag` and replace `/channel`. |
 | [bin/README.md](bin/README.md) | What each script is for. |
 | [docs/plan-file.md](docs/plan-file.md) | `node`, `verb`, and `message` syntax. |
 | [docs/diagram-marks.md](docs/diagram-marks.md) | The arrow marks: `->` (one in flight), `-<` (queue), both on one line (`<->`, `>-<`, `>->`), and what blockdiag draws. |
 | [prompts/](prompts/) | Text to give each agent, and how to grant the scripts. |
 | [dispatch/](dispatch/README.md) | A headless dispatcher that serves a node by starting one fresh agent per message through a launch hook: executor, reviewer, tester. [docs/dispatch.md](docs/dispatch.md) has the details. |
-| [example/comms.dispatch](example/comms.dispatch) | Dispatcher settings beside `example/comms.diag` (the channel never reads it). |
+| [example/comms.diag.dispatch](example/comms.diag.dispatch) | Dispatcher settings beside `example/comms.diag` (the channel never reads it). |
 
 The license is [MIT](LICENSE).

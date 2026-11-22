@@ -171,7 +171,7 @@ show_settings() {
     say "  review cycles: at most $MAX_REVIEW_CYCLES, stop early unless problems drop; not-done sessions: one retry; no resets. done_tag=${DONE_TAG:-none} retry_effort=${RETRY_EFFORT:-same} failure_log_dir=${FAILURE_LOG_DIR:-none}"
     for n in "${REVIEWS[@]}"; do
       local rr; rr=$(cfg "$ROLE" role reviewer "$n")
-      say "  review $n: role=$rr mode=$(review_mode "$n") node=$(review_node "$n") timeout=${REVIEW_TIMEOUT}s rules=$(cfg "$rr" rules '' "$n")"
+      say "  review $n: role=$rr mode=$(review_mode "$n") node=$(review_node "$n") timeout=${REVIEW_TIMEOUT}s in-process rules=${REVIEW_RULES:-$(cfg "$rr" rules '' "$n")}"
     done
   fi
 }

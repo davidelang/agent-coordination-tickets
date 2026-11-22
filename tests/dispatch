@@ -192,6 +192,11 @@ check "-p dry run: review node and verbs from the diag" '[[ $rc == 0 ]] && grep 
 
 start reviewer reviewer; start coder executor; sleep 1
 
+check "no project card: the dispatcher's generic card" 'grep -q "rules=$ROOT/dispatch/roles/executor.md" <<<"$out"'
+mkdir -p "$W/roles"; printf '# Role: executor (project)\n' >"$W/roles/executor.md"
+out=$(cd "$W" && "$D" -n -d "$C/config.diag" -r executor -p "$T/plan.md" "${COMMON[@]}" "${CODER[@]}" 2>&1) || :
+rm -rf "$W/roles"
+check "roles/executor.md at the worktree root is the card (as run-grok-* use roles/<role>.md)" 'grep -q "rules=$W/roles/executor.md" <<<"$out"'
 echo "x=1" >"$C/config.diag.dispatch"
 out=$(cd "$W" && "$D" -n -d "$C/config.diag" -r executor -p "$T/plan.md" "${COMMON[@]}" "${CODER[@]}" 2>&1) || :; rm -f "$C/config.diag.dispatch"
 check "an old DIAG.dispatch file is ignored with a warning" 'grep -q "config.diag.dispatch is ignored" <<<"$out"'

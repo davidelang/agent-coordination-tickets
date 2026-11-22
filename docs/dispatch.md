@@ -34,10 +34,9 @@ dispatch -d DIAG -r ROLE [-l HOOK] [options]
 | `-m, --model ID` / `-e, --effort LEVEL` | passed to the backend |
 | `-t, --max-turns N` | turn cap per agent run (default 80 executor, 40 reviewer, 60 tester) |
 | `-T, --timeout SEC` | wall-clock cap per run, via `timeout` (0 = none) |
-| `-u, --rules FILE` | role card for this role |
+| `-u, --rules FILE` | role card for this role (default: `roles/ROLE.md` at the worktree root, else `dispatch/roles/ROLE.md`) |
 | `--agent-bin PATH` | agent program the backend runs (default `grok` / `cursor-agent` / `agy`) |
 | `-w, --review-launch CMD` | hook for in-process reviews (default: the same hook) |
-| `--review-rules FILE` | role card for in-process reviews (default `dispatch/roles/reviewer.md`) |
 | `--done-tag TAG` | executor: a tag that must be on HEAD for the job to be done (e.g. `builds`) |
 | `--retry-effort LEVEL` | executor: effort for the one retry after a session that ended not done |
 | `--failure-log-dir DIR` | executor: also copy `review-history.md` here when a job goes back |
@@ -82,7 +81,7 @@ with every other entry symlinked back to the account's real `~/.grok`, so sign-i
 There is no settings file. Each thing lives where it belongs:
 
 - **Parameters of the run** are options: the ones above, given by the consumer's `run-*` wrapper (which takes project values such as the sandbox or `roles.config` efforts from the worktree it runs in). Defaults the dispatcher itself ships are in `dispatch/roles/ROLE.conf` (access, role card, prompt templates, `max_turns` 80 / 40 / 60, `timeout` 0, `require_commit=yes`, the built-in `conformance` review); the command line beats them, and they are not meant to be edited per project.
-- **Rules for the agent** are role cards (`-u`, `--review-rules`; default `dispatch/roles/ROLE.md`): what done means, committing, never resetting past the done tag, the reviewer's numbered findings and `PROBLEMS: N`.
+- **Rules for the agent** are role cards, found the way `run-grok-<role>` finds its own (`roles/<role>.md` at the worktree root, passed as `--rules`): `roles/executor.md`, `roles/reviewer.md` (also for an in-process review), `roles/tester.md`. A worktree without one gets the generic `dispatch/roles/ROLE.md`; `-u` overrides this process's own card. They say: what done means, committing, never resetting past the done tag, the reviewer's numbered findings and `PROBLEMS: N`.
 - **Messages** come from the diag: the node's inbox (`node`), whether reviews go over the channel (a `verb THIS-NODE OTHER REVIEW` line makes OTHER the review node), and the reply verbs. The executor replies `COMPLETE`, `FAILURE`, `BLOCKED` or `STOPPED`; a reviewer or tester replies `REQUEST-PASS` / `-FAIL` / `-ERROR` (`REVIEW-PASS` ...). A reply is sent only when the diag lists that verb from this node to the sender; otherwise the message stays claimed with a warning.
 
 A `DIAG.dispatch` file from an earlier version is ignored with a warning. Account, landlock, cwd and config-home choices do not exist here on purpose.

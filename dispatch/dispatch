@@ -37,10 +37,10 @@ Agent:
   -e, --effort LEVEL       reasoning effort passed to the backend
   -t, --max-turns N        turn cap per agent run
   -T, --timeout SEC        wall-clock cap per agent run (0 = none)
-  -u, --rules FILE         role card for this role (default dispatch/roles/ROLE.md)
+  -u, --rules FILE         role card for this role (default: roles/ROLE.md at the worktree
+                           root, as run-grok-* use roles/<role>.md; else dispatch/roles/ROLE.md)
   --agent-bin PATH         agent program the backend runs (default grok / cursor-agent / agy)
   -w, --review-launch CMD  launch hook for in-process reviews (default: the same hook)
-  --review-rules FILE      role card for in-process reviews (default dispatch/roles/reviewer.md)
 
 Executor:
   --done-tag TAG           a tag that must be on HEAD for the job to be done (e.g. builds)
@@ -78,11 +78,11 @@ U
 # ---------------------------------------------------------------- options
 ROLE=""; DIAG=""; PLAN=""; FROM_STEP=""; RANGE_ARG=""; ONCE=0
 DRY=0; VERBOSE=0; WORKTREE=""; REVIEW_LAUNCH=""; LOG_DIR=""
-DONE_TAG=""; RETRY_EFFORT=""; FAILURE_LOG_DIR=""; REVIEW_TIMEOUT=3600; REVIEW_RULES=""; AGENT_BIN=""
+DONE_TAG=""; RETRY_EFFORT=""; FAILURE_LOG_DIR=""; REVIEW_TIMEOUT=3600; AGENT_BIN=""
 REVIEW_VERB=REVIEW
 parsed=$(getopt -n "$PROG" -o d:r:l:p:f:R:1N:C:b:m:e:t:T:u:w:c:L:nvh \
   -l diag:,role:,launch:,plan:,from-step:,range:,once,node:,worktree:,backend:,model:,effort:,max-turns:,timeout:,rules:,review-launch:,channel:,log-dir:,dry-run,verbose,help \
-  -l agent-bin:,review-rules:,done-tag:,retry-effort:,failure-log-dir:,review-timeout: \
+  -l agent-bin:,done-tag:,retry-effort:,failure-log-dir:,review-timeout: \
   -- "$@") || { echo "usage: dispatch -d DIAG -r ROLE [-l HOOK] [options]  (-h for help)" >&2; exit 2; }
 eval set -- "$parsed"
 while true; do
@@ -104,7 +104,6 @@ while true; do
     -u|--rules) CFG_CLI[rules]=$(readlink -f -- "$2"); shift 2 ;;
     -w|--review-launch) REVIEW_LAUNCH="$2"; shift 2 ;;
     --agent-bin) AGENT_BIN="$2"; shift 2 ;;
-    --review-rules) REVIEW_RULES=$(readlink -f -- "$2"); shift 2 ;;
     --done-tag) DONE_TAG="$2"; shift 2 ;;
     --retry-effort) RETRY_EFFORT="$2"; shift 2 ;;
     --failure-log-dir) FAILURE_LOG_DIR="$2"; shift 2 ;;
@@ -166,14 +165,24 @@ show_settings() {
   say "dispatch role=$ROLE diag=$DIAG"
   say "  worktree=$WORKTREE node=${NODE:-none} inbox=${INBOX:-none} channel=$CHAN"
   say "  launch=$LAUNCH backend=$(cfg "$ROLE" backend grok-build) model=$(cfg "$ROLE" model '') effort=$(cfg "$ROLE" effort '') max_turns=$(cfg "$ROLE" max_turns 80) timeout=$(cfg "$ROLE" timeout 0)"
-  say "  rules=$(cfg "$ROLE" rules '') logs=$LOG_DIR"
+  say "  rules=$(role_card "$ROLE" '') logs=$LOG_DIR"
   if [[ "$ROLE" == executor ]]; then
     say "  review cycles: at most $MAX_REVIEW_CYCLES, stop early unless problems drop; not-done sessions: one retry; no resets. done_tag=${DONE_TAG:-none} retry_effort=${RETRY_EFFORT:-same} failure_log_dir=${FAILURE_LOG_DIR:-none}"
     for n in "${REVIEWS[@]}"; do
       local rr; rr=$(cfg "$ROLE" role reviewer "$n")
-      say "  review $n: role=$rr mode=$(review_mode "$n") node=$(review_node "$n") timeout=${REVIEW_TIMEOUT}s in-process rules=${REVIEW_RULES:-$(cfg "$rr" rules '' "$n")}"
+      say "  review $n: role=$rr mode=$(review_mode "$n") node=$(review_node "$n") timeout=${REVIEW_TIMEOUT}s in-process rules=$(role_card "$rr" "$n")"
     done
   fi
+}
+
+# role_card ROLE REVIEW: the card a run of ROLE gets. -u (this process's own role only),
+# else roles/ROLE.md at the worktree root (the project's card, the file run-grok-<role>
+# passes as --rules), else the dispatcher's generic dispatch/roles/ROLE.md.
+role_card() {
+  local role="$1" review="$2"
+  if [[ -z "$review" && "$role" == "$ROLE" && -n "${CFG_CLI[rules]+x}" ]]; then printf '%s\n' "${CFG_CLI[rules]}"
+  elif [[ -f "$WORKTREE/roles/$role.md" ]]; then printf '%s\n' "$WORKTREE/roles/$role.md"
+  else cfg "$role" rules "" "$review"; fi
 }
 
 # ----------------------------------------------------------- agent launch
@@ -185,8 +194,7 @@ run_agent() {
   [[ -f "$HERE/backends/$backend.sh" ]] || die "unknown backend '$backend'"
   # shellcheck source=/dev/null
   . "$HERE/backends/$backend.sh"
-  rules=$(cfg "$role" rules "" "$review")
-  [[ -n "$review" && -n "$REVIEW_RULES" ]] && rules="$REVIEW_RULES"
+  rules=$(role_card "$role" "$review")
   [[ -f "$rules" ]] || die "role card not found for $role: '$rules' (role rules are always passed)"
   access=$(cfg "$role" access read-only "$review")
   B_PROMPT_FILE="$prompt"; B_RULES_FILE="$rules"; B_WORKTREE="$WORKTREE"; B_JOB_DIR="$dir"

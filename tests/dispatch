@@ -281,5 +281,28 @@ check "3 cycles exhausted: three reviews saved" '[[ -f "$J/review-1.md" && -f "$
 check "no reset past builds: all commits kept, builds still on HEAD, no saved refs" '[[ $(git -C "$W" rev-list --count "$h0..HEAD") == 3 ]] && git -C "$W" merge-base --is-ancestor "$h0" builds && [[ "$(git -C "$W" rev-parse builds)" == "$(git -C "$W" rev-parse HEAD)" ]] && [[ -z "$(git -C "$W" for-each-ref refs/dispatch)" ]]'
 check "prompts are one line; the role card forbids resets past builds" '[[ $(wc -l <"$J/r1-executor/prompt.txt") == 1 ]] && grep -qx "Read the rules. Implement $T/plan.md." "$J/r1-executor/prompt.txt" && grep -q "never reset or check out past the .builds. tag" "$ROOT/dispatch/roles/executor.md"'
 
+# 9. launch failures: the agent never starts (exit 126/127, nothing on stdout) -> BLOCKED, no retry
+cat >"$T/refuse-hook" <<'EOF'
+#!/usr/bin/env bash
+echo "refuse-hook: agent program not executable: /nowhere/agy (project.config)" >&2
+exit 127
+EOF
+chmod +x "$T/refuse-hook"
+reset_case
+out=$(cd "$W" && "$D" -d "$C/config.diag" -r executor -p "$T/plan.md" -l "$T/refuse-hook" -c "$CH" --agent-bin "$T/fake" -L "$T/lf1" 2>&1) && rc=0 || rc=$?
+check "hook refuses before the agent: BLOCKED with the hook's text, no retry" '[[ $rc == 1 ]] && grep -q "RESULT blocked round 1: agent did not start (launch exit 127): refuse-hook: agent program not executable: /nowhere/agy" <<<"$out" && [[ $(grep -c "^.* START executor" <<<"$out") == 1 ]] && ! grep -q "NOT DONE\|ROUND 2" <<<"$out"'
+out=$(cd "$W" && "$D" -d "$C/config.diag" -r executor -p "$T/plan.md" -l "$ROOT/dispatch/hooks/direct" -c "$CH" --agent-bin "$T/no-such-agent" -L "$T/lf2" 2>&1) && rc=0 || rc=$?
+check "agent program missing (direct hook exec): BLOCKED, no retry" '[[ $rc == 1 ]] && grep -q "RESULT blocked round 1: agent did not start (launch exit 127)" <<<"$out" && [[ $(grep -c "^.* START executor" <<<"$out") == 1 ]]'
+out=$(cd "$W" && "$D" -d "$C/config.diag" -r executor -p "$T/plan.md" -l "$ROOT/dispatch/hooks/direct" -c "$CH" --agent-bin "$T/fake" -L "$T/lf3" -t 1 2>&1 </dev/null) || :
+check "an agent that starts and fails is still not a launch failure" '! grep -q "agent did not start" <<<"$out"'
+# review agent that cannot start: the reviewer node replies REVIEW-ERROR with STATUS: BLOCKED,
+# and the executor sends BLOCKED to the planner without a second review
+stop_role reviewer
+SAVED=("${COMMON[@]}"); COMMON=(-l "$T/refuse-hook" -c "$CH" --agent-bin "$T/fake"); start reviewer reviewer; COMMON=("${SAVED[@]}"); sleep 1
+reset_case
+implement; f=$(wait_reply BLOCKED 30 || :)
+check "review agent did not start: BLOCKED to the planner, one review request" '[[ -n "$f" ]] && grep -q "agent did not start (launch exit 127): refuse-hook" "$f" && [[ $(count "MESSAGE .* action=REVIEW" "$T/reviewer.log") == 1 ]] && [[ $(count "^exec" "$T/agent.log") == 1 ]]'
+stop_role reviewer
+
 printf '%s\n' "dispatch: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

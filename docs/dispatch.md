@@ -96,9 +96,8 @@ Inside each source `review.NAME.KEY` beats `ROLE.KEY`, which beats a bare `KEY`.
 | `prompt`, `fix_prompt`, `retry_prompt`, `evidence_prompt` | `roles/*.prompt` | templates |
 | `addendum` | none | file appended to the prompt as `{{ADDENDUM}}` (project steps such as a preflight) |
 | `executor.review_node` | none | node that runs the blocking reviews over the channel (`review.NAME.node` for one review); none = in-process |
-| `executor.retry_effort` | none | effort for the fresh session after a session that ended not done (e.g. `xhigh`) |
-| `executor.reset_keep` | none | paths an out's reset leaves alone, space separated (as `orch/reset-to-builds.sh`) |
-| `executor.failure_log_dir` | the job dir | where the failure log goes after the third reset |
+| `executor.retry_effort` | none | effort for the one retry after a session that ended not done (e.g. `xhigh`) |
+| `executor.failure_log_dir` | none | also copy `review-history.md` here when a job goes back to the sender |
 | `executor.require_commit` | yes | SUCCESS without a new commit is not done |
 | `executor.done_tag` | none | tag that must point at HEAD (e.g. `builds`) |
 | `ROLE.reply.KIND` | executor: COMPLETE, FAILURE, BLOCKED, STOPPED; reviewer/tester: none | reply verb per outcome (`complete`, `failure`, `blocked`, `stopped`; `pass`, `fail`, `error`) |
@@ -120,13 +119,12 @@ Account, landlock, cwd and config-home keys do not exist here on purpose.
 1. Move the message to `inbox/claimed/`, record HEAD.
 2. Round 1: render `executor.prompt` (plan, start step, recorded HEAD, addendum) and start a fresh agent.
 3. Done check. Not done when: there is no `STATUS:` line; `STATUS:` is not SUCCESS (BLOCKED and NEEDS-INPUT reply BLOCKED, anything else FAILURE); HEAD did not move (`require_commit`); `done_tag` is set and not on HEAD; the run timed out.
-4. Each enabled blocking review checks `APPROACH-START..HEAD`. In process, it is a fresh read-only agent; its last `STATUS:` line is the verdict (PASS / FAIL; anything else, no line, or a changed tree is ERROR). Over the channel (`review_node` set), the executor sends `REVIEW` (PLAN, RANGE, ROUND, REF) to the reviewer node and waits in its own inbox for the reply with the same `REF`, so the planner is not woken for reviews. While waiting, other messages stay queued, a `STOP` ends the job (reply STOPPED, the STOP is consumed), and after `wait_timeout` the request is retracted and the review counts as no verdict. A reply that arrives after its wait has ended is removed as stale. A review with no verdict is retried once as a fresh run (roles/coder.md); a second ERROR is FAILURE (a tool problem, not a strike). The full reply is saved as `verdict.txt`.
-5. Retries follow the "3 strikes, 3 outs" rule (`AGENTS.md` Retry; fixed counts). The split:
-   - Inside a session the agent owns its build failures: a typo-class red build is fixed in place and does not count; any other failure gets an original plus two fixups, then `reset-to-builds` and a new original; after the third reset it ends `STATUS: BLOCKED needs replan`, which the dispatcher replies as BLOCKED at once. The dispatcher never counts these.
-   - Across sessions the dispatcher counts strikes: a session that ends not done (FAILURE, no STATUS, no commit, `done_tag` not on HEAD, timeout) and a blocking review FAIL. After a review FAIL the next session gets `executor-fix.prompt` (verify each finding, say which it rejects); after a session that ended not done it gets `executor-retry.prompt` at `retry_effort`.
-   - Three strikes on one approach is an out: the approach's commits are kept at `refs/dispatch/failed/JOB-aN`, the worktree is reset to where the approach started (mixed reset, restore, `git clean -fd`, sparing `reset_keep`; not the builds tag, which may have moved onto the abandoned commits), and a new original starts with `{{HISTORY}}` naming what was tried.
-   - After the third out the dispatcher writes a failure log to `failure_log_dir` and replies FAILURE "re-plan needed". Only then does the planner hear about it.
-   Each job writes `strikes.txt` in its job directory.
+4. Each enabled blocking review checks `RECORDED..HEAD`. In process, it is a fresh read-only agent; its last `STATUS:` line is the verdict (PASS / FAIL; anything else, no line, or a changed tree is ERROR). Over the channel (`review_node` set), the executor sends `REVIEW` (PLAN, RANGE, ROUND, REF) to the reviewer node and waits in its own inbox for the reply with the same `REF`, so the planner is not woken for reviews. While waiting, other messages stay queued, a `STOP` ends the job (reply STOPPED, the STOP is consumed), and after `wait_timeout` the request is retracted and the review counts as no verdict. A reply that arrives after its wait has ended is removed as stale. A review with no verdict is retried once as a fresh run (roles/coder.md); a second ERROR is FAILURE (a tool problem; no cycle is used). A FAIL must carry a `PROBLEMS: N` line (numbered findings, then the count); a FAIL without one counts as no verdict. The full reply is saved as `verdict.txt`.
+5. Review cycles: at most 3 per job (fixed).
+   - After a FAIL the full review is saved as `review-N.md` and appended to `review-history.md` in the job directory. A fresh session gets `executor-fix.prompt` with the whole review and the counts so far, verifies each finding (saying which it rejects), and commits fixes on top. Then the range is reviewed again.
+   - If a review reports more problems than the review before it, or the third review still fails, the job ends: FAILURE "re-plan/review needed" to the sender, naming `review-history.md` (copied to `failure_log_dir` when set). The same count as before continues to the next cycle.
+   - A session that ends not done (FAILURE, no STATUS, no commit, `done_tag` not on HEAD, timeout) gets one fresh retry per job with `executor-retry.prompt` at `retry_effort`; a second one is FAILURE. It does not use a review cycle.
+   - The dispatcher never resets, reverts or drops commits: whatever the job committed is left in place for the planner. The prompts tell each session never to reset or check out past the `done_tag` (e.g. `builds`), or past HEAD at its start when there is none. Build slips (a missed reference, a typo) are the agent's to fix inside its own session; the dispatcher counts no strikes.
 6. Reply (`COMPLETE` / `FAILURE` / `BLOCKED`) to the sender, with the body built from the diag's message block (`STATUS`, `PLAN`, `RESPONDING-TO`, `REASON` filled; other `<...>` fields get `none`). The claimed file is removed only after the reply is sent.
 7. After COMPLETE, non-blocking reviews start in the background.
 
@@ -136,7 +134,7 @@ Sessions are never resumed: a resumed session carries its whole history and comp
 
 ### Reviewer / tester node (or `-p PLAN -R A..B`)
 
-A message with `PLAN:` and `RANGE:` gets one read-only review. The reply goes to whichever node sent the request; its verb is `ROLE.reply.pass|fail|error` (none by default); the body's `STATUS`, `REASON`, `VERDICT` / `VERDICT-FILE` fields are filled, and `REF` / `ROUND` are copied from the request.
+A message with `PLAN:` and `RANGE:` gets one read-only review. The reply goes to whichever node sent the request; its verb is `ROLE.reply.pass|fail|error` (none by default); the body's `STATUS`, `REASON`, `VERDICT` / `VERDICT-FILE` fields are filled, `REF` / `ROUND` are copied from the request, and `PROBLEMS` is the count from the review.
 
 ### Restart
 
@@ -176,4 +174,4 @@ The files must keep this layout relative to each other (`dispatch` finds the res
 
 ## Test
 
-`tests/dispatch` runs two real dispatcher processes (coder and reviewer) with a scripted fake agent on a scratch diag: review FAIL, fix, PASS over the channel; a message queued during the wait; STOP during the wait; a stale reply; review timeout; a session that ends not done; 3 strikes x 3 outs. `tests/run` calls it. No real agent runs.
+`tests/dispatch` runs two real dispatcher processes (coder and reviewer) with a scripted fake agent on a scratch diag: review FAIL, fix, PASS over the channel; a message queued during the wait; STOP during the wait; a stale reply; review timeout; a session that ends not done (once, twice); review cycles with falling problems, rising problems, and three FAILs; no reset past the builds tag. `tests/run` calls it. No real agent runs.

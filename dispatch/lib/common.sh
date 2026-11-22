@@ -6,66 +6,42 @@ say()  { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 vlog() { if [[ "${VERBOSE:-0}" == 1 ]]; then say "$@"; fi; }
 
 # ---------------------------------------------------------------- config
-# Sources, highest first: the command line, then dispatch/roles/<role>.conf (the
-# dispatcher's own defaults). Inside a role file a review key (review.NAME.KEY) beats
-# the role key. Project settings are the run-* wrapper's options; agent rules are role
-# cards; message verbs are the diag's.
-declare -A CFG_CLI=() CFG_ROLE=()
+# A run's settings: the command line (this process's own role only), else the role's
+# built-in default below. The role is fixed by the run-* wrapper that starts the
+# dispatcher (-r), as run-grok-coder fixes ROLE_KEY; everything per role is here, as
+# grok-launch-common.sh keeps its per-role cases. Project values are the wrapper's
+# options; agent rules are the worktree's roles/<role>.md; verbs are the diag's.
+declare -A CFG_CLI=()
 
-# Keys whose values are paths, resolved against the role file's directory.
-is_path_key() {
-  case "${1##*.}" in
-    rules|prompt|fix_prompt|retry_prompt|evidence_prompt) return 0 ;;
+# role_default ROLE KEY: the built-in value ('' when the role has none)
+role_default() {
+  case "$1:$2" in
+    executor:access) echo read-write ;;
+    reviewer:access|tester:access) echo read-only ;;
+    *:rules) echo "$HERE/roles/$1.md" ;;
+    executor:max_turns) echo 80 ;;
+    reviewer:max_turns) echo 40 ;;
+    tester:max_turns) echo 60 ;;
+    *:timeout) echo 0 ;;
+    # A STATUS: SUCCESS with HEAD unchanged is not done.
+    executor:require_commit) echo yes ;;
+    *) echo "" ;;
   esac
-  return 1
-}
-
-# load_kv FILE ARRAYNAME: KEY=VALUE lines; '#' starts a comment line; blank lines skipped.
-load_kv() {
-  local file="$1" arr="$2" base line key val
-  base=$(CDPATH='' cd -- "$(dirname -- "$file")" && pwd)
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    [[ -z "$line" || "$line" == \#* ]] && continue
-    [[ "$line" == *=* ]] || { say "WARNING $file: ignored line: $line" >&2; continue; }
-    key="${line%%=*}"; val="${line#*=}"
-    key="${key%"${key##*[![:space:]]}"}"; val="${val#"${val%%[![:space:]]*}"}"
-    if is_path_key "$key" && [[ -n "$val" && "$val" != /* ]]; then val="$base/$val"; fi
-    printf -v "${arr}[$key]" '%s' "$val"
-  done <"$file"
 }
 
 # cfg ROLE KEY DEFAULT [REVIEW]
-# The CLI only applies to the role this process was started as, not to reviews it runs.
 cfg() {
-  local role="$1" key="$2" def="$3" review="${4:-}"
+  local role="$1" key="$2" def="$3" review="${4:-}" v
   if [[ -z "$review" && "$role" == "$ROLE" && -n "${CFG_CLI[$key]+x}" ]]; then
     printf '%s\n' "${CFG_CLI[$key]}"; return
   fi
-  if [[ -n "$review" && -n "${CFG_ROLE[$ROLE:review.$review.$key]+x}" ]]; then
-    printf '%s\n' "${CFG_ROLE[$ROLE:review.$review.$key]}"; return
-  fi
-  if [[ -n "${CFG_ROLE[$role:$key]+x}" ]]; then printf '%s\n' "${CFG_ROLE[$role:$key]}"; return; fi
-  printf '%s\n' "$def"
+  v=$(role_default "$role" "$key")
+  printf '%s\n' "${v:-$def}"
 }
 
-load_role_conf() {
-  local role="$1" f="$HERE/roles/$1.conf" tmp k
-  [[ -f "$f" ]] || die "no role file $f"
-  declare -A _RC=()
-  load_kv "$f" _RC
-  for k in "${!_RC[@]}"; do CFG_ROLE["$role:$k"]="${_RC[$k]}"; done
-  unset _RC tmp
-}
-
-# review names, in sorted order, from the executor's role file
-review_names() {
-  local k
-  for k in "${!CFG_ROLE[@]}"; do
-    [[ "$k" == "$ROLE:review."*.* ]] && { k="${k#"$ROLE:review."}"; printf '%s\n' "${k%%.*}"; }
-  done | sort -u
-}
+# The executor's blocking reviews: one, 'conformance', run by the reviewer role (over the
+# channel when the diag has 'verb <this node> <reviewer node> REVIEW', else in-process).
+review_names() { echo conformance; }
 
 # ------------------------------------------------------------------ diag
 # node NAME PATH lines (also inside the /* */ key, where they live).
@@ -143,14 +119,8 @@ last_status() {
 }
 
 # ------------------------------------------------------------- templates
-# render TEMPLATE OUT  ({{KEY}} -> TV[KEY]; unknown {{...}} left as is)
-declare -A TV=()
-render() {
-  local t k
-  t=$(<"$1")
-  for k in "${!TV[@]}"; do t="${t//"{{$k}}"/"${TV[$k]}"}"; done
-  printf '%s\n' "$t" >"$2"
-}
+# say_prompt OUT TEXT: the session's prompt file, "Read the rules." then the job in one line
+say_prompt() { printf 'Read the rules. %s\n' "$2" >"$1"; }
 
 # ------------------------------------------------------------------- git
 git_head()  { git -C "$WORKTREE" rev-parse -q --verify HEAD 2>/dev/null || printf 'none\n'; }

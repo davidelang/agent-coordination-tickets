@@ -8,7 +8,7 @@ The split of work:
 |--|--|
 | the job loop, review rounds, done checks, replies | which account runs the agents (the wrapper may switch once at start with `sudo -u`, so the dispatcher and every agent share one account; or the hook may pick one per role) |
 | the agent command line for each backend | the landlock for each role and access level |
-| role cards and prompt templates (overridable) | the config home (`GROK_HOME`), which sets the context window |
+| generic role cards (a worktree's own `roles/<role>.md` wins) and the one-line job prompts | the config home (`GROK_HOME`), which sets the context window |
 | reading the diag: nodes, the REVIEW arrow, reply verbs | finding the standard diag and asking whether to use it |
 | | effort and model from the project's `roles.config`, passed as `-e`/`-m` |
 | | the project's options: node, role cards (from the worktree), done tag, retry effort, failure log dir |
@@ -80,7 +80,7 @@ with every other entry symlinked back to the account's real `~/.grok`, so sign-i
 
 There is no settings file. Each thing lives where it belongs:
 
-- **Parameters of the run** are options: the ones above, given by the consumer's `run-*` wrapper (which takes project values such as the sandbox or `roles.config` efforts from the worktree it runs in). Defaults the dispatcher itself ships are in `dispatch/roles/ROLE.conf` (access, role card, prompt templates, `max_turns` 80 / 40 / 60, `timeout` 0, `require_commit=yes`, the built-in `conformance` review); the command line beats them, and they are not meant to be edited per project.
+- **Parameters of the run** are options: the ones above, given by the consumer's `run-*` wrapper (which takes project values such as the sandbox or `roles.config` efforts from the worktree it runs in). The role is fixed by the wrapper (`-r`), as `run-grok-coder` fixes `ROLE_KEY`, and the per-role defaults are cases in the dispatcher itself (`role_default` in `lib/common.sh`: access read-write / read-only, `max_turns` 80 / 40 / 60, `timeout` 0, the prompt templates, the commit check, the one `conformance` review); there is no per-role settings file. The command line beats them.
 - **Rules for the agent** are role cards, found the way `run-grok-<role>` finds its own (`roles/<role>.md` at the worktree root, passed as `--rules`): `roles/executor.md`, `roles/reviewer.md` (also for an in-process review), `roles/tester.md`. A worktree without one gets the generic `dispatch/roles/ROLE.md`; `-u` overrides this process's own card. They say: what done means, committing, never resetting past the done tag, the reviewer's numbered findings and `PROBLEMS: N`.
 - **Messages** come from the diag: the node's inbox (`node`), whether reviews go over the channel (a `verb THIS-NODE OTHER REVIEW` line makes OTHER the review node), and the reply verbs. The executor replies `COMPLETE`, `FAILURE`, `BLOCKED` or `STOPPED`; a reviewer or tester replies `REQUEST-PASS` / `-FAIL` / `-ERROR` (`REVIEW-PASS` ...). A reply is sent only when the diag lists that verb from this node to the sender; otherwise the message stays claimed with a warning.
 
@@ -91,19 +91,19 @@ A `DIAG.dispatch` file from an earlier version is ignored with a warning. Accoun
 ### Executor (`IMPLEMENT` / `RESUME`, or `-p PLAN`)
 
 1. Move the message to `inbox/claimed/`, record HEAD.
-2. Round 1: render `executor.prompt` (plan, start step, recorded HEAD, the reset floor) and start a fresh agent.
+2. Round 1: start a fresh agent with the role card as its rules and a one-line prompt: `Read the rules. Implement PLAN [from step N].`
 3. Done check. Not done when: there is no `STATUS:` line; `STATUS:` is not SUCCESS (BLOCKED and NEEDS-INPUT reply BLOCKED, anything else FAILURE); HEAD did not move (`require_commit`); `--done-tag` is given and not on HEAD; the run timed out.
 4. Each enabled blocking review checks `RECORDED..HEAD`. In process, it is a fresh read-only agent; its last `STATUS:` line is the verdict (PASS / FAIL; anything else, no line, or a changed tree is ERROR). Over the channel (the diag has a `REVIEW` arrow from this node), the executor sends `REVIEW` (PLAN, RANGE, ROUND, REF) to the reviewer node and waits in its own inbox for the reply with the same `REF`, so the planner is not woken for reviews. While waiting, other messages stay queued, a `STOP` ends the job (reply STOPPED, the STOP is consumed), and after `--review-timeout` the request is retracted and the review counts as no verdict. A reply that arrives after its wait has ended is removed as stale. A review with no verdict is retried once as a fresh run (roles/coder.md); a second ERROR is FAILURE (a tool problem; no cycle is used). A FAIL must carry a `PROBLEMS: N` line (numbered findings, then the count); a FAIL without one counts as no verdict. The full reply is saved as `verdict.txt`.
 5. Review cycles: at most 3 per job (fixed).
-   - After a FAIL the full review is saved as `review-N.md` and appended to `review-history.md` in the job directory. A fresh session gets `executor-fix.prompt` with the whole review and the counts so far, verifies each finding (saying which it rejects), and commits fixes on top. Then the range is reviewed again.
+   - After a FAIL the full review is saved as `review-N.md` and appended to `review-history.md` in the job directory. A fresh session is told `Read the rules. Fix the issues in JOB/review-N.md (review N of 3 of RANGE against PLAN).`; the role card says how (verify each finding, say which it rejects, commit fixes on top; earlier reviews are the `review-*.md` beside it). Then the range is reviewed again.
    - If a review reports as many problems as the review before it or more, or the third review still fails, the job ends: FAILURE "re-plan needed" to the sender, naming `review-history.md` (copied to `--failure-log-dir` when given). BLOCKED is never used for this: it is only the agent's own `STATUS: BLOCKED`, when something outside the code prevents progress (permissions, contradictory instructions, missing access).
-   - A session that ends not done (FAILURE, no STATUS, no commit, `done_tag` not on HEAD, timeout) gets one fresh retry per job with `executor-retry.prompt` at `--retry-effort`; a second one is FAILURE. It does not use a review cycle.
-   - The dispatcher never resets, reverts or drops commits: whatever the job committed is left in place for the planner. The prompts tell each session never to reset or check out past the `done_tag` (e.g. `builds`), or past HEAD at its start when none is given. Build slips (a missed reference, a typo) are the agent's to fix inside its own session; the dispatcher counts no strikes.
+   - A session that ends not done (FAILURE, no STATUS, no commit, `done_tag` not on HEAD, timeout) gets one fresh retry per job (`Read the rules. Finish PLAN [from step N]. The previous session stopped without finishing; its last reply is FILE.`) at `--retry-effort`; a second one is FAILURE. It does not use a review cycle.
+   - The dispatcher never resets, reverts or drops commits: whatever the job committed is left in place for the planner. The role card tells each session never to reset or check out past the `builds` tag (the done tag). Build slips (a missed reference, a typo) are the agent's to fix inside its own session; the dispatcher counts no strikes.
 6. Reply (`COMPLETE` / `FAILURE` / `BLOCKED` / `STOPPED`, as the diag allows) to the sender, with the body built from the diag's message block (`STATUS`, `PLAN`, `RESPONDING-TO`, `REASON` filled; other `<...>` fields get `none`). The claimed file is removed only after the reply is sent.
 
-Sessions are never resumed: a resumed session carries its whole history and compacts again, which costs more than a fresh session given the plan, the range and the verdict.
+Prompts carry only the job (plan, range, step, review file); everything else an agent must follow (the STATUS line, committing, the done tag, no reset past `builds`, numbered findings and `PROBLEMS: N`) is in the role card passed as rules. Sessions are never resumed: a resumed session carries its whole history and compacts again, which costs more than a fresh session given the plan, the range and the verdict.
 
-`PROVIDE-EVIDENCE` runs `executor-evidence.prompt` (run the CHECK, change nothing) and replies COMPLETE or FAILURE. `STOP` replies STOPPED: jobs run one at a time, so a STOP is read between jobs or while a channel review is awaited (an agent already running stops at its turn cap or timeout). `PING` is answered with `PONG`.
+`PROVIDE-EVIDENCE` runs `Read the rules. Rerun this check for PLAN and report the result, changing nothing: CHECK` and replies COMPLETE or FAILURE. `STOP` replies STOPPED: jobs run one at a time, so a STOP is read between jobs or while a channel review is awaited (an agent already running stops at its turn cap or timeout). `PING` is answered with `PONG`.
 
 ### Reviewer / tester node (or `-p PLAN -R A..B`)
 
@@ -137,10 +137,7 @@ dispatch/backends/cursor.sh
 dispatch/backends/antigravity.sh
 dispatch/backends/grokbot-webhook.sh
 dispatch/hooks/direct
-dispatch/roles/executor.conf   dispatch/roles/reviewer.conf   dispatch/roles/tester.conf
 dispatch/roles/executor.md     dispatch/roles/reviewer.md     dispatch/roles/tester.md
-dispatch/roles/executor.prompt dispatch/roles/executor-fix.prompt dispatch/roles/executor-retry.prompt dispatch/roles/executor-evidence.prompt
-dispatch/roles/reviewer.prompt dispatch/roles/tester.prompt
 ```
 
 The files must keep this layout relative to each other (`dispatch` finds the rest from its own location, following symlinks). Needs bash 4.3+, GNU `getopt`, `jq`, `git`, coreutils `timeout`.

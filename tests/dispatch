@@ -44,7 +44,7 @@ if [[ "$rules" == *"Role: reviewer"* ]]; then
   esac
 else
   line=$(head -1 "$S/execs" 2>/dev/null || echo SUCCESS); sed -i '1d' "$S/execs" 2>/dev/null || :
-  kind=original; grep -q '^Fix the findings' "$pf" && kind=fix; grep -q '^Retry for' "$pf" && kind=retry
+  kind=original; grep -q 'Fix the issues in' "$pf" && kind=fix; grep -q 'Finish ' "$pf" && kind=retry
   echo "exec $kind effort=${eff:-none} $line" >>"$S/agent.log"
   if [[ "$line" == FAILURE ]]; then t="could not\nSTATUS: FAILURE build red"
   else date +%s%N >>a.txt; git add a.txt; git commit -qm "fake $kind"; git tag -f builds >/dev/null; t="done\nSTATUS: SUCCESS"; fi
@@ -214,7 +214,7 @@ f=$(wait_reply COMPLETE 30 || :)
 check "fail-fix-pass: planner gets COMPLETE" '[[ -n "$f" ]]'
 J=$(ls -td "$C"/dispatch/coder/*-IMPLEMENT* | head -1)
 check "fail-fix-pass: passes on review cycle 2 after one fix session" 'grep -q "REVIEW CYCLE 1 of 3: FAIL, 3 problems" "$T/coder.log" && grep -q "exec fix" "$T/agent.log" && grep -q "RESULT complete .*passed review cycle 2" "$T/coder.log"'
-check "fail-fix-pass: full review saved and given to the fix session" 'grep -q "^3. a.txt: finding 3 of 3" "$J/review-1.md" && grep -q "^3. a.txt: finding 3 of 3" "$J/r2-executor/prompt.txt" && grep -q "Full review: $J/review-1.md" "$J/r2-executor/prompt.txt"'
+check "fail-fix-pass: full review saved and given to the fix session" 'grep -q "^3. a.txt: finding 3 of 3" "$J/review-1.md" && grep -qx "Read the rules. Fix the issues in $J/review-1.md (review 1 of 3 of .* against $T/plan.md)." "$J/r2-executor/prompt.txt"'
 check "reviewer reply carries PROBLEMS" 'grep -qs "^PROBLEMS: 3" "$C"/dispatch/reviewer/*/reply.txt'
 check "fail-fix-pass: two reviews ran in the reviewer process" '[[ $(count "^review" "$T/agent.log") == 2 ]] && [[ $(count "MESSAGE .* action=REVIEW" "$T/reviewer.log") == 2 ]]'
 check "fail-fix-pass: verdicts went to the coder, not the planner" '! grep -qs "^VERB: REVIEW-" "$C/nodes/planner/inbox"/*.md && [[ $(count "REPLY REVIEW-" "$T/coder.log") == 2 ]]'
@@ -279,7 +279,7 @@ J=$(ls -td "$C"/dispatch/coder/*-IMPLEMENT* | head -1)
 check "3 cycles exhausted: FAILURE after cycle 3" '[[ -n "$f" ]] && grep -q "review cycle 3 of 3 still fails with 1 problems; re-plan needed" "$f" && [[ $(count "^exec" "$T/agent.log") == 3 ]] && [[ $(count "^review" "$T/agent.log") == 3 ]]'
 check "3 cycles exhausted: three reviews saved" '[[ -f "$J/review-1.md" && -f "$J/review-2.md" && -f "$J/review-3.md" ]]'
 check "no reset past builds: all commits kept, builds still on HEAD, no saved refs" '[[ $(git -C "$W" rev-list --count "$h0..HEAD") == 3 ]] && git -C "$W" merge-base --is-ancestor "$h0" builds && [[ "$(git -C "$W" rev-parse builds)" == "$(git -C "$W" rev-parse HEAD)" ]] && [[ -z "$(git -C "$W" for-each-ref refs/dispatch)" ]]'
-check "prompts forbid resets past the builds tag" 'grep -q "Never reset or check out past the .builds. tag" "$J/r1-executor/prompt.txt" "$J/r2-executor/prompt.txt"'
+check "prompts are one line; the role card forbids resets past builds" '[[ $(wc -l <"$J/r1-executor/prompt.txt") == 1 ]] && grep -qx "Read the rules. Implement $T/plan.md." "$J/r1-executor/prompt.txt" && grep -q "never reset or check out past the .builds. tag" "$ROOT/dispatch/roles/executor.md"'
 
 printf '%s\n' "dispatch: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

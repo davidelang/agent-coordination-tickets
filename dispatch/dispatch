@@ -139,7 +139,6 @@ WORKTREE=$(readlink -f -- "$WORKTREE")
 git -C "$WORKTREE" rev-parse --git-dir >/dev/null 2>&1 || die "not a git worktree: $WORKTREE"
 
 # ----------------------------------------------------------------- config
-for r in executor reviewer tester; do load_role_conf "$r"; done
 [[ -f "$DIAG.dispatch" ]] && say "WARNING $DIAG.dispatch is ignored: settings are options of the run-* wrapper or the dispatcher, rules live in the role cards, verbs in the diag" >&2
 
 NODE=$(cfg "$ROLE" node "")
@@ -169,7 +168,7 @@ show_settings() {
   if [[ "$ROLE" == executor ]]; then
     say "  review cycles: at most $MAX_REVIEW_CYCLES, stop early unless problems drop; not-done sessions: one retry; no resets. done_tag=${DONE_TAG:-none} retry_effort=${RETRY_EFFORT:-same} failure_log_dir=${FAILURE_LOG_DIR:-none}"
     for n in "${REVIEWS[@]}"; do
-      local rr; rr=$(cfg "$ROLE" role reviewer "$n")
+      local rr=reviewer
       say "  review $n: role=$rr mode=$(review_mode "$n") node=$(review_node "$n") timeout=${REVIEW_TIMEOUT}s in-process rules=$(role_card "$rr" "$n")"
     done
   fi
@@ -249,13 +248,14 @@ run_agent() {
 # run_review NAME DIR PLAN RANGE -> V_STATUS PASS|FAIL|ERROR, V_FILE, V_REASON
 run_review() {
   local name="$1" dir="$2" plan="$3" range="$4" role h0 d0 st
-  role=$(cfg "$ROLE" role reviewer "$name"); [[ -z "$name" ]] && role="$ROLE"
+  role=reviewer; [[ -z "$name" ]] && role="$ROLE"
   mkdir -p "$dir"
   V_FILE="$dir/verdict.txt"; V_STATUS=ERROR; V_REASON=""
-  TV=([PLAN]="$plan" [RANGE]="$range" [VERDICT_FILE]="$V_FILE" [WORKTREE]="$WORKTREE")
-  local tmpl; tmpl=$(cfg "$role" prompt "" "$name")
-  [[ -f "$tmpl" ]] || die "prompt template not found for $role: '$tmpl'"
-  render "$tmpl" "$dir/prompt.txt"
+  # The prompt is only the job; the role card (--rules) holds the contract.
+  case "$role" in
+    tester) say_prompt "$dir/prompt.txt" "Test $range against $plan. Reply with the report." ;;
+    *) say_prompt "$dir/prompt.txt" "Review $range against $plan. Reply with the verdict." ;;
+  esac
   h0=$(git_head); d0=$(git_dirty)
   run_agent "$role" "$name" "$dir" "$dir/prompt.txt"
   [[ $DRY == 1 ]] && { V_STATUS=PASS; V_REASON="dry run"; return 0; }
@@ -318,13 +318,6 @@ problem_count() {
   sed -n 's/^[[:space:]*_#]*PROBLEMS:[[:space:]*_]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | tail -1
 }
 
-# reset_floor: what a session may never reset past: the done_tag, else HEAD at session start
-reset_floor() {
-  local tag="$DONE_TAG"
-  if [[ -n "$tag" ]]; then printf "the '%s' tag (%s)" "$tag" "$(tag_commit "$tag" | cut -c1-12)"
-  else printf 'HEAD at your start (%s)' "$(git_head | cut -c1-12)"; fi
-}
-
 # review_node NAME: the node the diag lets this node send REVIEW to ('' = in-process)
 review_node() {
   [[ -n "$NODE" ]] || return 0
@@ -350,7 +343,7 @@ run_channel_review() {
 
 channel_review_wait() {
   local name="$1" dir="$2" plan="$3" range="$4" round="$5" rr node verb ref tmo out sent deadline f st vf
-  rr=$(cfg executor role reviewer "$name"); node=$(review_node "$name")
+  rr=reviewer; node=$(review_node "$name")
   verb="$REVIEW_VERB"; tmo="$REVIEW_TIMEOUT"
   mkdir -p "$dir"; V_FILE="$dir/verdict.txt"; V_STATUS=ERROR; V_REASON=""; V_STOP=0; STOP_FILE=""
   ref="$(basename -- "$JOB_DIR")-r$round-$name-$RANDOM"
@@ -405,8 +398,7 @@ blocking_reviews() {
   local round="$1" pre="$2" plan="$3" range="$4" n rr try
   R_RESULT=pass
   for n in "${REVIEWS[@]}"; do
-    rr=$(cfg executor role reviewer "$n")
-    [[ "$(cfg "$rr" enabled yes "$n")" == yes ]] || continue
+    rr=reviewer
     for try in 1 2; do
       if [[ "$(review_mode "$n")" == channel ]]; then
         run_channel_review "$n" "$pre-review-$n${try/#1/}" "$plan" "$range" "$round"
@@ -432,7 +424,9 @@ blocking_reviews() {
 # run_executor_job PLAN FROM_STEP JOBDIR -> J_KIND complete|failure|blocked|stopped, J_REASON
 run_executor_job() {
   local plan="$1" step="${2:-the beginning}" job="$3" before round=0 cycle=0 retried=0
-  local dir start tmpl add kind="original" verdict_file="" verdict_text="" history="" prev="" n hist fdir
+  local from=""
+  case "${2:-}" in ""|none|"the beginning"|beginning) ;; *) from=" from step $2" ;; esac
+  local dir start add kind="original" verdict_file="" prev="" n hist fdir
   JOB_DIR="$job"; STOP_FILE=""
   before=$(git_head)
   printf 'plan=%s\nfrom_step=%s\nrecorded_head=%s\n' "$plan" "$step" "$before" >"$job/job.txt"
@@ -440,18 +434,14 @@ run_executor_job() {
   while true; do
     round=$((round + 1))
     dir="$job/r$round-executor"; mkdir -p "$dir"
-    TV=([PLAN]="$plan" [FROM_STEP]="$step" [RECORDED_HEAD]="$before" [RANGE]="$before..HEAD"
-        [ROUND]="$round" [CYCLE]="$((cycle + 1))" [LAST_CYCLE]="$cycle" [MAX_CYCLES]="$MAX_REVIEW_CYCLES" [HISTORY]="$history"
-        [RESET_FLOOR]="$(reset_floor)"
-        [VERDICT_FILE]="$verdict_file" [VERDICT]="$verdict_text" [WORKTREE]="$WORKTREE")
     EFFORT_OVERRIDE=""
+    # The prompt is only the job; the role card (--rules) holds the contract.
     case "$kind" in
-      original) tmpl=$(cfg executor prompt "") ;;
-      fix) tmpl=$(cfg executor fix_prompt "") ;;
-      retry) tmpl=$(cfg executor retry_prompt ""); EFFORT_OVERRIDE="$RETRY_EFFORT" ;;
+      original) say_prompt "$dir/prompt.txt" "Implement $plan$from." ;;
+      fix) say_prompt "$dir/prompt.txt" "Fix the issues in $verdict_file (review $cycle of $MAX_REVIEW_CYCLES of $before..HEAD against $plan)." ;;
+      retry) EFFORT_OVERRIDE="$RETRY_EFFORT"
+        say_prompt "$dir/prompt.txt" "Finish $plan$from. The previous session stopped without finishing; its last reply is $verdict_file." ;;
     esac
-    [[ -f "$tmpl" ]] || die "executor prompt template not found ($kind): '$tmpl'"
-    render "$tmpl" "$dir/prompt.txt"
     say "ROUND $round: $kind session (review cycle $((cycle + 1)) of $MAX_REVIEW_CYCLES${EFFORT_OVERRIDE:+, effort $EFFORT_OVERRIDE})"
     start=$(git_head)
     run_agent executor "" "$dir" "$dir/prompt.txt"
@@ -464,7 +454,6 @@ run_executor_job() {
           return
         fi
         retried=1; kind=retry; verdict_file="$dir/result.txt"
-        verdict_text="The previous executor session ended not done: $D_REASON"
         say "NOT DONE round $round: $D_REASON; one fresh retry"
         continue ;;
     esac
@@ -482,14 +471,13 @@ run_executor_job() {
     { printf '## Review cycle %s: %s, PROBLEMS: %s (range %s, file %s)\n\n' \
         "$cycle" "$R_NAME" "$n" "$before..$(git_head)" "$job/review-$cycle.md"
       cat -- "$V_FILE"; printf '\n'; } >>"$hist"
-    history+="Review cycle $cycle: $n problems ($job/review-$cycle.md)"$'\n'
     say "REVIEW CYCLE $cycle of $MAX_REVIEW_CYCLES: FAIL, $n problems${prev:+ (cycle $((cycle - 1)): $prev)}"
     if [[ -n "$prev" ]] && (( n >= prev )); then
       J_REASON="review cycle $cycle found $n problems, not fewer than the $prev before; re-plan needed"
     elif (( cycle >= MAX_REVIEW_CYCLES )); then
       J_REASON="review cycle $cycle of $MAX_REVIEW_CYCLES still fails with $n problems; re-plan needed"
     else
-      prev="$n"; kind=fix; verdict_file="$job/review-$cycle.md"; verdict_text=$(<"$V_FILE")
+      prev="$n"; kind=fix; verdict_file="$job/review-$cycle.md"
       continue
     fi
     fdir="$FAILURE_LOG_DIR"
@@ -555,9 +543,8 @@ handle_message() {
           run_executor_job "${MF[PLAN]}" "${MF[FROM-STEP]:-}" "$job"; kind="$J_KIND"
         fi ;;
       PROVIDE-EVIDENCE)
-        local dir="$job/r1-evidence" t; mkdir -p "$dir"
-        TV=([PLAN]="${MF[PLAN]:-none}" [CHECK]="${MF[CHECK]:-none}" [WORKTREE]="$WORKTREE")
-        t=$(cfg executor evidence_prompt ""); render "$t" "$dir/prompt.txt"
+        local dir="$job/r1-evidence"; mkdir -p "$dir"
+        say_prompt "$dir/prompt.txt" "Rerun this check for ${MF[PLAN]:-the plan} and report the result, changing nothing: ${MF[CHECK]:-none}"
         local h0; h0=$(git_head)
         run_agent executor "" "$dir" "$dir/prompt.txt"
         local st; st=$(last_status "$A_TEXT" || true)

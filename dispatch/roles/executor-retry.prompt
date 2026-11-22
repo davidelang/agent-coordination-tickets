@@ -13,5 +13,4 @@ Why the previous session did not finish:
 Its final text is in {{VERDICT_FILE}}.
 
 Read the plan, check what is already in the tree, and finish the plan. Commit your work.
-{{ADDENDUM}}
 End with exactly one STATUS line as your last line (SUCCESS, FAILURE <reason>, BLOCKED <reason>, NEEDS-INPUT <reason>). BLOCKED only when something outside the code stops you (permissions, contradictory instructions, missing access); work you could not finish is FAILURE.

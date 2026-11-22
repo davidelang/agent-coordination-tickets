@@ -17,4 +17,4 @@ channel-send sandbox/connect/feature-x/config.diag planner coder IMPLEMENT body.
 rm /path/to/the/inbox/file
 ```
 
-`comms.diag.dispatch` holds the settings `dispatch/dispatch` reads beside this diag (nodes per role, review registry, reply verbs). The channel never reads it. See [docs/dispatch.md](../docs/dispatch.md).
+`dispatch/dispatch` reads only this diag: nodes, the `coder -> reviewer` REVIEW arrow when there is one, and reply verbs. Its other parameters are command-line options (given by a `run-*` wrapper), and agent rules are role cards. See [docs/dispatch.md](../docs/dispatch.md).

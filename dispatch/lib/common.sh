@@ -6,43 +6,21 @@ say()  { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
 vlog() { if [[ "${VERBOSE:-0}" == 1 ]]; then say "$@"; fi; }
 
 # ---------------------------------------------------------------- config
-# Sources, highest first: CLI > sidecar > '# dispatch.' lines in the diag >
-# dispatch/roles/<role>.conf. Inside each source a review key
-# (review.NAME.KEY) beats a role key (ROLE.KEY), which beats a bare KEY.
-declare -A CFG_CLI=() CFG_SIDE=() CFG_DIAG=() CFG_ROLE=()
+# Sources, highest first: the command line, then dispatch/roles/<role>.conf (the
+# dispatcher's own defaults). Inside a role file a review key (review.NAME.KEY) beats
+# the role key. Project settings are the run-* wrapper's options; agent rules are role
+# cards; message verbs are the diag's.
+declare -A CFG_CLI=() CFG_ROLE=()
 
-# Keys whose values are paths, resolved against the file that set them.
+# Keys whose values are paths, resolved against the role file's directory.
 is_path_key() {
   case "${1##*.}" in
-    rules|prompt|fix_prompt|retry_prompt|evidence_prompt|addendum|failure_log_dir) return 0 ;;
-  esac
-  return 1
-}
-is_cmd_key() {
-  case "${1##*.}" in
-    launch|channel|agent_bin) return 0 ;;
+    rules|prompt|fix_prompt|retry_prompt|evidence_prompt) return 0 ;;
   esac
   return 1
 }
 
-# resolve_value KEY VALUE BASEDIR
-resolve_value() {
-  local key="$1" val="$2" base="$3" first rest
-  if is_path_key "$key" && [[ -n "$val" && "$val" != /* ]]; then
-    printf '%s/%s\n' "$base" "$val"; return
-  fi
-  if is_cmd_key "$key" && [[ -n "$val" ]]; then
-    first="${val%% *}"; rest=""
-    [[ "$val" == *" "* ]] && rest=" ${val#* }"
-    if [[ "$first" == */* && "$first" != /* ]]; then
-      printf '%s/%s%s\n' "$base" "$first" "$rest"; return
-    fi
-  fi
-  printf '%s\n' "$val"
-}
-
-# load_kv FILE ARRAYNAME [prefix-to-strip]
-# KEY=VALUE lines; '#' starts a comment line; blank lines skipped.
+# load_kv FILE ARRAYNAME: KEY=VALUE lines; '#' starts a comment line; blank lines skipped.
 load_kv() {
   local file="$1" arr="$2" base line key val
   base=$(CDPATH='' cd -- "$(dirname -- "$file")" && pwd)
@@ -53,48 +31,18 @@ load_kv() {
     [[ "$line" == *=* ]] || { say "WARNING $file: ignored line: $line" >&2; continue; }
     key="${line%%=*}"; val="${line#*=}"
     key="${key%"${key##*[![:space:]]}"}"; val="${val#"${val%%[![:space:]]*}"}"
-    key="${key#dispatch.}"
-    val=$(resolve_value "$key" "$val" "$base")
+    if is_path_key "$key" && [[ -n "$val" && "$val" != /* ]]; then val="$base/$val"; fi
     printf -v "${arr}[$key]" '%s' "$val"
   done <"$file"
-}
-
-# '# dispatch.KEY=VALUE' (or '// dispatch.KEY=VALUE') lines anywhere in the diag.
-# channel skips every '#' / '//' line, so these never reach its parser.
-load_diag_comments() {
-  local diag="$1" base line key val
-  base=$(CDPATH='' cd -- "$(dirname -- "$diag")" && pwd)
-  while IFS= read -r line; do
-    line="${line#"${line%%[![:space:]]*}"}"
-    case "$line" in
-      '# dispatch.'*) line="${line#'# dispatch.'}" ;;
-      '// dispatch.'*) line="${line#'// dispatch.'}" ;;
-      *) continue ;;
-    esac
-    line="${line%"${line##*[![:space:]]}"}"
-    [[ "$line" == *=* ]] || continue
-    key="${line%%=*}"; val="${line#*=}"
-    CFG_DIAG[$key]=$(resolve_value "$key" "$val" "$base")
-  done <"$diag"
 }
 
 # cfg ROLE KEY DEFAULT [REVIEW]
 # The CLI only applies to the role this process was started as, not to reviews it runs.
 cfg() {
-  local role="$1" key="$2" def="$3" review="${4:-}" k src
-  local -a keys=()
+  local role="$1" key="$2" def="$3" review="${4:-}"
   if [[ -z "$review" && "$role" == "$ROLE" && -n "${CFG_CLI[$key]+x}" ]]; then
     printf '%s\n' "${CFG_CLI[$key]}"; return
   fi
-  [[ -n "$review" ]] && keys+=("review.$review.$key")
-  keys+=("$role.$key" "$key")
-  for k in "${keys[@]}"; do
-    for src in CFG_SIDE CFG_DIAG; do
-      local -n m="$src"
-      if [[ -n "${m[$k]+x}" ]]; then printf '%s\n' "${m[$k]}"; unset -n m; return; fi
-      unset -n m
-    done
-  done
   if [[ -n "$review" && -n "${CFG_ROLE[$ROLE:review.$review.$key]+x}" ]]; then
     printf '%s\n' "${CFG_ROLE[$ROLE:review.$review.$key]}"; return
   fi
@@ -111,17 +59,12 @@ load_role_conf() {
   unset _RC tmp
 }
 
-# review names, in sorted order, from every source
+# review names, in sorted order, from the executor's role file
 review_names() {
   local k
-  {
-    for k in "${!CFG_SIDE[@]}" "${!CFG_DIAG[@]}"; do
-      [[ "$k" == review.*.* ]] && { k="${k#review.}"; printf '%s\n' "${k%%.*}"; }
-    done
-    for k in "${!CFG_ROLE[@]}"; do
-      [[ "$k" == "$ROLE:review."*.* ]] && { k="${k#"$ROLE:review."}"; printf '%s\n' "${k%%.*}"; }
-    done
-  } | sort -u
+  for k in "${!CFG_ROLE[@]}"; do
+    [[ "$k" == "$ROLE:review."*.* ]] && { k="${k#"$ROLE:review."}"; printf '%s\n' "${k%%.*}"; }
+  done | sort -u
 }
 
 # ------------------------------------------------------------------ diag
@@ -129,6 +72,13 @@ review_names() {
 diag_node_path() {
   awk -v n="$2" '{ l=$0; sub(/^[ \t]+/, "", l)
     if (l ~ /^node[ \t]/) { split(l, a, /[ \t]+/); if (a[2] == n) { print a[3]; exit } } }' "$1"
+}
+
+# diag_verb_dests DIAG SRC VERB: every DEST of a 'verb SRC DEST WORD...' line that lists VERB
+diag_verb_dests() {
+  awk -v s="$2" -v v="$3" '{ l=$0; sub(/^[ \t]+/, "", l)
+    if (l ~ /^verb[ \t]/) { n = split(l, a, /[ \t]+/)
+      if (a[2] == s) for (i = 4; i <= n; i++) if (a[i] == v) { print a[3]; break } } }' "$1"
 }
 
 # body lines of 'message VERB { ... body: { ... } }'

@@ -50,7 +50,7 @@ node coder /channel/connect/feature-x/nodes/coder/inbox
 
 verb planner coder IMPLEMENT RESUME PROVIDE-EVIDENCE STOP
 verb coder planner COMPLETE FAILURE BLOCKED STOPPED DAVID-DIRECT
-# A reviewer node the coder's dispatcher talks to directly (executor.review_node=reviewer),
+# A reviewer node the coder's dispatcher talks to directly (the REVIEW verb line makes it so),
 # so reviews do not wake the planner. Add the arrow `coder >-> reviewer;`, these lines,
 # and REVIEW / REVIEW-PASS / REVIEW-FAIL / REVIEW-ERROR blocks with PLAN, RANGE, ROUND
 # and REF lines (the replies also STATUS, PROBLEMS, REASON, VERDICT-FILE); see tests/dispatch.

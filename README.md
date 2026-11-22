@@ -70,6 +70,5 @@ The send prints `SENT PATH`, then `DELIVERED PATH` (exit 0) once the file is in 
 | [docs/diagram-marks.md](docs/diagram-marks.md) | The arrow marks: `->` (one in flight), `-<` (queue), both on one line (`<->`, `>-<`, `>->`), and what blockdiag draws. |
 | [prompts/](prompts/) | Text to give each agent, and how to grant the scripts. |
 | [dispatch/](dispatch/README.md) | A headless dispatcher that serves a node by starting one fresh agent per message through a launch hook: executor, reviewer, tester. [docs/dispatch.md](docs/dispatch.md) has the details. |
-| [example/comms.diag.dispatch](example/comms.diag.dispatch) | Dispatcher settings beside `example/comms.diag` (the channel never reads it). |
 
 The license is [MIT](LICENSE).

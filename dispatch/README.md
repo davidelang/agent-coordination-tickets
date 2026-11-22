@@ -19,9 +19,9 @@ dispatch ... -n                                                  # dry run: sett
 | `backends/grok-build.sh` | Grok Build headless (`--prompt-file --rules --output-format json`), tested |
 | `backends/cursor.sh`, `backends/antigravity.sh` | built from `--help`, untested |
 | `backends/grokbot-webhook.sh` | stub, refuses to run |
-| `roles/ROLE.conf` | per-role defaults (access, turns, reply verbs, review registry) |
+| `roles/ROLE.conf` | the dispatcher's own defaults (access, role card, prompts, turns) |
 | `roles/ROLE.md` | role card, always passed as the agent's rules |
 | `roles/*.prompt` | job prompt templates (`{{PLAN}}`, `{{RANGE}}`, `{{VERDICT}}`, ...) |
 | `hooks/direct` | trivial launch hook: runs the agent as the current user |
 
-The dispatcher knows nothing about accounts, landlock, cwd beyond the git worktree, config homes, or a project's `roles.config`. Those belong to the launch hook, a consumer's `run-*` wrapper. Full description: [docs/dispatch.md](../docs/dispatch.md). Example settings: [example/comms.diag.dispatch](../example/comms.diag.dispatch).
+The dispatcher knows nothing about accounts, landlock, cwd beyond the git worktree, config homes, or a project's `roles.config`. Those belong to the launch hook, a consumer's `run-*` wrapper. Full description: [docs/dispatch.md](../docs/dispatch.md). There is no settings file: run parameters are options, agent rules are role cards, verbs come from the diag.

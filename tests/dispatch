@@ -53,7 +53,7 @@ printf '{"text":"%s","total_cost_usd":0}\n' "$t"
 EOF
 chmod +x "$T/fake"
 
-# ---- scratch repo, diag, sidecar
+# ---- scratch repo and diag (verbs, nodes and the coder -> reviewer REVIEW arrow; no settings file)
 W=$T/work; C=$T/connect
 git init -q "$W"; git -C "$W" config user.email t@t; git -C "$W" config user.name t
 echo base >"$W/a.txt"; echo keep >"$W/ENGINEERING_LOG.md"; git -C "$W" add -A; git -C "$W" commit -qm base; git -C "$W" tag builds
@@ -159,26 +159,16 @@ VERDICT-FILE: <file>
 }
 */
 EOF
-cat >"$C/config.diag.dispatch" <<EOF
-executor.node=coder
-reviewer.node=reviewer
-launch=$ROOT/dispatch/hooks/direct
-agent_bin=$T/fake
-channel=$CH
-executor.review_node=reviewer
-executor.retry_effort=xhigh
-executor.done_tag=builds
-executor.failure_log_dir=$T/failure-logs
-reviewer.wait_timeout=4
-reviewer.reply.pass=REVIEW-PASS
-reviewer.reply.fail=REVIEW-FAIL
-reviewer.reply.error=REVIEW-ERROR
-EOF
 for n in planner coder reviewer; do "$CH" --setup "$C/config.diag" "$n" >/dev/null; done
 export FAKE_DIR=$T
 
+# What a run-* wrapper passes: the node, the hook, the channel, the agent program and, for
+# the coder, the project's done tag, retry effort, failure log dir and review wait.
+COMMON=(-l "$ROOT/dispatch/hooks/direct" -c "$CH" --agent-bin "$T/fake")
+CODER=(-N coder --done-tag builds --retry-effort xhigh --failure-log-dir "$T/failure-logs" --review-timeout 4)
 start() {  # start NAME ROLE: one dispatcher in watch mode, log in $T/NAME.log
-  ( cd "$W" && exec "$D" -d "$C/config.diag" -r "$2" ) >>"$T/$1.log" 2>&1 &
+  local -a extra=(-N "$1"); [[ "$2" == executor ]] && extra=("${CODER[@]}")
+  ( cd "$W" && exec "$D" -d "$C/config.diag" -r "$2" "${COMMON[@]}" "${extra[@]}" ) >>"$T/$1.log" 2>&1 &
   PIDS+=("$!"); eval "PID_$1=$!"
 }
 stop_role() { local v="PID_$1"; kill "${!v}" 2>/dev/null || :; wait "${!v}" 2>/dev/null || :; }
@@ -197,10 +187,16 @@ reset_case() { rm -f "$C/nodes/planner/inbox/"*.md "$T/agent.log" "$T/reviews" "
 count() { local n; n=$(grep -c "$1" "$2" 2>/dev/null) || :; echo "${n:-0}"; }
 
 # 0. -p (no message) dry run with a channel review: settings and the REVIEW it would send
-out=$(cd "$W" && "$D" -n -d "$C/config.diag" -r executor -p "$T/plan.md" 2>&1); rc=$?
-check "-p dry run with review_node" '[[ $rc == 0 ]] && grep -q "mode=channel node=reviewer" <<<"$out" && grep -q "would wait for the reply with REF" <<<"$out"'
+out=$(cd "$W" && "$D" -n -d "$C/config.diag" -r executor -p "$T/plan.md" "${COMMON[@]}" "${CODER[@]}" 2>&1) && rc=0 || rc=$?
+check "-p dry run: review node and verbs from the diag" '[[ $rc == 0 ]] && grep -q "mode=channel node=reviewer" <<<"$out" && grep -q "would wait for the reply with REF" <<<"$out"'
 
 start reviewer reviewer; start coder executor; sleep 1
+
+echo "x=1" >"$C/config.diag.dispatch"
+out=$(cd "$W" && "$D" -n -d "$C/config.diag" -r executor -p "$T/plan.md" "${COMMON[@]}" "${CODER[@]}" 2>&1) || :; rm -f "$C/config.diag.dispatch"
+check "an old DIAG.dispatch file is ignored with a warning" 'grep -q "config.diag.dispatch is ignored" <<<"$out"'
+out=$(cd "$W" && "$D" -n -d "$C/config.diag" -r executor -p "$T/plan.md" -s x 2>&1) && rc=0 || rc=$?
+check "-s/--sidecar is gone" '[[ $rc == 2 ]]'
 
 # 1. FAIL -> fix -> PASS over the channel, PING queued during the wait
 reset_case; printf 'FAIL 3\nSLEEP 2\n' >"$T/reviews"

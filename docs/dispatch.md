@@ -9,8 +9,9 @@ The split of work:
 | the job loop, review rounds, done checks, replies | which account runs the agents (the wrapper may switch once at start with `sudo -u`, so the dispatcher and every agent share one account; or the hook may pick one per role) |
 | the agent command line for each backend | the landlock for each role and access level |
 | role cards and prompt templates (overridable) | the config home (`GROK_HOME`), which sets the context window |
-| reading the diag and the sidecar | finding the standard diag and asking whether to use it |
+| reading the diag: nodes, the REVIEW arrow, reply verbs | finding the standard diag and asking whether to use it |
 | | effort and model from the project's `roles.config`, passed as `-e`/`-m` |
+| | the project's options: node, role cards (from the worktree), done tag, retry effort, failure log dir |
 
 ## Command line
 
@@ -22,20 +23,25 @@ dispatch -d DIAG -r ROLE [-l HOOK] [options]
 |--|--|
 | `-d, --diag FILE` | channel plan. Required; there is no default (the wrapper finds `sandbox/connect/<branch>/config.diag`) |
 | `-r, --role ROLE` | `executor`, `reviewer` or `tester`. Required |
-| `-l, --launch CMD` | launch hook. Required here or as `launch=` / `ROLE.launch=` |
+| `-l, --launch CMD` | launch hook. Required |
 | `-p, --plan FILE` | one job, no channel. Executor: implement; reviewer/tester: review `-R` |
 | `-f, --from-step STEP` | executor start step (default: the beginning) |
 | `-R, --range A..B` | commit range for a direct reviewer/tester job |
 | `-1, --once` | handle the oldest inbox message, then exit |
-| `-N, --node NAME` | node this process serves (default `ROLE.node`) |
+| `-N, --node NAME` | node this process serves (required to watch) |
 | `-C, --worktree DIR` | git worktree the agent works in (default: toplevel of `$PWD`) |
 | `-b, --backend NAME` | `grok-build` (default), `cursor`, `antigravity`, `grokbot-webhook` |
 | `-m, --model ID` / `-e, --effort LEVEL` | passed to the backend |
 | `-t, --max-turns N` | turn cap per agent run (default 80 executor, 40 reviewer, 60 tester) |
 | `-T, --timeout SEC` | wall-clock cap per run, via `timeout` (0 = none) |
 | `-u, --rules FILE` | role card for this role |
-| `-w, --review-launch CMD` | hook for the reviews an executor runs |
-| `-s, --sidecar FILE` | settings file (default `DIAG.dispatch` if present) |
+| `--agent-bin PATH` | agent program the backend runs (default `grok` / `cursor-agent` / `agy`) |
+| `-w, --review-launch CMD` | hook for in-process reviews (default: the same hook) |
+| `--review-rules FILE` | role card for in-process reviews (default `dispatch/roles/reviewer.md`) |
+| `--done-tag TAG` | executor: a tag that must be on HEAD for the job to be done (e.g. `builds`) |
+| `--retry-effort LEVEL` | executor: effort for the one retry after a session that ended not done |
+| `--failure-log-dir DIR` | executor: also copy `review-history.md` here when a job goes back |
+| `--review-timeout SEC` | executor: wait for a channel review verdict (default 3600) |
 | `-c, --channel PATH` | channel program (default `channel` on `PATH`) |
 | `-L, --log-dir DIR` | job logs (default `DIAGDIR/dispatch/NODE`) |
 | `-n, --dry-run` | print the settings and the agent command lines; start nothing, send nothing |
@@ -73,60 +79,28 @@ with every other entry symlinked back to the account's real `~/.grok`, so sign-i
 
 ## Settings
 
-Settings come from, highest first:
+There is no settings file. Each thing lives where it belongs:
 
-1. the command line (applies only to the role this process was started as),
-2. the sidecar (`DIAG.dispatch`, or `-s FILE`), `KEY=VALUE` lines,
-3. `# dispatch.KEY=VALUE` lines in the diag (the channel skips every `#` line, so its parser is unchanged),
-4. `dispatch/roles/ROLE.conf`.
+- **Parameters of the run** are options: the ones above, given by the consumer's `run-*` wrapper (which takes project values such as the sandbox or `roles.config` efforts from the worktree it runs in). Defaults the dispatcher itself ships are in `dispatch/roles/ROLE.conf` (access, role card, prompt templates, `max_turns` 80 / 40 / 60, `timeout` 0, `require_commit=yes`, the built-in `conformance` review); the command line beats them, and they are not meant to be edited per project.
+- **Rules for the agent** are role cards (`-u`, `--review-rules`; default `dispatch/roles/ROLE.md`): what done means, committing, never resetting past the done tag, the reviewer's numbered findings and `PROBLEMS: N`.
+- **Messages** come from the diag: the node's inbox (`node`), whether reviews go over the channel (a `verb THIS-NODE OTHER REVIEW` line makes OTHER the review node), and the reply verbs. The executor replies `COMPLETE`, `FAILURE`, `BLOCKED` or `STOPPED`; a reviewer or tester replies `REQUEST-PASS` / `-FAIL` / `-ERROR` (`REVIEW-PASS` ...). A reply is sent only when the diag lists that verb from this node to the sender; otherwise the message stays claimed with a warning.
 
-Inside each source `review.NAME.KEY` beats `ROLE.KEY`, which beats a bare `KEY`. Relative paths (`rules`, `prompt`, `fix_prompt`, `evidence_prompt`, `addendum`, and the program in `launch`, `channel`, `agent_bin`) are resolved from the file that set them. [example/comms.diag.dispatch](../example/comms.diag.dispatch) shows every key.
-
-| Key | Default | Meaning |
-|--|--|--|
-| `ROLE.node` | none | node served in watch / `--once` mode |
-| `launch`, `ROLE.launch` | none | launch hook |
-| `channel` | `channel` | channel program |
-| `backend` | `grok-build` | backend |
-| `agent_bin` | `grok` / `cursor-agent` / `agy` | agent program the backend runs |
-| `model`, `effort` | none | passed to the backend when set |
-| `max_turns` | 80 / 40 / 60 | turn cap |
-| `timeout` | 0 | seconds per run |
-| `rules` | `roles/ROLE.md` | role card (always passed: `--rules` for grok, prepended to the prompt otherwise) |
-| `prompt`, `fix_prompt`, `retry_prompt`, `evidence_prompt` | `roles/*.prompt` | templates |
-| `addendum` | none | file appended to the prompt as `{{ADDENDUM}}` (project steps such as a preflight) |
-| `executor.review_node` | none | node that runs the blocking reviews over the channel (`review.NAME.node` for one review); none = in-process |
-| `executor.retry_effort` | none | effort for the one retry after a session that ended not done (e.g. `xhigh`) |
-| `executor.failure_log_dir` | none | also copy `review-history.md` here when a job goes back to the sender |
-| `executor.require_commit` | yes | SUCCESS without a new commit is not done |
-| `executor.done_tag` | none | tag that must point at HEAD (e.g. `builds`) |
-| `ROLE.reply.KIND` | executor: COMPLETE, FAILURE, BLOCKED, STOPPED; reviewer/tester: none | reply verb per outcome (`complete`, `failure`, `blocked`, `stopped`; `pass`, `fail`, `error`) |
-| `review.NAME.role` | `reviewer` | role that runs the review |
-| `review.NAME.enabled` | yes | |
-| `review.NAME.blocking` | yes | blocking reviews gate the reply; non-blocking start after COMPLETE |
-| `review.NAME.mode` | `in-process` | non-blocking: `channel` sends `verb` to `node` and does not wait. A blocking review goes over the channel when it has a node |
-| `review.NAME.node` | `executor.review_node` | reviewer node for this review |
-| `review.NAME.verb`, `reviewer.verb` | `REVIEW` | request verb for a channel review |
-| `review.NAME.wait_timeout`, `reviewer.wait_timeout` | 3600 | seconds the executor waits for the verdict; then no verdict |
-| `review.NAME.on_fail_verb` | none | non-blocking in-process review: verb sent to the planner on FAIL |
-
-Account, landlock, cwd and config-home keys do not exist here on purpose.
+A `DIAG.dispatch` file from an earlier version is ignored with a warning. Account, landlock, cwd and config-home choices do not exist here on purpose.
 
 ## What a job does
 
 ### Executor (`IMPLEMENT` / `RESUME`, or `-p PLAN`)
 
 1. Move the message to `inbox/claimed/`, record HEAD.
-2. Round 1: render `executor.prompt` (plan, start step, recorded HEAD, addendum) and start a fresh agent.
-3. Done check. Not done when: there is no `STATUS:` line; `STATUS:` is not SUCCESS (BLOCKED and NEEDS-INPUT reply BLOCKED, anything else FAILURE); HEAD did not move (`require_commit`); `done_tag` is set and not on HEAD; the run timed out.
-4. Each enabled blocking review checks `RECORDED..HEAD`. In process, it is a fresh read-only agent; its last `STATUS:` line is the verdict (PASS / FAIL; anything else, no line, or a changed tree is ERROR). Over the channel (`review_node` set), the executor sends `REVIEW` (PLAN, RANGE, ROUND, REF) to the reviewer node and waits in its own inbox for the reply with the same `REF`, so the planner is not woken for reviews. While waiting, other messages stay queued, a `STOP` ends the job (reply STOPPED, the STOP is consumed), and after `wait_timeout` the request is retracted and the review counts as no verdict. A reply that arrives after its wait has ended is removed as stale. A review with no verdict is retried once as a fresh run (roles/coder.md); a second ERROR is FAILURE (a tool problem; no cycle is used). A FAIL must carry a `PROBLEMS: N` line (numbered findings, then the count); a FAIL without one counts as no verdict. The full reply is saved as `verdict.txt`.
+2. Round 1: render `executor.prompt` (plan, start step, recorded HEAD, the reset floor) and start a fresh agent.
+3. Done check. Not done when: there is no `STATUS:` line; `STATUS:` is not SUCCESS (BLOCKED and NEEDS-INPUT reply BLOCKED, anything else FAILURE); HEAD did not move (`require_commit`); `--done-tag` is given and not on HEAD; the run timed out.
+4. Each enabled blocking review checks `RECORDED..HEAD`. In process, it is a fresh read-only agent; its last `STATUS:` line is the verdict (PASS / FAIL; anything else, no line, or a changed tree is ERROR). Over the channel (the diag has a `REVIEW` arrow from this node), the executor sends `REVIEW` (PLAN, RANGE, ROUND, REF) to the reviewer node and waits in its own inbox for the reply with the same `REF`, so the planner is not woken for reviews. While waiting, other messages stay queued, a `STOP` ends the job (reply STOPPED, the STOP is consumed), and after `--review-timeout` the request is retracted and the review counts as no verdict. A reply that arrives after its wait has ended is removed as stale. A review with no verdict is retried once as a fresh run (roles/coder.md); a second ERROR is FAILURE (a tool problem; no cycle is used). A FAIL must carry a `PROBLEMS: N` line (numbered findings, then the count); a FAIL without one counts as no verdict. The full reply is saved as `verdict.txt`.
 5. Review cycles: at most 3 per job (fixed).
    - After a FAIL the full review is saved as `review-N.md` and appended to `review-history.md` in the job directory. A fresh session gets `executor-fix.prompt` with the whole review and the counts so far, verifies each finding (saying which it rejects), and commits fixes on top. Then the range is reviewed again.
-   - If a review reports as many problems as the review before it or more, or the third review still fails, the job ends: FAILURE "re-plan needed" to the sender, naming `review-history.md` (copied to `failure_log_dir` when set). BLOCKED is never used for this: it is only the agent's own `STATUS: BLOCKED`, when something outside the code prevents progress (permissions, contradictory instructions, missing access).
-   - A session that ends not done (FAILURE, no STATUS, no commit, `done_tag` not on HEAD, timeout) gets one fresh retry per job with `executor-retry.prompt` at `retry_effort`; a second one is FAILURE. It does not use a review cycle.
-   - The dispatcher never resets, reverts or drops commits: whatever the job committed is left in place for the planner. The prompts tell each session never to reset or check out past the `done_tag` (e.g. `builds`), or past HEAD at its start when there is none. Build slips (a missed reference, a typo) are the agent's to fix inside its own session; the dispatcher counts no strikes.
-6. Reply (`COMPLETE` / `FAILURE` / `BLOCKED`) to the sender, with the body built from the diag's message block (`STATUS`, `PLAN`, `RESPONDING-TO`, `REASON` filled; other `<...>` fields get `none`). The claimed file is removed only after the reply is sent.
-7. After COMPLETE, non-blocking reviews start in the background.
+   - If a review reports as many problems as the review before it or more, or the third review still fails, the job ends: FAILURE "re-plan needed" to the sender, naming `review-history.md` (copied to `--failure-log-dir` when given). BLOCKED is never used for this: it is only the agent's own `STATUS: BLOCKED`, when something outside the code prevents progress (permissions, contradictory instructions, missing access).
+   - A session that ends not done (FAILURE, no STATUS, no commit, `done_tag` not on HEAD, timeout) gets one fresh retry per job with `executor-retry.prompt` at `--retry-effort`; a second one is FAILURE. It does not use a review cycle.
+   - The dispatcher never resets, reverts or drops commits: whatever the job committed is left in place for the planner. The prompts tell each session never to reset or check out past the `done_tag` (e.g. `builds`), or past HEAD at its start when none is given. Build slips (a missed reference, a typo) are the agent's to fix inside its own session; the dispatcher counts no strikes.
+6. Reply (`COMPLETE` / `FAILURE` / `BLOCKED` / `STOPPED`, as the diag allows) to the sender, with the body built from the diag's message block (`STATUS`, `PLAN`, `RESPONDING-TO`, `REASON` filled; other `<...>` fields get `none`). The claimed file is removed only after the reply is sent.
 
 Sessions are never resumed: a resumed session carries its whole history and compacts again, which costs more than a fresh session given the plan, the range and the verdict.
 
@@ -134,7 +108,7 @@ Sessions are never resumed: a resumed session carries its whole history and comp
 
 ### Reviewer / tester node (or `-p PLAN -R A..B`)
 
-A message with `PLAN:` and `RANGE:` gets one read-only review. The reply goes to whichever node sent the request; its verb is `ROLE.reply.pass|fail|error` (none by default); the body's `STATUS`, `REASON`, `VERDICT` / `VERDICT-FILE` fields are filled, `REF` / `ROUND` are copied from the request, and `PROBLEMS` is the count from the review.
+A message with `PLAN:` and `RANGE:` gets one read-only review. The reply goes to whichever node sent the request; its verb is the request verb plus `-PASS` / `-FAIL` / `-ERROR` (`REVIEW-PASS` ...), sent only when the diag allows it; the body's `STATUS`, `REASON`, `VERDICT` / `VERDICT-FILE` fields are filled, `REF` / `ROUND` are copied from the request, and `PROBLEMS` is the count from the review.
 
 ### Restart
 
@@ -142,7 +116,7 @@ On start the dispatcher lists anything left in `inbox/claimed/` and does not red
 
 ## Files per job
 
-`LOG_DIR/YYYYmmdd-HHMMSS-ACTION/`: `message.txt`, `job.txt` (plan, recorded HEAD), one directory per run (`r1-executor/`, `r1-review-conformance/`, `r2-executor/`, ...) holding `prompt.txt`, `argv.txt` (exact command, reproducible), `agent.out` (the `--output-format json` result), `agent.err`, `result.txt` (final text), and `verdict.txt` for reviews; `reply.txt`; `nonblocking.log`. `LOG_DIR/costs.tsv` gets one line per run: time, role, exit, cost in USD.
+`LOG_DIR/YYYYmmdd-HHMMSS-ACTION/`: `message.txt`, `job.txt` (plan, recorded HEAD), one directory per run (`r1-executor/`, `r1-review-conformance/`, `r2-executor/`, ...) holding `prompt.txt`, `argv.txt` (exact command, reproducible), `agent.out` (the `--output-format json` result), `agent.err`, `result.txt` (final text), and `verdict.txt` for reviews; `reply.txt`; for failed reviews `review-N.md` and `review-history.md`. `LOG_DIR/costs.tsv` gets one line per run: time, role, exit, cost in USD.
 
 ## Backends
 

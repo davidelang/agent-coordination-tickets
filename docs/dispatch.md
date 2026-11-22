@@ -124,7 +124,7 @@ A backend is `dispatch/backends/NAME.sh` defining `backend_argv` (fills `BACKEND
 
 - `grok-build`: `grok --prompt-file P --rules CARD --output-format json --cwd WT --always-approve --permission-mode auto --no-subagents --no-alt-screen --max-turns N [--model M] [--reasoning-effort E]`. Tested with grok 1.0.92.
 - `cursor`: built from `--help`, untested.
-- `antigravity`: `agy --print --dangerously-skip-permissions [--effort E] [--model M] "CARD\n\nPROMPT"`, plain-text reply, no turn cap, no cost. Built from `--help`, untested. agy reads flags only before the prompt, so a launch hook that adds flags inserts them after the program name.
+- `antigravity`: `agy --dangerously-skip-permissions [--model M | --effort E] --print="CARD\n\nPROMPT"`, plain-text reply, no turn cap, no cost. `--print` takes the prompt as its value, so it is attached with `=` and comes last; every other flag goes before it, and a launch hook that adds flags inserts them after the program name. agy model names carry the effort (`Gemini 3.8 Flash (Low)`) and agy refuses `--effort` beside `--model`, so with a model no effort is passed (a retry effort does not apply). The fake agy in `tests/dispatch` parses the command line the same way. Checked live once (agy accepted the command line); no full job yet.
 - `grokbot-webhook`: stub. Waking a Grok Bot node is already possible with the channel's per-node `webhook=`.
 
 ## Shipping it through a pin

@@ -304,5 +304,58 @@ implement; f=$(wait_reply BLOCKED 30 || :)
 check "review agent did not start: BLOCKED to the planner, one review request" '[[ -n "$f" ]] && grep -q "agent did not start (launch exit 127): refuse-hook" "$f" && [[ $(count "MESSAGE .* action=REVIEW" "$T/reviewer.log") == 1 ]] && [[ $(count "^exec" "$T/agent.log") == 1 ]]'
 stop_role reviewer
 
+# 10. antigravity backend: a fake agy that parses its command line like agy (Go flags: they
+# stop at the first non-flag; --print takes the prompt as its value; a value-less --print
+# takes the next word as the prompt and leaves the real prompt as an ignored argument)
+cat >"$T/fakeagy" <<'EOF'
+#!/usr/bin/env bash
+S=$FAKE_DIR; prompt=""; have_print=0; model=""; effort=""
+bool=" --dangerously-skip-permissions --sandbox --continue -c --disable-slash-commands --new-project --remote-control "
+val=" --add-dir --effort --model --print -p --prompt --output-format --mode --log-file --agent --conversation --print-timeout --project --input-format --json-schema -i --prompt-interactive "
+while [[ $# -gt 0 ]]; do
+  a="$1"
+  case "$a" in
+    --*=*|-?=*) k="${a%%=*}"; v="${a#*=}"; shift ;;
+    -*) k="$a"
+        if [[ "$bool" == *" $k "* ]]; then v=""; shift
+        elif [[ "$val" == *" $k "* ]]; then [[ $# -ge 2 ]] || { echo "flag needs an argument: $k" >&2; exit 2; }; v="$2"; shift 2
+        else echo "flag provided but not defined: $k" >&2; exit 2; fi ;;
+    *) break ;;
+  esac
+  case "$k" in
+    --print|-p|--prompt) have_print=1; prompt="$v"
+      if [[ "$v" == -* && "$a" != *=* ]]; then
+        echo "Error: --print took \"$v\" as its prompt, so the intended prompt was left as an argument and ignored." >&2; exit 2
+      fi ;;
+    --effort) effort="$v"; case "$v" in low|medium|high|max) ;; *) echo "invalid effort: $v" >&2; exit 2 ;; esac ;;
+    --model) model="$v" ;;
+  esac
+done
+if [[ -n "$model" && -n "$effort" ]]; then echo "error: invalid model selection (--model \"$model\" --effort \"$effort\"): --effort is not supported for model \"$model\"" >&2; exit 1; fi
+if [[ $# -gt 0 && $have_print == 1 ]]; then echo "Error: unexpected argument after --print: ${1:0:40}" >&2; exit 2; fi
+[[ $have_print == 1 && -n "$prompt" ]] || { echo "Error: no --print prompt" >&2; exit 2; }
+if [[ "$prompt" == *"Role: reviewer"* ]]; then
+  echo "agy review" >>"$S/agent.log"; printf 'ok\nPROBLEMS: 0\nSTATUS: PASS\n'
+else
+  echo "agy exec" >>"$S/agent.log"
+  date +%s%N >>a.txt; git add a.txt; git commit -qm "fake agy"; git tag -f builds >/dev/null
+  printf 'done\nSTATUS: SUCCESS\n'
+fi
+EOF
+chmod +x "$T/fakeagy"
+printf 'blockdiag {\n  planner >-> coder;\n}\n/*\nnode planner %s/agyn/planner/inbox\nnode coder %s/agyn/coder/inbox\nverb coder planner COMPLETE FAILURE BLOCKED STOPPED\n*/\n' "$T" "$T" >"$T/agy.diag"
+reset_case
+out=$(cd "$W" && "$D" -d "$T/agy.diag" -r executor -p "$T/plan.md" -l "$ROOT/dispatch/hooks/direct" -c "$CH" -b antigravity --agent-bin "$T/fakeagy" -e high -m "Gemini X" -L "$T/agy-logs" 2>&1) && rc=0 || rc=$?
+check "antigravity backend: a command line agy accepts; executor and in-process review run" '[[ $rc == 0 ]] && grep -q "RESULT complete" <<<"$out" && [[ $(count "^agy exec" "$T/agent.log") == 1 ]] && [[ $(count "^agy review" "$T/agent.log") == 1 ]]'
+A=$(ls "$T"/agy-logs/*/r1-executor/argv.txt | head -1)
+check "antigravity backend: flags first, the prompt attached to --print and last; no --effort beside --model" 'grep -qF -- "fakeagy --dangerously-skip-permissions --model Gemini\\ X \$'"'"'--print=# Role: executor" "$A" && grep -qF "Read the rules. Implement $T/plan.md.'"'"' " "$A" && ! grep -q -- "--effort" "$A"'
+out=$(cd "$W" && "$D" -d "$T/agy.diag" -r executor -p "$T/plan.md" -l "$ROOT/dispatch/hooks/direct" -c "$CH" -b antigravity --agent-bin "$T/fakeagy" -e high -L "$T/agy-logs2" 2>&1) && rc=0 || rc=$?
+A=$(ls "$T"/agy-logs2/*/r1-executor/argv.txt | head -1)
+check "antigravity backend: without a model, --effort is passed" '[[ $rc == 0 ]] && grep -qF -- "fakeagy --dangerously-skip-permissions --effort high \$'"'"'--print=" "$A"'
+"$T/fakeagy" --print --dangerously-skip-permissions "the prompt" 2>"$T/agy-old.err" && rc=0 || rc=$?
+check "fake agy rejects the old order (--print then a flag) as agy does" '[[ $rc == 2 ]] && grep -q "took \"--dangerously-skip-permissions\" as its prompt" "$T/agy-old.err"'
+"$T/fakeagy" --model "Gemini 3.8 Flash (Low)" --effort low --print="p" 2>"$T/agy-eff.err" && rc=0 || rc=$?
+check "fake agy rejects --effort beside --model as agy does" '[[ $rc == 1 ]] && grep -q "effort is not supported for model" "$T/agy-eff.err"'
+
 printf '%s\n' "dispatch: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

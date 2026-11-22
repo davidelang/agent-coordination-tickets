@@ -19,9 +19,11 @@ role_default() {
     executor:access) echo read-write ;;
     reviewer:access|tester:access) echo read-only ;;
     *:rules) echo "$HERE/roles/$1.md" ;;
-    executor:max_turns) echo 80 ;;
-    reviewer:max_turns) echo 40 ;;
-    tester:max_turns) echo 60 ;;
+    # Live wifi-mapper runs (GB-1, Nov 20): landing one plan took 80 (cap hit) + 100 + 7
+    # executor turns, fix sessions 34 and 13; reviews 20 and 60 turns.
+    executor:max_turns) echo 200 ;;
+    reviewer:max_turns) echo 80 ;;
+    tester:max_turns) echo 80 ;;
     *:timeout) echo 0 ;;
     # A STATUS: SUCCESS with HEAD unchanged is not done.
     executor:require_commit) echo yes ;;

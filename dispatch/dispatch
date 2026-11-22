@@ -35,7 +35,7 @@ Agent:
   -b, --backend NAME       grok-build (default) | cursor | antigravity | grokbot-webhook
   -m, --model ID           model passed to the backend
   -e, --effort LEVEL       reasoning effort passed to the backend
-  -t, --max-turns N        turn cap per agent run
+  -t, --max-turns N        turn cap per agent run (default 200 executor, 80 reviewer, 80 tester)
   -T, --timeout SEC        wall-clock cap per agent run (0 = none)
   -u, --rules FILE         role card for this role (default: roles/ROLE.md at the worktree
                            root, as run-grok-* use roles/<role>.md; else dispatch/roles/ROLE.md)
@@ -253,8 +253,8 @@ run_review() {
   V_FILE="$dir/verdict.txt"; V_STATUS=ERROR; V_REASON=""
   # The prompt is only the job; the role card (--rules) holds the contract.
   case "$role" in
-    tester) say_prompt "$dir/prompt.txt" "Test $range against $plan. Reply with the report." ;;
-    *) say_prompt "$dir/prompt.txt" "Review $range against $plan. Reply with the verdict." ;;
+    tester) say_prompt "$dir/prompt.txt" "Test $range against $plan." ;;
+    *) say_prompt "$dir/prompt.txt" "Review $range against $plan." ;;
   esac
   h0=$(git_head); d0=$(git_dirty)
   run_agent "$role" "$name" "$dir" "$dir/prompt.txt"

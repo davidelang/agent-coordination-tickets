@@ -32,7 +32,7 @@ dispatch -d DIAG -r ROLE [-l HOOK] [options]
 | `-C, --worktree DIR` | git worktree the agent works in (default: toplevel of `$PWD`) |
 | `-b, --backend NAME` | `grok-build` (default), `cursor`, `antigravity`, `grokbot-webhook` |
 | `-m, --model ID` / `-e, --effort LEVEL` | passed to the backend |
-| `-t, --max-turns N` | turn cap per agent run (default 80 executor, 40 reviewer, 60 tester) |
+| `-t, --max-turns N` | turn cap per agent run (default 200 executor, 80 reviewer, 80 tester) |
 | `-T, --timeout SEC` | wall-clock cap per run, via `timeout` (0 = none) |
 | `-u, --rules FILE` | role card for this role (default: `roles/ROLE.md` at the worktree root, else `dispatch/roles/ROLE.md`) |
 | `--agent-bin PATH` | agent program the backend runs (default `grok` / `cursor-agent` / `agy`) |
@@ -80,7 +80,7 @@ with every other entry symlinked back to the account's real `~/.grok`, so sign-i
 
 There is no settings file. Each thing lives where it belongs:
 
-- **Parameters of the run** are options: the ones above, given by the consumer's `run-*` wrapper (which takes project values such as the sandbox or `roles.config` efforts from the worktree it runs in). The role is fixed by the wrapper (`-r`), as `run-grok-coder` fixes `ROLE_KEY`, and the per-role defaults are cases in the dispatcher itself (`role_default` in `lib/common.sh`: access read-write / read-only, `max_turns` 80 / 40 / 60, `timeout` 0, the prompt templates, the commit check, the one `conformance` review); there is no per-role settings file. The command line beats them.
+- **Parameters of the run** are options: the ones above, given by the consumer's `run-*` wrapper (which takes project values such as the sandbox or `roles.config` efforts from the worktree it runs in). The role is fixed by the wrapper (`-r`), as `run-grok-coder` fixes `ROLE_KEY`, and the per-role defaults are cases in the dispatcher itself (`role_default` in `lib/common.sh`: access read-write / read-only, `max_turns` 200 / 80 / 80 (from live runs: one plan took 187 executor turns over three sessions, a review up to 60), `timeout` 0, the prompt templates, the commit check, the one `conformance` review); there is no per-role settings file. The command line beats them.
 - **Rules for the agent** are role cards, found the way `run-grok-<role>` finds its own (`roles/<role>.md` at the worktree root, passed as `--rules`): `roles/executor.md`, `roles/reviewer.md` (also for an in-process review), `roles/tester.md`. A worktree without one gets the generic `dispatch/roles/ROLE.md`; `-u` overrides this process's own card. They say: what done means, committing, never resetting past the done tag, the reviewer's numbered findings and `PROBLEMS: N`.
 - **Messages** come from the diag: the node's inbox (`node`), whether reviews go over the channel (a `verb THIS-NODE OTHER REVIEW` line makes OTHER the review node), and the reply verbs. The executor replies `COMPLETE`, `FAILURE`, `BLOCKED` or `STOPPED`; a reviewer or tester replies `REQUEST-PASS` / `-FAIL` / `-ERROR` (`REVIEW-PASS` ...). A reply is sent only when the diag lists that verb from this node to the sender; otherwise the message stays claimed with a warning.
 
@@ -122,7 +122,8 @@ On start the dispatcher lists anything left in `inbox/claimed/` and does not red
 A backend is `dispatch/backends/NAME.sh` defining `backend_argv` (fills `BACKEND_ARGV` from `B_PROMPT_FILE`, `B_RULES_FILE`, `B_WORKTREE`, `B_MODEL`, `B_EFFORT`, `B_MAX_TURNS`, `B_ACCESS`, `B_AGENT_BIN`), `backend_text FILE` (final text from the agent's stdout) and `backend_cost FILE`.
 
 - `grok-build`: `grok --prompt-file P --rules CARD --output-format json --cwd WT --always-approve --permission-mode auto --no-subagents --no-alt-screen --max-turns N [--model M] [--reasoning-effort E]`. Tested with grok 1.0.92.
-- `cursor`, `antigravity`: built from `--help`, untested.
+- `cursor`: built from `--help`, untested.
+- `antigravity`: `agy --print --dangerously-skip-permissions [--effort E] [--model M] "CARD\n\nPROMPT"`, plain-text reply, no turn cap, no cost. Built from `--help`, untested. agy reads flags only before the prompt, so a launch hook that adds flags inserts them after the program name.
 - `grokbot-webhook`: stub. Waking a Grok Bot node is already possible with the channel's per-node `webhook=`.
 
 ## Shipping it through a pin

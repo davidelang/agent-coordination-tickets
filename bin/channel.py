@@ -653,7 +653,8 @@ ACT_TAIL = [
     'read: a message file has FROM, TO, SEQ, VERB and REFS (zero or more files, paths relative to the plan directory, or - none), then a --- line, then the body.',
     "  Handle the oldest FILE first, one file at a time. You may move it into {INBOX}/claimed/ while you work (the watch ignores subfolders and shows the next file); optionally write claimed/<file>.owner saying who has it.",
     "claim: if mv or rm of a FILE says No such file, the sender took it back first: you lost the race. Say so in one line (LOST <file>: the sender took it back) and go back to watching for new messages; it is not an error.",
-    'send: {BIN}/channel-send {PLAN} {NODE} DEST VERB BODYFILE [REF ...]',
+    "send: after channel-send prints DELIVERED <path> (exit 0), go straight back to your inbox watch; do not wait for, look for, or check a reply, DEST's inbox or its claimed/.",
+    '  {BIN}/channel-send {PLAN} {NODE} DEST VERB BODYFILE [REF ...]',
     "  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB -m 'TEXT' [-m 'TEXT' ...] [REF ...]   (each -m is one block of lines; blocks are joined by a blank line)",
     '  or:  {BIN}/channel-send {PLAN} {NODE} DEST VERB - [REF ...]   (- or no BODYFILE reads the body from stdin)',
     "  DEST must be a node you have an arrow to and VERB must be one your duties list for that arrow (see duties). PING and PONG are built in on every arrow; their body is NONCE: <value>, or what the plan's PING/PONG message block asks for (the tools fill only NONCE, SCOPE and RUN there; any other <...> line makes them fail with CHANNEL-CONTROL-BODY).",
@@ -661,7 +662,7 @@ ACT_TAIL = [
     '  Lines are compared after trimming spaces; blank lines are ignored and extra lines are allowed.',
     '  REF files are optional and a message may carry several; each is copied into refs/ and listed under REFS.',
     "  At a -> end (one message in flight) the send first waits until DEST removes your previous message there (it prints PENDING <path>); at a -< end (crow's foot) it sends at once. PING and PONG never wait.",
-    "  A send is done when channel-send returns: DELIVERED <path> (exit 0) means the message is in DEST's inbox, and that ends your part. Never check DEST's inbox, its claimed/ or channel-status to see whether DEST has taken or handled it. A failed send exits non-zero with its reason; that is the only send result you act on. If you need an answer, it comes as a message in your own inbox (FILE).",
+    "  DELIVERED <path> means the message is in DEST's inbox, and that ends your part; channel-status is not for checking your sends. A failed send exits non-zero with its reason; that is the only send result you act on. Any answer comes later as a message in your own inbox (FILE).",
     "  Start a send that may wait (PENDING) in the background (see step 3) and keep handling your inbox, so two nodes that wait on each other cannot deadlock.",
     "  take back: {BIN}/channel-send {PLAN} {NODE} --retract <path from SENT>. It is one rename, so exactly one of you and DEST gets the file: RETRACTED <path> -> <where> (DEST never got it) or NOT-RETRACTED <path> (DEST already has it; you lost the race). Both exit 0: report which, and carry on. Stopping a send while it is PENDING prints ABORTED; nothing was sent.",
     'done: rm the FILE when you have finished it (from claimed/ only after your reply is sent). Removing it is the acknowledgement.',
@@ -670,6 +671,11 @@ ACT_TAIL = [
     'after a compaction, run {BIN}/channel-arm {PLAN} {NODE} --whatineedtoknow again and follow it (do not start a second watch), then check claimed/ (see start).',
     'duties (from the plan; PING and PONG are allowed on every arrow as well):',
 ]
+
+# How the duties and arrows read in --whatineedtoknow ("wait"/"queue" are only internal mode names).
+SEND_KIND = {"wait": "one in flight: channel-send waits (PENDING) until DEST takes your previous one; DELIVERED ends your part", "queue": "sends at once; DELIVERED ends your part"}
+RECEIVE_KIND = {"wait": "one in flight: their next one waits until you rm this one", "queue": "may queue: handle the oldest first"}
+ARROW = {"wait": "->", "queue": "-<"}
 
 
 def emit_act(me, plan_path, nodes, verbs, edges):
@@ -685,9 +691,9 @@ def emit_act(me, plan_path, nodes, verbs, edges):
     for src, dst, mode, _label in edges:
         words = " ".join(verbs[(src, dst)])
         if src == me:
-            say(f"  send to {dst} ({mode}): {words}")
+            say(f"  send to {dst} ({SEND_KIND[mode]}): {words}")
         if dst == me:
-            say(f"  receive from {src} ({mode}): {words}")
+            say(f"  receive from {src} ({RECEIVE_KIND[mode]}): {words}")
     say("")
 
 
@@ -707,7 +713,7 @@ def emit_what(me, nodes, verbs, messages, edges, plan_path):
         say(f"node {name} {nodes[name]}")
     used = []
     for src, dst, mode in touching:
-        say(f"{src} -> {dst} {mode}")
+        say(f"{src} {ARROW[mode]} {dst}")
         words = verbs[(src, dst)]
         say("verb " + " ".join([src, dst, *words]))
         used.extend(words)

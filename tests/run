@@ -248,7 +248,7 @@ same "named command plus its own flag" "$TMP/py-w" "$TMP/sh-same"
 
 # The agent tool comes only from CHANNEL_AGENT (set by the run-* launchers); no guessing.
 if grep -qx 'you are node coder (agent: grok)' "$TMP/sh-w" && grep -q 'with the monitor tool, persistent: true' "$TMP/sh-w" && ! grep -q 'cursor-channel-watch' "$TMP/sh-w"; then ok "grok header names the monitor watch"; else bad "grok header names the monitor watch"; fi
-if grep -q '^  receive from planner (wait): ' "$TMP/sh-w" && grep -q '^  send to planner ' "$TMP/sh-w"; then ok "header lists duties per direction"; else bad "header lists duties per direction: $(grep -A4 '^duties' "$TMP/sh-w")"; fi
+if grep -q '^  receive from planner (one in flight: ' "$TMP/sh-w" && grep -q '^  send to planner ' "$TMP/sh-w"; then ok "header lists duties per direction"; else bad "header lists duties per direction: $(grep -A4 '^duties' "$TMP/sh-w")"; fi
 for impl in sh go py; do
   case $impl in sh) W="$SH --arm" ;; go) W="$GO --arm" ;; py) W="python3 $PY arm" ;; esac
   capture "$TMP/$impl-nag" "$TMP/$impl-nag.err" "$TMP/$impl-nag.rc" env -u CHANNEL_AGENT $W "$EX" coder --whatineedtoknow
@@ -1154,7 +1154,7 @@ for ag in grok cursor; do
   capture "$Z/hdr-$ag" "$Z/hdr-$ag.err" "$Z/hdr-$ag.rc" sh -c 'cd "$1" && shift && exec "$@"' sh "$TMP/cur" env CHANNEL_AGENT=$ag "$ROOT/bin/channel-setup" "$Z/z.diag" q -n --whatineedtoknow
   if grep -q 'claim: if mv or rm of a FILE says No such file, the sender took it back first: you lost the race. Say so in one line (LOST <file>: the sender took it back) and go back to watching for new messages; it is not an error.' "$Z/hdr-$ag" \
     && grep -q 'NOT-RETRACTED <path> (DEST already has it; you lost the race)' "$Z/hdr-$ag" \
-    && grep -q "Never check DEST's inbox, its claimed/ or channel-status" "$Z/hdr-$ag" \
+    && grep -q "go straight back to your inbox watch; do not wait for, look for, or check a reply, DEST's inbox or its claimed/" "$Z/hdr-$ag" \
     && grep -q 'With no arrow back to <FROM> you cannot send a PONG' "$Z/hdr-$ag" \
     && ! grep -q 'CONSUMED\|OUTCOME\|outcome/\|CHANNEL_SEND_WAIT\|DEST took it' "$Z/hdr-$ag"; then ok "$ag header: claim lost, retract, no inbox checks"; else bad "$ag header: claim lost / retract lines"; fi
 done

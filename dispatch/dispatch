@@ -55,11 +55,11 @@ and must run AGENT-ARGV (as the right user, under the right landlock, with
 the right config home). Exit: 0 done/PASS, 1 not done/FAIL, 2 usage or
 setup error, 3 a direct review produced no verdict.
 
-Executor retries follow the "3 strikes, 3 outs" rule (AGENTS.md Retry): a
-session that ends not done, or a blocking review FAIL, is a strike; three
-strikes (original + two fix sessions) end the approach, the tree is reset to
-where it began and a new original starts; after the third reset the job stops
-with a failure log and FAILURE (re-plan needed). These counts are fixed.
+At most 3 blocking review cycles per job. After a FAIL a fresh session fixes
+from the full review (saved as review-N.md), then the range is reviewed again.
+A review that reports more problems (PROBLEMS: N) than the one before, or a
+third FAIL, ends the job with FAILURE (re-plan/review needed) and the review
+history. A session that ends not done gets one retry. Nothing is ever reset.
 A blocking review with 'review.NAME.node=' (or 'executor.review_node=') goes
 over the channel: REVIEW to that node, then wait in this node's inbox for the
 reply carrying the same REF.
@@ -156,8 +156,9 @@ show_settings() {
   say "  launch=$LAUNCH backend=$(cfg "$ROLE" backend grok-build) model=$(cfg "$ROLE" model '') effort=$(cfg "$ROLE" effort '') max_turns=$(cfg "$ROLE" max_turns 80) timeout=$(cfg "$ROLE" timeout 0)"
   say "  rules=$(cfg "$ROLE" rules '') logs=$LOG_DIR"
   if [[ "$ROLE" == executor ]]; then
-    say "  retries: $STRIKES_PER_APPROACH strikes per approach, stop after reset $MAX_RESETS (AGENTS.md Retry) require_commit=$(cfg executor require_commit yes) done_tag=$(cfg executor done_tag '') retry_effort=$(cfg executor retry_effort '') reset_keep=$(cfg executor reset_keep '')"
-    [[ -n "$(cfg executor rounds '')" ]] && say "  WARNING executor.rounds is ignored: the counts come from the 3 strikes / 3 outs rule"
+    say "  review cycles: at most $MAX_REVIEW_CYCLES, stop early if problems grow; not-done sessions: one retry; no resets. require_commit=$(cfg executor require_commit yes) done_tag=$(cfg executor done_tag '') retry_effort=$(cfg executor retry_effort '')"
+    [[ -n "$(cfg executor rounds '')" ]] && say "  WARNING executor.rounds is ignored: at most $MAX_REVIEW_CYCLES review cycles, fixed"
+    [[ -n "$(cfg executor reset_keep '')" ]] && say "  WARNING executor.reset_keep is ignored: the dispatcher never resets"
     for n in "${REVIEWS[@]}"; do
       local rr; rr=$(cfg "$ROLE" role reviewer "$n")
       say "  review $n: role=$rr enabled=$(cfg "$rr" enabled yes "$n") blocking=$(cfg "$rr" blocking yes "$n") mode=$(review_mode "$n") node=$(review_node "$n") backend=$(cfg "$rr" backend grok-build "$n") rules=$(cfg "$rr" rules '' "$n")"
@@ -283,17 +284,27 @@ check_done() {
   D_KIND=complete; D_REASON=""
 }
 
-# ------------------------------------------------- strikes and outs (AGENTS.md "Retry")
-# The rule: a typo-class red build is fixed in place and does not count; any other failure
-# counts; each approach gets an original plus two fixups; then reset and start a new
-# original; after the third reset, stop, report, wait.
-# Split: inside ONE executor session the agent applies it to its own builds (it ends
-# BLOCKED needs replan when they run out; that goes straight to the sender). Across
-# sessions only the dispatcher sees the failures, so it counts them here, never the
-# in-session ones: a session that ends not done, and a blocking review FAIL. The counts are
-# the rule's and are not settings. Fresh sessions get the counts in their prompt.
-STRIKES_PER_APPROACH=3
-MAX_RESETS=3
+# ------------------------------------------------------------------ review cycles
+# A job gets at most MAX_REVIEW_CYCLES blocking reviews. After a FAIL a fresh executor
+# session gets the full review to fix, then the range is reviewed again. A FAIL that reports
+# more problems (PROBLEMS: N) than the review before it, or a FAIL on the last cycle, goes
+# back to the sender with the review history: re-plan/review needed. Build-blocking slips
+# (a missed reference, a typo) are the agent's to fix inside its own session; the
+# dispatcher counts no strikes. A session that ends not done gets one fresh retry per job;
+# a second one goes back to the sender. The dispatcher never resets the worktree.
+MAX_REVIEW_CYCLES=3
+
+# problem_count FILE: N from the last 'PROBLEMS: N' line ('' if none)
+problem_count() {
+  sed -n 's/^[[:space:]*_#]*PROBLEMS:[[:space:]*_]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | tail -1
+}
+
+# reset_floor: what a session may never reset past: the done_tag, else HEAD at session start
+reset_floor() {
+  local tag; tag=$(cfg executor done_tag "")
+  if [[ -n "$tag" ]]; then printf "the '%s' tag (%s)" "$tag" "$(tag_commit "$tag" | cut -c1-12)"
+  else printf 'HEAD at your start (%s)' "$(git_head | cut -c1-12)"; fi
+}
 
 # review_node NAME: channel node a blocking review goes to ('' = in-process)
 review_node() {
@@ -388,7 +399,10 @@ blocking_reviews() {
       else
         say "WARNING review $n: blocking mode must be in-process or channel (node=); skipped"; continue 2
       fi
-      say "REVIEW $n round $round: $V_STATUS ${V_REASON}"
+      if [[ "$V_STATUS" == FAIL && -z "$(problem_count "$V_FILE")" ]]; then
+        V_STATUS=ERROR; V_REASON="FAIL without a 'PROBLEMS: N' line (the count is compared across cycles)"
+      fi
+      say "REVIEW $n cycle $round: $V_STATUS ${V_REASON}"
       [[ "$V_STATUS" == ERROR && $try == 1 ]] && { say "review $n gave no verdict; one fresh retry"; continue; }
       break
     done
@@ -400,30 +414,20 @@ blocking_reviews() {
   done
 }
 
-# reset_worktree TO: back to TO like orch/reset-to-builds.sh: HEAD and index to TO, every
-# tracked path but the 'executor.reset_keep' paths rewound, untracked non-ignored files removed.
-reset_worktree() {
-  local to="$1" k; local -a keep=()
-  for k in $(cfg executor reset_keep ""); do keep+=(":(exclude)$k"); done
-  git -C "$WORKTREE" reset --quiet --mixed "$to"
-  git -C "$WORKTREE" restore --source="$to" --worktree -- . "${keep[@]}"
-  git -C "$WORKTREE" clean -fdq -- . "${keep[@]}"
-}
-
 # run_executor_job PLAN FROM_STEP JOBDIR -> J_KIND complete|failure|blocked|stopped, J_REASON
 run_executor_job() {
-  local plan="$1" step="${2:-the beginning}" job="$3" before astart round=0 approach=1 strike=0
-  local dir start tmpl add kind="original" verdict_file="" verdict_text="" history="" alog="" ref flog fdir
-  local strike_next what
+  local plan="$1" step="${2:-the beginning}" job="$3" before round=0 cycle=0 retried=0
+  local dir start tmpl add kind="original" verdict_file="" verdict_text="" history="" prev="" n hist fdir
   JOB_DIR="$job"; STOP_FILE=""
-  before=$(git_head); astart="$before"
+  before=$(git_head)
   printf 'plan=%s\nfrom_step=%s\nrecorded_head=%s\n' "$plan" "$step" "$before" >"$job/job.txt"
+  hist="$job/review-history.md"
   while true; do
-    round=$((round + 1)); strike_next=""
+    round=$((round + 1))
     dir="$job/r$round-executor"; mkdir -p "$dir"
-    TV=([PLAN]="$plan" [FROM_STEP]="$step" [RECORDED_HEAD]="$astart" [RANGE]="$astart..HEAD"
-        [ROUND]="$round" [APPROACH]="$approach" [ATTEMPT]="$((strike + 1))" [STRIKES]="$STRIKES_PER_APPROACH"
-        [RESETS]="$MAX_RESETS" [HISTORY]="$history"
+    TV=([PLAN]="$plan" [FROM_STEP]="$step" [RECORDED_HEAD]="$before" [RANGE]="$before..HEAD"
+        [ROUND]="$round" [CYCLE]="$((cycle + 1))" [LAST_CYCLE]="$cycle" [MAX_CYCLES]="$MAX_REVIEW_CYCLES" [HISTORY]="$history"
+        [RESET_FLOOR]="$(reset_floor)"
         [VERDICT_FILE]="$verdict_file" [VERDICT]="$verdict_text" [WORKTREE]="$WORKTREE" [ADDENDUM]="")
     add=$(cfg executor addendum ""); [[ -n "$add" && -f "$add" ]] && TV[ADDENDUM]=$(<"$add")
     EFFORT_OVERRIDE=""
@@ -434,53 +438,55 @@ run_executor_job() {
     esac
     [[ -f "$tmpl" ]] || die "executor prompt template not found ($kind): '$tmpl'"
     render "$tmpl" "$dir/prompt.txt"
-    say "ROUND $round: approach $approach of $MAX_RESETS, attempt $((strike + 1)) of $STRIKES_PER_APPROACH ($kind${EFFORT_OVERRIDE:+, effort $EFFORT_OVERRIDE})"
+    say "ROUND $round: $kind session (review cycle $((cycle + 1)) of $MAX_REVIEW_CYCLES${EFFORT_OVERRIDE:+, effort $EFFORT_OVERRIDE})"
     start=$(git_head)
     run_agent executor "" "$dir" "$dir/prompt.txt"
     if [[ $DRY == 1 ]]; then D_KIND=complete; else check_done "$start"; fi
     case "$D_KIND" in
       blocked) J_KIND=blocked; J_REASON="round $round: $D_REASON"; return ;;
-      failure) strike_next=retry; verdict_file="$dir/result.txt"; verdict_text="The previous executor session ended not done: $D_REASON" ;;
-      complete)
-        blocking_reviews "$round" "$job/r$round" "$plan" "$astart..$(git_head)"
-        [[ $DRY == 1 ]] && { J_KIND=complete; J_REASON="dry run"; return; }
-        case "$R_RESULT" in
-          pass) J_KIND=complete; J_REASON="range $before..$(git_head)"; return ;;
-          stopped) J_KIND=stopped; J_REASON="$V_REASON (round $round)"; return ;;
-          error) J_KIND=failure; J_REASON="review $R_NAME gave no verdict twice: $V_REASON (verdict $V_FILE); not a code failure, nothing counted"; return ;;
-          fail) strike_next=fix; verdict_file="$V_FILE"; verdict_text=$(<"$V_FILE") ;;
-        esac ;;
+      failure)
+        if [[ $retried == 1 ]]; then
+          J_KIND=failure; J_REASON="executor session ended not done twice (round $round: $D_REASON; see $dir/result.txt)${prev:+; reviews so far: $hist}"
+          return
+        fi
+        retried=1; kind=retry; verdict_file="$dir/result.txt"
+        verdict_text="The previous executor session ended not done: $D_REASON"
+        say "NOT DONE round $round: $D_REASON; one fresh retry"
+        continue ;;
     esac
-    strike=$((strike + 1))
-    if [[ "$strike_next" == fix ]]; then what="review $R_NAME FAIL"; else what="session not done: $D_REASON"; fi
-    alog+="  round $round ($kind): strike $strike: $what"$'\n'
-    say "STRIKE $strike of $STRIKES_PER_APPROACH on approach $approach (round $round, $what)"
-    if [[ $strike -lt $STRIKES_PER_APPROACH ]]; then kind="$strike_next"; continue; fi
-    # out: keep the approach's commits, reset, new original (or stop after the third reset)
-    ref=""
-    if [[ "$(git_head)" != "$astart" ]]; then
-      ref="refs/dispatch/failed/$(basename -- "$job")-a$approach"
-      git -C "$WORKTREE" update-ref "$ref" HEAD
+    cycle=$((cycle + 1))
+    blocking_reviews "$cycle" "$job/r$round" "$plan" "$before..$(git_head)"
+    [[ $DRY == 1 ]] && { J_KIND=complete; J_REASON="dry run"; return; }
+    case "$R_RESULT" in
+      pass) J_KIND=complete; J_REASON="range $before..$(git_head)${prev:+ (passed review cycle $cycle)}"; return ;;
+      stopped) J_KIND=stopped; J_REASON="$V_REASON (round $round)"; return ;;
+      error) J_KIND=failure; J_REASON="review $R_NAME gave no verdict twice: $V_REASON (verdict $V_FILE)${prev:+; reviews so far: $hist}"; return ;;
+    esac
+    # FAIL: keep the full review of this cycle
+    n=$(problem_count "$V_FILE")
+    cp -- "$V_FILE" "$job/review-$cycle.md"
+    { printf '## Review cycle %s: %s, PROBLEMS: %s (range %s, file %s)\n\n' \
+        "$cycle" "$R_NAME" "$n" "$before..$(git_head)" "$job/review-$cycle.md"
+      cat -- "$V_FILE"; printf '\n'; } >>"$hist"
+    history+="Review cycle $cycle: $n problems ($job/review-$cycle.md)"$'\n'
+    say "REVIEW CYCLE $cycle of $MAX_REVIEW_CYCLES: FAIL, $n problems${prev:+ (cycle $((cycle - 1)): $prev)}"
+    if [[ -n "$prev" ]] && (( n > prev )); then
+      J_REASON="review cycle $cycle found $n problems, more than the $prev before; re-plan/review needed"
+    elif (( cycle >= MAX_REVIEW_CYCLES )); then
+      J_REASON="review cycle $cycle of $MAX_REVIEW_CYCLES still fails with $n problems; re-plan/review needed"
+    else
+      prev="$n"; kind=fix; verdict_file="$job/review-$cycle.md"; verdict_text=$(<"$V_FILE")
+      continue
     fi
-    say "OUT $approach: approach $approach used $STRIKES_PER_APPROACH strikes; reset to ${astart:0:12}${ref:+ (its commits kept at $ref)}"
-    reset_worktree "$astart"
-    history+="Approach $approach was abandoned after $STRIKES_PER_APPROACH strikes${ref:+ (its commits are kept at $ref)}:"$'\n'"$alog"
-    printf 'approach %s out at round %s; reset to %s; kept %s\n%s' "$approach" "$round" "$astart" "${ref:-nothing}" "$alog" >>"$job/strikes.txt"
-    if [[ $approach -ge $MAX_RESETS ]]; then
-      fdir=$(cfg executor failure_log_dir "$job"); mkdir -p "$fdir"
-      flog="$fdir/$(date +%Y%m%d-%H%M%S)-$(basename -- "$plan" .md).md"
-      { printf '# Implementation failure: %s\n\nPlan: %s\nWorktree: %s\nJob: %s\nReset to: %s (after %s approaches x %s strikes)\n\n' \
-          "$(basename -- "$plan")" "$plan" "$WORKTREE" "$job" "$astart" "$MAX_RESETS" "$STRIKES_PER_APPROACH"
-        printf '%s\n' "$history"; } >"$flog"
-      J_KIND=failure; J_REASON="3 strikes 3 outs: $MAX_RESETS approaches failed, tree reset to ${astart:0:12}; re-plan needed (failure log $flog)"
-      return
+    fdir=$(cfg executor failure_log_dir "")
+    if [[ -n "$fdir" ]]; then
+      mkdir -p "$fdir"; cp -- "$hist" "$fdir/$(date +%Y%m%d-%H%M%S)-$(basename -- "$plan" .md)-reviews.md"
     fi
-    approach=$((approach + 1)); strike=0; alog=""; kind=original; verdict_file=""; verdict_text=""
-    astart=$(git_head)
+    J_KIND=failure; J_REASON+=" (range $before..$(git_head) left as is; review history $hist)"
+    return
   done
 }
 
-# non-blocking reviews: started after COMPLETE, never waited for by the reply
 start_nonblocking() {
   local plan="$1" range="$2" job="$3" reply_to="$4" n rr mode
   for n in "${REVIEWS[@]}"; do
@@ -540,7 +546,10 @@ handle_message() {
   else
     claimed="$INBOX/claimed/$base"; mkdir -p "$INBOX/claimed"; mv -- "$file" "$claimed"
   fi
-  job="$LOG_DIR/$(date +%Y%m%d-%H%M%S)-${action}"; mkdir -p "$job"; cp -- "$claimed" "$job/message.txt"
+  job="$LOG_DIR/$(date +%Y%m%d-%H%M%S)-${action}"
+  # two messages in one second must not share a job directory
+  if [[ -e "$job" ]]; then local i=2; while [[ -e "$job-$i" ]]; do i=$((i + 1)); done; job="$job-$i"; fi
+  mkdir -p "$job"; cp -- "$claimed" "$job/message.txt"
   declare -gA F=([PLAN]="${MF[PLAN]:-none}" [RESPONDING-TO]="$claimed" [RANGE]="${MF[RANGE]:-none}"
                  [REF]="${MF[REF]:-none}" [ROUND]="${MF[ROUND]:-none}")
   if [[ "$ROLE" == executor ]]; then
@@ -574,6 +583,7 @@ handle_message() {
     kind=$(tr '[:upper:]' '[:lower:]' <<<"$V_STATUS")
     verb=$(cfg "$ROLE" "reply.$kind" "")
     F[STATUS]="$V_STATUS"; F[REASON]="${V_REASON:-$V_STATUS}"; F[VERDICT]="$V_FILE"; F[VERDICT-FILE]="$V_FILE"
+    F[PROBLEMS]=$(problem_count "$V_FILE"); [[ -n "${F[PROBLEMS]}" ]] || F[PROBLEMS]=none
   fi
   say "RESULT $kind ${F[REASON]}"
   if [[ -n "$verb" && -n "$M_FROM" ]]; then

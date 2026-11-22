@@ -4,8 +4,8 @@ Plan: {{PLAN}}
 Start from: {{FROM_STEP}}
 Worktree (your cwd): {{WORKTREE}}
 HEAD before you start (do not reset it): {{RECORDED_HEAD}}
+Never reset or check out past {{RESET_FLOOR}}.
 
-{{HISTORY}}
 Read the plan first and follow it. Commit your work.
 {{ADDENDUM}}
 End with exactly one STATUS line as your last line (SUCCESS, FAILURE <reason>, BLOCKED <reason>, NEEDS-INPUT <reason>).

@@ -4,7 +4,7 @@ Plan: {{PLAN}}
 Commit range: {{RANGE}}
 Worktree (your cwd): {{WORKTREE}}
 
-Check the diff of exactly that range (git diff {{RANGE}}) against the plan's Aim and Acceptance. List each finding on its own short line.
+Check the diff of exactly that range (git diff {{RANGE}}) against the plan's Aim and Acceptance. List each finding as a numbered line (file, what is wrong, why it matters), then a line `PROBLEMS: N` with the number of findings (`PROBLEMS: 0` when there are none). The count is compared with the previous review of this job, so a finding is one distinct problem.
 If the range is empty or invalid, end with STATUS: BLOCKED no commit range.
 {{ADDENDUM}}
-Your reply is the verdict; the dispatcher saves it to {{VERDICT_FILE}}. Do not write that file yourself. Last line: STATUS: PASS or STATUS: FAIL.
+Your reply is the verdict; the dispatcher saves it to {{VERDICT_FILE}}. Do not write that file yourself. Your whole reply is saved and given to the executor that fixes the range. Last line: STATUS: PASS or STATUS: FAIL (a FAIL without a PROBLEMS line counts as no verdict).

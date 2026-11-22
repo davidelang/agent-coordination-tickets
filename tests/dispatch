@@ -3,8 +3,9 @@
 # processes on a scratch diag: a coder (executor, watch mode) and a reviewer (watch mode)
 # talking over the channel (bin/channel). The test plays the planner. No real agent runs.
 # Cases: review FAIL -> fix -> PASS over the channel; an unrelated message queued during the
-# wait; review timeout; STOP during the wait; a session that ends not done (retry prompt +
-# retry effort); 3 strikes x 3 outs -> failure log, reset, FAILURE to the planner.
+# wait; review timeout; STOP during the wait; a session that ends not done (one retry, then
+# FAILURE); review cycles: fewer problems pass later, more problems or 3 FAILs go back to the
+# planner with the full review history; the tree is never reset (the builds tag only moves on).
 # Run from anywhere: tests/dispatch   (tests/run calls it)
 set -euo pipefail
 export LC_ALL=C CHANNEL_AGENT=grok DISPATCH_POLL_SEC=0.2
@@ -36,16 +37,17 @@ if [[ "$rules" == *"Role: reviewer"* ]]; then
   line=$(head -1 "$S/reviews" 2>/dev/null || echo PASS); sed -i '1d' "$S/reviews" 2>/dev/null || :
   echo "review $line" >>"$S/agent.log"
   case "$line" in
-    SLEEP*) sleep "${line#SLEEP }"; t="slow ok\nSTATUS: PASS" ;;
-    FAIL) t="a.txt: finding\nSTATUS: FAIL" ;;
-    *) t="ok\nSTATUS: PASS" ;;
+    SLEEP*) sleep "${line#SLEEP }"; t="slow ok\nPROBLEMS: 0\nSTATUS: PASS" ;;
+    FAILNOCOUNT) t="a.txt: finding\nSTATUS: FAIL" ;;
+    FAIL*) n=${line#FAIL }; t=""; for ((i = 1; i <= n; i++)); do t+="$i. a.txt: finding $i of $n\n"; done; t+="PROBLEMS: $n\nSTATUS: FAIL" ;;
+    *) t="ok\nPROBLEMS: 0\nSTATUS: PASS" ;;
   esac
 else
   line=$(head -1 "$S/execs" 2>/dev/null || echo SUCCESS); sed -i '1d' "$S/execs" 2>/dev/null || :
-  kind=original; grep -q '^Fix round' "$pf" && kind=fix; grep -q '^Retry for' "$pf" && kind=retry
+  kind=original; grep -q '^Fix the findings' "$pf" && kind=fix; grep -q '^Retry for' "$pf" && kind=retry
   echo "exec $kind effort=${eff:-none} $line" >>"$S/agent.log"
   if [[ "$line" == FAILURE ]]; then t="could not\nSTATUS: FAILURE build red"
-  else date +%s%N >>a.txt; git add a.txt; git commit -qm "fake $kind"; t="done\nSTATUS: SUCCESS"; fi
+  else date +%s%N >>a.txt; git add a.txt; git commit -qm "fake $kind"; git tag -f builds >/dev/null; t="done\nSTATUS: SUCCESS"; fi
 fi
 printf '{"text":"%s","total_cost_usd":0}\n' "$t"
 EOF
@@ -54,7 +56,7 @@ chmod +x "$T/fake"
 # ---- scratch repo, diag, sidecar
 W=$T/work; C=$T/connect
 git init -q "$W"; git -C "$W" config user.email t@t; git -C "$W" config user.name t
-echo base >"$W/a.txt"; echo keep >"$W/ENGINEERING_LOG.md"; git -C "$W" add -A; git -C "$W" commit -qm base
+echo base >"$W/a.txt"; echo keep >"$W/ENGINEERING_LOG.md"; git -C "$W" add -A; git -C "$W" commit -qm base; git -C "$W" tag builds
 mkdir -p "$C"; echo "# plan" >"$T/plan.md"
 cat >"$C/config.diag" <<EOF
 blockdiag {
@@ -128,6 +130,7 @@ STATUS: <PASS>
 REF: <ref>
 ROUND: <round>
 RANGE: <range>
+PROBLEMS: <n>
 REASON: <reason>
 VERDICT-FILE: <file>
 }
@@ -138,6 +141,7 @@ STATUS: <FAIL>
 REF: <ref>
 ROUND: <round>
 RANGE: <range>
+PROBLEMS: <n>
 REASON: <reason>
 VERDICT-FILE: <file>
 }
@@ -148,6 +152,7 @@ STATUS: <ERROR>
 REF: <ref>
 ROUND: <round>
 RANGE: <range>
+PROBLEMS: <n>
 REASON: <reason>
 VERDICT-FILE: <file>
 }
@@ -162,7 +167,7 @@ agent_bin=$T/fake
 channel=$CH
 executor.review_node=reviewer
 executor.retry_effort=xhigh
-executor.reset_keep=ENGINEERING_LOG.md
+executor.done_tag=builds
 executor.failure_log_dir=$T/failure-logs
 reviewer.wait_timeout=4
 reviewer.reply.pass=REVIEW-PASS
@@ -189,7 +194,7 @@ wait_reply() {
   return 1
 }
 reset_case() { rm -f "$C/nodes/planner/inbox/"*.md "$T/agent.log" "$T/reviews" "$T/execs"; : >"$T/coder.log"; : >"$T/reviewer.log"; }
-count() { grep -c "$1" "$2" 2>/dev/null || echo 0; }
+count() { local n; n=$(grep -c "$1" "$2" 2>/dev/null) || :; echo "${n:-0}"; }
 
 # 0. -p (no message) dry run with a channel review: settings and the REVIEW it would send
 out=$(cd "$W" && "$D" -n -d "$C/config.diag" -r executor -p "$T/plan.md" 2>&1); rc=$?
@@ -198,7 +203,7 @@ check "-p dry run with review_node" '[[ $rc == 0 ]] && grep -q "mode=channel nod
 start reviewer reviewer; start coder executor; sleep 1
 
 # 1. FAIL -> fix -> PASS over the channel, PING queued during the wait
-reset_case; printf 'FAIL\nSLEEP 2\n' >"$T/reviews"
+reset_case; printf 'FAIL 3\nSLEEP 2\n' >"$T/reviews"
 implement
 sleep 1.2
 ( "$CH" --send "$C/config.diag" planner coder PING --timeout 30 >"$T/ping.out" 2>&1; echo $? >"$T/ping.rc" ) &
@@ -206,17 +211,23 @@ sleep 0.6
 check "PING sent during the review wait stays queued in the coder inbox" 'grep -lqs "^VERB: PING" "$C/nodes/coder/inbox"/*.md && ! grep -q "MESSAGE .*verb=PING" "$T/coder.log"'
 f=$(wait_reply COMPLETE 30 || :)
 check "fail-fix-pass: planner gets COMPLETE" '[[ -n "$f" ]]'
-check "fail-fix-pass: one strike then a fix round" 'grep -q "STRIKE 1 of 3 on approach 1" "$T/coder.log" && grep -q "exec fix" "$T/agent.log"'
+J=$(ls -td "$C"/dispatch/coder/*-IMPLEMENT* | head -1)
+check "fail-fix-pass: passes on review cycle 2 after one fix session" 'grep -q "REVIEW CYCLE 1 of 3: FAIL, 3 problems" "$T/coder.log" && grep -q "exec fix" "$T/agent.log" && grep -q "RESULT complete .*passed review cycle 2" "$T/coder.log"'
+check "fail-fix-pass: full review saved and given to the fix session" 'grep -q "^3. a.txt: finding 3 of 3" "$J/review-1.md" && grep -q "^3. a.txt: finding 3 of 3" "$J/r2-executor/prompt.txt" && grep -q "Full review: $J/review-1.md" "$J/r2-executor/prompt.txt"'
+check "reviewer reply carries PROBLEMS" 'grep -qs "^PROBLEMS: 3" "$C"/dispatch/reviewer/*/reply.txt'
 check "fail-fix-pass: two reviews ran in the reviewer process" '[[ $(count "^review" "$T/agent.log") == 2 ]] && [[ $(count "MESSAGE .* action=REVIEW" "$T/reviewer.log") == 2 ]]'
 check "fail-fix-pass: verdicts went to the coder, not the planner" '! grep -qs "^VERB: REVIEW-" "$C/nodes/planner/inbox"/*.md && [[ $(count "REPLY REVIEW-" "$T/coder.log") == 2 ]]'
 for i in $(seq 50); do [[ -s "$T/ping.rc" ]] && break; sleep 0.2; done
 check "queued PING handled after the job and answered" '[[ "$(cat "$T/ping.rc" 2>/dev/null)" == 0 ]] && [[ $(grep -n "MESSAGE .*verb=PING" "$T/coder.log" | cut -d: -f1) -gt $(grep -n "SEND COMPLETE" "$T/coder.log" | cut -d: -f1) ]]'
 
-# 2. session not done -> retry prompt with retry effort, counted as a strike
+# 2. session not done -> one retry prompt with retry effort
 reset_case; printf 'FAILURE\nSUCCESS\n' >"$T/execs"; printf 'PASS\n' >"$T/reviews"
 implement; f=$(wait_reply COMPLETE 30 || :)
 check "not-done session: COMPLETE after a retry" '[[ -n "$f" ]]'
-check "not-done session: retry prompt at retry_effort" 'grep -q "exec retry effort=xhigh SUCCESS" "$T/agent.log" && grep -q "STRIKE 1 of 3 .*session not done" "$T/coder.log"'
+check "not-done session: retry prompt at retry_effort" 'grep -q "exec retry effort=xhigh SUCCESS" "$T/agent.log" && grep -q "NOT DONE round 1" "$T/coder.log"'
+reset_case; printf 'FAILURE\nFAILURE\n' >"$T/execs"
+implement; f=$(wait_reply FAILURE 30 || :)
+check "not-done twice: FAILURE after the one retry, no review" '[[ -n "$f" ]] && grep -q "ended not done twice" "$f" && [[ $(count "^exec" "$T/agent.log") == 2 ]] && [[ $(count "^review" "$T/agent.log") == 0 ]]'
 
 # 3. STOP during the wait
 reset_case; printf 'SLEEP 3\n' >"$T/reviews"
@@ -227,24 +238,42 @@ check "STOP during the review wait: STOPPED to the planner" '[[ -n "$f" ]] && gr
 check "STOP during the review wait: the STOP is consumed" '! grep -lq "^VERB: STOP" "$C/nodes/coder/inbox"/* 2>/dev/null'
 sleep 3; check "late reply after STOP is dropped as stale" 'grep -q "stale review reply" "$T/coder.log"'
 
-# 4. timeout: no reviewer process; one fresh retry, then FAILURE (not a strike)
+# 4. timeout: no reviewer process; one fresh retry, then FAILURE
 stop_role reviewer
 reset_case
 implement; f=$(wait_reply FAILURE 30 || :)
 check "review timeout: FAILURE after one retry" '[[ -n "$f" ]] && grep -q "gave no verdict twice" "$f" && [[ $(count "no reply from reviewer within 4s" "$T/coder.log") -ge 2 ]]'
-check "review timeout: no strike counted, requests retracted" '! grep -q STRIKE "$T/coder.log" && [[ -z "$(ls -A "$C/nodes/reviewer/inbox" | grep -v claimed)" ]]'
+check "review timeout: no cycle counted, requests retracted" '! grep -q "REVIEW CYCLE" "$T/coder.log" && [[ -z "$(ls -A "$C/nodes/reviewer/inbox" | grep -v claimed)" ]]'
 start reviewer reviewer; sleep 1
 
-# 5. three strikes, three outs
-reset_case; for i in 1 2 3 4 5 6 7 8 9; do echo FAIL; done >"$T/reviews"
+# 5. a FAIL without a PROBLEMS line is no verdict: one fresh review
+reset_case; printf 'FAILNOCOUNT\nPASS\n' >"$T/reviews"
+implement; f=$(wait_reply COMPLETE 30 || :)
+check "FAIL without PROBLEMS: retried as no verdict, then PASS" '[[ -n "$f" ]] && grep -q "without a .PROBLEMS: N. line" "$T/coder.log" && [[ $(count "^exec" "$T/agent.log") == 1 ]]'
+
+# 6. decreasing problems: 3 -> 2 -> PASS on cycle 3
+reset_case; printf 'FAIL 3\nFAIL 2\nPASS\n' >"$T/reviews"
+implement; f=$(wait_reply COMPLETE 40 || :)
+check "decreasing problems: COMPLETE on review cycle 3" '[[ -n "$f" ]] && grep -q "RESULT complete .*passed review cycle 3" "$T/coder.log" && [[ $(count "^exec fix" "$T/agent.log") == 2 ]]'
+
+# 7. increasing problems on cycle 2 go back to the planner with the history
+reset_case; printf 'FAIL 2\nFAIL 4\n' >"$T/reviews"
 h0=$(git -C "$W" rev-parse HEAD)
-implement; f=$(wait_reply FAILURE 90 || :)
-check "3x3: FAILURE says re-plan needed" '[[ -n "$f" ]] && grep -q "re-plan needed" "$f"'
-check "3x3: nine executor sessions, three outs" '[[ $(count "^exec" "$T/agent.log") == 9 ]] && [[ $(count "^.* OUT [123]:" "$T/coder.log") == 3 ]]'
-check "3x3: tree reset to the start, kept log untouched" '[[ "$(git -C "$W" rev-parse HEAD)" == "$h0" ]] && [[ "$(cat "$W/ENGINEERING_LOG.md")" == keep ]]'
-check "3x3: each approach kept under refs/dispatch/failed" '[[ $(git -C "$W" for-each-ref refs/dispatch/failed | wc -l) == 3 ]]'
-check "3x3: failure log written" '[[ $(ls "$T/failure-logs" | wc -l) == 1 ]] && grep -q "Approach 3 was abandoned" "$T/failure-logs"/*'
-check "3x3: new original after each out, with history" 'grep -q "Approach 1 was abandoned" "$(ls -d "$C"/dispatch/coder/*-IMPLEMENT | tail -1)/r4-executor/prompt.txt"'
+implement; f=$(wait_reply FAILURE 40 || :)
+J=$(ls -td "$C"/dispatch/coder/*-IMPLEMENT* | head -1)
+check "more problems on cycle 2: FAILURE, re-plan/review needed" '[[ -n "$f" ]] && grep -q "review cycle 2 found 4 problems, more than the 2 before; re-plan/review needed" "$f" && [[ $(count "^exec" "$T/agent.log") == 2 ]]'
+check "more problems: reply points at the history with both full reviews" 'grep -q "review history $J/review-history.md" "$f" && grep -q "^2. a.txt: finding 2 of 2" "$J/review-history.md" && grep -q "^4. a.txt: finding 4 of 4" "$J/review-history.md" && ls "$T/failure-logs"/*-reviews.md >/dev/null'
+check "more problems: commits kept, no reset" '[[ $(git -C "$W" rev-list --count "$h0..HEAD") == 2 ]] && [[ "$(git -C "$W" rev-parse builds)" == "$(git -C "$W" rev-parse HEAD)" ]]'
+
+# 8. three FAILs with falling counts: back to the planner after cycle 3; nothing reset
+reset_case; printf 'FAIL 3\nFAIL 2\nFAIL 1\n' >"$T/reviews"
+h0=$(git -C "$W" rev-parse HEAD)
+implement; f=$(wait_reply FAILURE 40 || :)
+J=$(ls -td "$C"/dispatch/coder/*-IMPLEMENT* | head -1)
+check "3 cycles exhausted: FAILURE after cycle 3" '[[ -n "$f" ]] && grep -q "review cycle 3 of 3 still fails with 1 problems" "$f" && [[ $(count "^exec" "$T/agent.log") == 3 ]] && [[ $(count "^review" "$T/agent.log") == 3 ]]'
+check "3 cycles exhausted: three reviews saved" '[[ -f "$J/review-1.md" && -f "$J/review-2.md" && -f "$J/review-3.md" ]]'
+check "no reset past builds: all commits kept, builds still on HEAD, no saved refs" '[[ $(git -C "$W" rev-list --count "$h0..HEAD") == 3 ]] && git -C "$W" merge-base --is-ancestor "$h0" builds && [[ "$(git -C "$W" rev-parse builds)" == "$(git -C "$W" rev-parse HEAD)" ]] && [[ -z "$(git -C "$W" for-each-ref refs/dispatch)" ]]'
+check "prompts forbid resets past the builds tag" 'grep -q "Never reset or check out past the .builds. tag" "$J/r1-executor/prompt.txt" "$J/r2-executor/prompt.txt"'
 
 printf '%s\n' "dispatch: $pass passed, $fail failed"
 [[ $fail -eq 0 ]]

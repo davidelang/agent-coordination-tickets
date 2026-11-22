@@ -1,11 +1,15 @@
-Fix round {{ROUND}} for an approved plan (attempt {{ATTEMPT}} of {{STRIKES}} on approach {{APPROACH}} of {{RESETS}}). You are a fresh session; the earlier executor and reviewer sessions are gone, so everything you need is below or in the files named.
+Fix the findings of review cycle {{LAST_CYCLE}} of {{MAX_CYCLES}} for an approved plan. You are a fresh session; the earlier executor and reviewer sessions are gone, so everything you need is below or in the files named.
 
 Plan: {{PLAN}}
 Worktree (your cwd): {{WORKTREE}}
 Commit range implemented so far: {{RANGE}} (recorded HEAD {{RECORDED_HEAD}})
-Reviewer verdict file: {{VERDICT_FILE}}
+Never reset or check out past {{RESET_FLOOR}}. Fix forward with new commits.
+Full review: {{VERDICT_FILE}}
+Reviews so far:
+{{HISTORY}}
+The next review must find fewer problems than this one, or the job goes back to the planner.
 
-The reviewer's verdict:
+The full review:
 ----
 {{VERDICT}}
 ----

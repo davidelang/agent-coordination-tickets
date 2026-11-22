@@ -7,7 +7,7 @@ Never reset or check out past {{RESET_FLOOR}}. Fix forward with new commits.
 Full review: {{VERDICT_FILE}}
 Reviews so far:
 {{HISTORY}}
-The next review must find fewer problems than this one, or the job goes back to the planner.
+The next review must find fewer problems than this one, or the job goes back to the planner for a re-plan.
 
 The full review:
 ----
@@ -21,4 +21,4 @@ For each finding:
 
 Commit your fixes. If you rejected every finding and changed nothing, end with STATUS: NEEDS-INPUT and the reasons.
 {{ADDENDUM}}
-End with exactly one STATUS line as your last line (SUCCESS, FAILURE <reason>, BLOCKED <reason>, NEEDS-INPUT <reason>).
+End with exactly one STATUS line as your last line (SUCCESS, FAILURE <reason>, BLOCKED <reason>, NEEDS-INPUT <reason>). BLOCKED only when something outside the code stops you (permissions, contradictory instructions, missing access); work you could not finish is FAILURE.

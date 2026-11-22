@@ -57,8 +57,8 @@ setup error, 3 a direct review produced no verdict.
 
 At most 3 blocking review cycles per job. After a FAIL a fresh session fixes
 from the full review (saved as review-N.md), then the range is reviewed again.
-A review that reports more problems (PROBLEMS: N) than the one before, or a
-third FAIL, ends the job with FAILURE (re-plan/review needed) and the review
+A review that reports as many problems (PROBLEMS: N) as the one before or more,
+or a third FAIL, ends the job with FAILURE (re-plan needed) and the review
 history. A session that ends not done gets one retry. Nothing is ever reset.
 A blocking review with 'review.NAME.node=' (or 'executor.review_node=') goes
 over the channel: REVIEW to that node, then wait in this node's inbox for the
@@ -156,7 +156,7 @@ show_settings() {
   say "  launch=$LAUNCH backend=$(cfg "$ROLE" backend grok-build) model=$(cfg "$ROLE" model '') effort=$(cfg "$ROLE" effort '') max_turns=$(cfg "$ROLE" max_turns 80) timeout=$(cfg "$ROLE" timeout 0)"
   say "  rules=$(cfg "$ROLE" rules '') logs=$LOG_DIR"
   if [[ "$ROLE" == executor ]]; then
-    say "  review cycles: at most $MAX_REVIEW_CYCLES, stop early if problems grow; not-done sessions: one retry; no resets. require_commit=$(cfg executor require_commit yes) done_tag=$(cfg executor done_tag '') retry_effort=$(cfg executor retry_effort '')"
+    say "  review cycles: at most $MAX_REVIEW_CYCLES, stop early unless problems drop; not-done sessions: one retry; no resets. require_commit=$(cfg executor require_commit yes) done_tag=$(cfg executor done_tag '') retry_effort=$(cfg executor retry_effort '')"
     [[ -n "$(cfg executor rounds '')" ]] && say "  WARNING executor.rounds is ignored: at most $MAX_REVIEW_CYCLES review cycles, fixed"
     [[ -n "$(cfg executor reset_keep '')" ]] && say "  WARNING executor.reset_keep is ignored: the dispatcher never resets"
     for n in "${REVIEWS[@]}"; do
@@ -287,8 +287,9 @@ check_done() {
 # ------------------------------------------------------------------ review cycles
 # A job gets at most MAX_REVIEW_CYCLES blocking reviews. After a FAIL a fresh executor
 # session gets the full review to fix, then the range is reviewed again. A FAIL that reports
-# more problems (PROBLEMS: N) than the review before it, or a FAIL on the last cycle, goes
-# back to the sender with the review history: re-plan/review needed. Build-blocking slips
+# as many problems (PROBLEMS: N) as the review before it or more, or a FAIL on the last
+# cycle, goes back to the sender with the review history: FAILURE, re-plan needed.
+# (BLOCKED is only for the agent's own STATUS: BLOCKED, something preventing progress.) Build-blocking slips
 # (a missed reference, a typo) are the agent's to fix inside its own session; the
 # dispatcher counts no strikes. A session that ends not done gets one fresh retry per job;
 # a second one goes back to the sender. The dispatcher never resets the worktree.
@@ -470,10 +471,10 @@ run_executor_job() {
       cat -- "$V_FILE"; printf '\n'; } >>"$hist"
     history+="Review cycle $cycle: $n problems ($job/review-$cycle.md)"$'\n'
     say "REVIEW CYCLE $cycle of $MAX_REVIEW_CYCLES: FAIL, $n problems${prev:+ (cycle $((cycle - 1)): $prev)}"
-    if [[ -n "$prev" ]] && (( n > prev )); then
-      J_REASON="review cycle $cycle found $n problems, more than the $prev before; re-plan/review needed"
+    if [[ -n "$prev" ]] && (( n >= prev )); then
+      J_REASON="review cycle $cycle found $n problems, not fewer than the $prev before; re-plan needed"
     elif (( cycle >= MAX_REVIEW_CYCLES )); then
-      J_REASON="review cycle $cycle of $MAX_REVIEW_CYCLES still fails with $n problems; re-plan/review needed"
+      J_REASON="review cycle $cycle of $MAX_REVIEW_CYCLES still fails with $n problems; re-plan needed"
     else
       prev="$n"; kind=fix; verdict_file="$job/review-$cycle.md"; verdict_text=$(<"$V_FILE")
       continue

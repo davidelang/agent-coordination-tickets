@@ -35,8 +35,8 @@ executor.require_commit=yes
 # A project role card instead of dispatch/roles/executor.md:
 # executor.rules=../../roles/executor.md
 
-# At most 3 review cycles; more problems than the review before, or a 3rd FAIL, goes back
-# to the planner with the review history. The dispatcher never resets the tree.
+# At most 3 review cycles; a review without fewer problems than the one before, or a 3rd
+# FAIL, goes back to the planner (FAILURE, re-plan needed) with the review history. The dispatcher never resets the tree.
 # executor.retry_effort=xhigh
 # executor.failure_log_dir=../../implementation-failure-logs
 # Blocking reviews over the channel: the coder sends REVIEW and waits for the verdict.

@@ -12,3 +12,4 @@ You implement one approved plan in this checkout, in a fresh session with no ear
   STATUS: FAILURE <short reason>
   STATUS: BLOCKED <short reason>
   STATUS: NEEDS-INPUT <short reason>
+- FAILURE: you could not finish the work (it does not build, the plan does not fit the code). BLOCKED: something outside the code prevents progress (permissions, contradictory instructions, missing access or files).

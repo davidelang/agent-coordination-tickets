@@ -4,7 +4,7 @@
 # talking over the channel (bin/channel). The test plays the planner. No real agent runs.
 # Cases: review FAIL -> fix -> PASS over the channel; an unrelated message queued during the
 # wait; review timeout; STOP during the wait; a session that ends not done (one retry, then
-# FAILURE); review cycles: fewer problems pass later, more problems or 3 FAILs go back to the
+# FAILURE); review cycles: fewer problems pass later, same/more problems or 3 FAILs go back to the
 # planner with the full review history; the tree is never reset (the builds tag only moves on).
 # Run from anywhere: tests/dispatch   (tests/run calls it)
 set -euo pipefail
@@ -261,16 +261,21 @@ reset_case; printf 'FAIL 2\nFAIL 4\n' >"$T/reviews"
 h0=$(git -C "$W" rev-parse HEAD)
 implement; f=$(wait_reply FAILURE 40 || :)
 J=$(ls -td "$C"/dispatch/coder/*-IMPLEMENT* | head -1)
-check "more problems on cycle 2: FAILURE, re-plan/review needed" '[[ -n "$f" ]] && grep -q "review cycle 2 found 4 problems, more than the 2 before; re-plan/review needed" "$f" && [[ $(count "^exec" "$T/agent.log") == 2 ]]'
+check "more problems on cycle 2: FAILURE, re-plan needed" '[[ -n "$f" ]] && grep -q "^STATUS: FAILURE" "$f" && grep -q "review cycle 2 found 4 problems, not fewer than the 2 before; re-plan needed" "$f" && [[ $(count "^exec" "$T/agent.log") == 2 ]]'
 check "more problems: reply points at the history with both full reviews" 'grep -q "review history $J/review-history.md" "$f" && grep -q "^2. a.txt: finding 2 of 2" "$J/review-history.md" && grep -q "^4. a.txt: finding 4 of 4" "$J/review-history.md" && ls "$T/failure-logs"/*-reviews.md >/dev/null'
 check "more problems: commits kept, no reset" '[[ $(git -C "$W" rev-list --count "$h0..HEAD") == 2 ]] && [[ "$(git -C "$W" rev-parse builds)" == "$(git -C "$W" rev-parse HEAD)" ]]'
+
+# 7b. the same count on cycle 2 also goes back to the planner
+reset_case; printf 'FAIL 2\nFAIL 2\n' >"$T/reviews"
+implement; f=$(wait_reply FAILURE 40 || :)
+check "same problems on cycle 2: FAILURE, re-plan needed" '[[ -n "$f" ]] && grep -q "review cycle 2 found 2 problems, not fewer than the 2 before; re-plan needed" "$f" && [[ $(count "^exec" "$T/agent.log") == 2 ]]'
 
 # 8. three FAILs with falling counts: back to the planner after cycle 3; nothing reset
 reset_case; printf 'FAIL 3\nFAIL 2\nFAIL 1\n' >"$T/reviews"
 h0=$(git -C "$W" rev-parse HEAD)
 implement; f=$(wait_reply FAILURE 40 || :)
 J=$(ls -td "$C"/dispatch/coder/*-IMPLEMENT* | head -1)
-check "3 cycles exhausted: FAILURE after cycle 3" '[[ -n "$f" ]] && grep -q "review cycle 3 of 3 still fails with 1 problems" "$f" && [[ $(count "^exec" "$T/agent.log") == 3 ]] && [[ $(count "^review" "$T/agent.log") == 3 ]]'
+check "3 cycles exhausted: FAILURE after cycle 3" '[[ -n "$f" ]] && grep -q "review cycle 3 of 3 still fails with 1 problems; re-plan needed" "$f" && [[ $(count "^exec" "$T/agent.log") == 3 ]] && [[ $(count "^review" "$T/agent.log") == 3 ]]'
 check "3 cycles exhausted: three reviews saved" '[[ -f "$J/review-1.md" && -f "$J/review-2.md" && -f "$J/review-3.md" ]]'
 check "no reset past builds: all commits kept, builds still on HEAD, no saved refs" '[[ $(git -C "$W" rev-list --count "$h0..HEAD") == 3 ]] && git -C "$W" merge-base --is-ancestor "$h0" builds && [[ "$(git -C "$W" rev-parse builds)" == "$(git -C "$W" rev-parse HEAD)" ]] && [[ -z "$(git -C "$W" for-each-ref refs/dispatch)" ]]'
 check "prompts forbid resets past the builds tag" 'grep -q "Never reset or check out past the .builds. tag" "$J/r1-executor/prompt.txt" "$J/r2-executor/prompt.txt"'

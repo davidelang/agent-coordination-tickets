@@ -8,4 +8,4 @@ Never reset or check out past {{RESET_FLOOR}}.
 
 Read the plan first and follow it. Commit your work.
 {{ADDENDUM}}
-End with exactly one STATUS line as your last line (SUCCESS, FAILURE <reason>, BLOCKED <reason>, NEEDS-INPUT <reason>).
+End with exactly one STATUS line as your last line (SUCCESS, FAILURE <reason>, BLOCKED <reason>, NEEDS-INPUT <reason>). BLOCKED only when something outside the code stops you (permissions, contradictory instructions, missing access); work you could not finish is FAILURE.
